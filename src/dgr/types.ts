@@ -6,10 +6,10 @@
  * rather than a boundary this SDK validates its own input against, and — unlike the
  * public OpenAPI spec, which types `destination` as a bare string — they encode the
  * gotchas the real API actually requires. Internal only: `buildRenderBody` produces
- * a {@link RenderBodyWire}, and the HTTP client (a later task) will produce
- * {@link JobStatusResponse} / {@link Controls} / {@link PresetSummary} from parsed
- * JSON responses. None of this module is re-exported from the package's public
- * entry point.
+ * a {@link RenderBodyWire}; {@link JobStatusResponse}, {@link Controls}, and
+ * {@link PresetSummary} are the shapes a DGR HTTP client parses its JSON
+ * responses into. None of this module is re-exported from the package's
+ * public entry point.
  */
 
 import type { RenderVariable } from './schemas.js';
@@ -118,7 +118,7 @@ export interface PresetSummary {
  */
 export interface ControlVariable {
   variableId: string;
-  /** Not an exhaustive enum — the set of control types is established by Task 9's preset/`.epr` work. */
+  /** Not an exhaustive enum — DGR's describe response may report control types beyond the ones currently known. */
   type: string;
 }
 

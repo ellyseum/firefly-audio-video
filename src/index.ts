@@ -16,3 +16,12 @@ export type { JobMeta } from './core/job.js';
 
 export { ClientCredentialsProvider } from './core/auth.js';
 export type { TokenProvider, ClientCredentials } from './core/auth.js';
+
+export { rotatingFileLogger, stdoutJsonLogger } from './core/logging.js';
+export type {
+  Logger,
+  LogLevel,
+  LogRecord,
+  LoggingOption,
+  RotatingFileLoggerOptions,
+} from './core/logging.js';

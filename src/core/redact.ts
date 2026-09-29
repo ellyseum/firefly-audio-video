@@ -1,13 +1,19 @@
 /**
  * The single mandatory redaction path used everywhere a value crosses from this SDK
  * out to a log record, a thrown error, or `console.log` — never log or throw an
- * unredacted secret. Three shapes are covered:
+ * unredacted secret. Four shapes are covered:
  *
- * - {@link redactUrl} — a presigned URL's Azure SAS or AWS SigV4 query parameters.
+ * - {@link redactUrl} — a URL's credentials: its user info (`user:pass@`) and
+ *   every query parameter that carries or scopes a signature or a secret (Azure
+ *   SAS, AWS SigV4 and SigV2, Google Cloud Storage V4 and V2, and any token,
+ *   secret, password, credential or API-key parameter).
  * - {@link redactHeaders} — an HTTP header set's auth-bearing header values.
  * - {@link redactValue} — an arbitrary log record, error `.items`, or error
- *   `.message` string: walks objects/arrays recursively, scrubbing both
- *   secret-named keys and any embedded URL.
+ *   `.message` string: walks objects/arrays recursively, scrubbing secret-named
+ *   keys, any embedded URL, a secret parameter written in plain text (in its
+ *   `&amp;` and percent-encoded forms too), a `Bearer` credential and a JWT.
+ * - {@link redactError} — a redacted copy of an error, to keep as another
+ *   error's `cause`.
  *
  * None of these throw, on any input, including a malformed URL or a circular
  * object graph — a redaction pass failing would be strictly worse than an
@@ -16,34 +22,49 @@
  */
 
 /**
- * The query-parameter names that carry or scope a presigned URL's signature,
- * as a regex source for one whole name: the Azure SAS names — stripping only
- * `sig` would still leave `se`/`sp`/etc. narrowing what the leaked signature
- * was valid for, so the whole set is treated as sensitive together — every
- * AWS `x-amz-*` parameter, and anything naming a signature. `free` is the
- * character class the open-ended parts of a name may use.
+ * The query-parameter names that carry or scope a credential, as a regex
+ * source for one whole name, matched case-insensitively:
+ *
+ * - Azure SAS: `sig` and every parameter scoping it (`se`, `sp`, `sv`, …) —
+ *   stripping only `sig` would still leave the rest narrowing what the leaked
+ *   signature was valid for, so the whole set is treated as sensitive together;
+ * - AWS: every SigV4 `x-amz-*` parameter, and SigV2's `AWSAccessKeyId`;
+ * - Google Cloud Storage: every V4 `x-goog-*` parameter, and V2's `GoogleAccessId`;
+ * - the bare `key` of a keyed API URL, and any name containing `signature`,
+ *   `token`, `secret`, `password` or `passwd`, `credential`, `api_key`,
+ *   `api-key` or `apikey`, or `private_key`.
+ *
+ * `free` is the character class the open-ended parts of a name may use.
  */
 function secretParamNames(free: string): string {
-  return `sig|se|sp|sv|sr|st|skoid|sktid|skt|ske|sks|skv|x-amz-${free}*|${free}*signature${free}*`;
+  const sas =
+    'sig|se|sp|sv|sr|st|spr|sip|si|srt|ss|skoid|sktid|skt|ske|sks|skv|saoid|suoid|scid|skdutid|sduoid|sdd|ses';
+  const named = 'signature|token|secret|passw(?:or)?d|credential|api[-_]?key|private[-_]?key';
+  return `${sas}|key|awsaccesskeyid|googleaccessid|x-amz-${free}*|x-goog-${free}*|${free}*(?:${named})${free}*`;
 }
 
 /** {@link secretParamNames} anchored to a whole parsed parameter name, case-insensitively. */
 const SECRET_PARAM_RE = new RegExp(`^(?:${secretParamNames('.')})$`, 'is');
 
-/** True for an Azure SAS param name, an AWS `x-amz-*` param, or anything naming a signature. */
+/** True for a parameter name {@link secretParamNames} matches. */
 function isSecretQueryParam(key: string): boolean {
   return SECRET_PARAM_RE.test(key);
 }
 
 /**
- * Deletes every {@link isSecretQueryParam} match from `url`'s query string —
- * removing the parameter entirely (name and value), not just blanking its value,
- * so that no parameter name recognizable as a signing parameter (e.g. `sig=`)
- * survives in the result — and returns the re-serialized URL, or `undefined`
- * when there was nothing to delete, so the caller can keep its original text.
+ * Removes every {@link isSecretQueryParam} match from `url`'s query string —
+ * each parameter entirely (name and value), not just its value, so that no
+ * parameter name recognizable as a signing parameter (e.g. `sig=`) survives —
+ * and returns the re-serialized URL, or `undefined` when there was nothing to
+ * remove, so the caller can keep its original text. A query string whose
+ * separators are HTML-escaped (`&amp;`) is left to the text pass, which reads
+ * `&amp;` as a separator where the URL parser would fold it into the next
+ * parameter's name.
  */
-function stripSecretSearchParams(url: URL): string | undefined {
-  const secret = [...new Set(url.searchParams.keys())].filter(isSecretQueryParam);
+function stripSecrets(url: URL): string | undefined {
+  const secret = url.search.includes('&amp;')
+    ? []
+    : [...new Set(url.searchParams.keys())].filter(isSecretQueryParam);
   if (secret.length === 0) return undefined;
   for (const key of secret) url.searchParams.delete(key);
   return url.toString();
@@ -71,11 +92,31 @@ function stripSecretParamsFromRawString(u: string): string {
   return u.includes('?') && !stripped.includes('?') ? stripped.replace('&', '?') : stripped;
 }
 
+/** `u` with its secret query parameters removed through the URL parser, or the raw fallback. */
+function stripParsedSecrets(u: string): string {
+  try {
+    return stripSecrets(new URL(u)) ?? u;
+  } catch {
+    // Not an absolute URL (no scheme/host) — fall through to relative resolution.
+  }
+  try {
+    const base = 'http://redact.invalid';
+    const resolved = stripSecrets(new URL(u, base));
+    if (resolved === undefined) return u;
+    return resolved.startsWith(base) ? resolved.slice(base.length) : resolved;
+  } catch {
+    // Not parseable even as a relative reference — fall through to the raw scrub.
+  }
+  return stripSecretParamsFromRawString(u);
+}
+
 /**
- * Redacts a presigned URL's Azure SAS or AWS SigV4 query parameters, removing each
- * matched parameter — name and value — entirely, rather than blanking its value in
- * place. Every other part of the URL (origin, path, and non-matching params) is
- * preserved.
+ * Redacts a URL's credentials: its user info (`user:pass@`), and every query
+ * parameter {@link secretParamNames} names — removing each matched parameter,
+ * name and value, entirely rather than blanking its value in place — including
+ * one separated by `;` or `&amp;`, or percent-encoded inside another
+ * parameter's value. Every other part of the URL (origin, path, and
+ * non-matching params) is preserved.
  *
  * Never throws: an absolute URL is redacted directly against the native `URL`
  * parser; a relative reference (no scheme/host) is resolved against a throwaway
@@ -86,7 +127,7 @@ function stripSecretParamsFromRawString(u: string): string {
  * port, the encoding of the parameters that remain) without changing its meaning.
  *
  * @param u - A URL, absolute or relative, with or without a query string.
- * @returns `u` with every SAS/AWS signing parameter removed.
+ * @returns `u` with its user info and every credential-bearing parameter removed.
  *
  * @example
  * ```ts
@@ -97,33 +138,25 @@ function stripSecretParamsFromRawString(u: string): string {
  * @internal
  */
 export function redactUrl(u: string): string {
-  try {
-    return stripSecretSearchParams(new URL(u)) ?? u;
-  } catch {
-    // Not an absolute URL (no scheme/host) — fall through to relative resolution.
-  }
-  try {
-    const base = 'http://redact.invalid';
-    const resolved = stripSecretSearchParams(new URL(u, base));
-    if (resolved === undefined) return u;
-    return resolved.startsWith(base) ? resolved.slice(base.length) : resolved;
-  } catch {
-    // Not parseable even as a relative reference — fall through to the raw scrub.
-  }
-  return stripSecretParamsFromRawString(u);
+  return stripSecretsFromText(stripParsedSecrets(u));
 }
 
-/** Header names whose value must never be logged or thrown, matched case-insensitively. */
-const HEADER_SECRET_KEY_RE = /authorization|x-api-key|api-key|cookie|token|secret/i;
+/**
+ * Object keys and header names whose value is never kept, matched
+ * case-insensitively anywhere in the name — plus the exact name `sig`.
+ */
+const SECRET_KEY_RE =
+  /authorization|bearer|cookie|token|secret|passw(?:or)?d|credential|api[-_]?key|private[-_]?key|signature|^sig$/i;
 
 /**
- * Redacts an HTTP header set by name: any header matching a known secret pattern
- * (`authorization`, `x-api-key`, `api-key`, `cookie`, `token`, `secret` —
- * case-insensitive, so a capitalized `Authorization` is redacted the same as
- * lowercase) becomes the literal string `'REDACTED'`; every other header passes
- * through unchanged. Returns a new object — `headers` is never mutated, since a
- * caller may still need the original values for the live request this redaction
- * is only describing.
+ * Redacts an HTTP header set by name: any header whose name matches the same
+ * secret pattern object keys are checked against (`authorization`, `cookie`,
+ * `x-api-key`, anything naming a token, secret, password, credential,
+ * signature or private key — case-insensitive, so a capitalized `Authorization`
+ * is redacted the same as lowercase) becomes the literal string `'REDACTED'`;
+ * every other header passes through unchanged. Returns a new object — `headers`
+ * is never mutated, since a caller may still need the original values for the
+ * live request this redaction is only describing.
  *
  * @param headers - The header set to redact, as sent or received.
  * @returns A new header set with secret values replaced.
@@ -139,7 +172,7 @@ const HEADER_SECRET_KEY_RE = /authorization|x-api-key|api-key|cookie|token|secre
 export function redactHeaders(headers: Record<string, string>): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(headers)) {
-    out[key] = HEADER_SECRET_KEY_RE.test(key) ? 'REDACTED' : value;
+    out[key] = SECRET_KEY_RE.test(key) ? 'REDACTED' : value;
   }
   return out;
 }
@@ -199,34 +232,62 @@ function redactEmbeddedUrls(s: string): string {
 }
 
 /**
- * Every {@link secretParamNames} parameter written as `name=value` in free text
- * — after `?`, `&`, `;` or whitespace, or at the very start — whether or not a
- * URL run around it was recognized: a bare query string, or a URL whose path
- * holds a raw space (`…/render (1).mov?sv=…&sig=…`), where the run ends at the
- * space, before the query string.
+ * User info after any `//` — `https://user:pass@host`, `postgres://admin:pass@db`,
+ * a protocol-relative `//user@host` — up to the last `@` before the host, so a
+ * password that itself holds an `@` goes with it.
+ */
+const USERINFO_RE = /(\/\/)[^\s/?#"'<>]*@/g;
+
+/**
+ * Every {@link secretParamNames} parameter written as `name=value` in free text,
+ * whether or not a URL run around it was recognized: a bare query string, a
+ * form body, a URL whose path holds a raw space (`…/render (1).mov?sv=…&sig=…`)
+ * and so ends before its query string, an HTML body's `&amp;sig=…`, or a URL
+ * percent-encoded inside another (`%3Fsig%3D…`). The name follows the start of
+ * the string, whitespace, `?`, `&`, `;`, `&amp;`, or their encodings `%3F`,
+ * `%26`, `%3B`; an encoded value ends at the next encoded separator.
  */
 const TEXT_SECRET_PARAM_RE = new RegExp(
-  `(^|[\\s?&;])(?:${secretParamNames('[\\w.-]')})=[^&;#\\s"'<>]*`,
+  `(^|&amp;|%26|%3F|%3B|[\\s?&;])(?:${secretParamNames('[\\w.-]')})` +
+    `(?:=[^&;#\\s"'<>]*|%3D(?:(?!%26|%3B|%23)[^&;#\\s"'<>])*)`,
   'gi',
 );
 
+/** The separators a removed {@link TEXT_SECRET_PARAM_RE} match takes with it: every one but a query start. */
+const PARAM_SEPARATOR_RE = /^(?:&|;|&amp;|%26|%3B)$/i;
+
 /**
  * Removes every {@link TEXT_SECRET_PARAM_RE} match, name and value, with the
- * `&` or `;` before it; a `?`, whitespace or the start of the string stays.
+ * `&`, `;`, `&amp;` or encoded separator before it; a `?` (or `%3F`),
+ * whitespace or the start of the string stays.
  */
 function stripSecretParamsFromText(s: string): string {
   return s.replace(TEXT_SECRET_PARAM_RE, (_match: string, before: string) =>
-    before === '&' || before === ';' ? '' : before,
+    PARAM_SEPARATOR_RE.test(before) ? '' : before,
   );
 }
 
-/** Every redaction a free-text string gets: its embedded URLs, then any signing parameter left in the text. */
-function redactString(s: string): string {
-  return stripSecretParamsFromText(redactEmbeddedUrls(s));
+/** The text-level passes a URL, or any string, gets: user info after `//`, then every secret parameter. */
+function stripSecretsFromText(s: string): string {
+  return stripSecretParamsFromText(s.replace(USERINFO_RE, '$1'));
 }
 
-/** Object/array key names whose value must never be logged or thrown, matched case-insensitively. */
-const VALUE_SECRET_KEY_RE = /authorization|api-key|token|secret|bearer/i;
+/**
+ * A `Bearer` credential written in free text — `Authorization: Bearer eyJ…` —
+ * with the scheme matched case-insensitively. A word of lowercase letters
+ * alone after it, as in "a bearer token", is prose and stays.
+ */
+const BEARER_RE = /\b([Bb][Ee][Aa][Rr][Ee][Rr]\s+)(?![a-z]+(?![\w\-.~+/=]))[\w\-.~+/]+=*/g;
+
+/** A JWT: three base64url segments, the first opening with `eyJ` (the encoding of `{"`). */
+const JWT_RE = /\beyJ[\w-]+\.[\w-]+\.[\w-]*/g;
+
+/** Every redaction a free-text string gets: embedded URLs, user info, secret parameters, `Bearer` credentials and JWTs. */
+function redactString(s: string): string {
+  return stripSecretsFromText(redactEmbeddedUrls(s))
+    .replace(BEARER_RE, '$1REDACTED')
+    .replace(JWT_RE, 'REDACTED');
+}
 
 function redactValueInner(value: unknown, seen: WeakSet<object>): unknown {
   if (typeof value === 'string') return redactString(value);
@@ -240,7 +301,7 @@ function redactValueInner(value: unknown, seen: WeakSet<object>): unknown {
     seen.add(value);
     const out: Record<string, unknown> = {};
     for (const [key, val] of Object.entries(value)) {
-      out[key] = VALUE_SECRET_KEY_RE.test(key) ? 'REDACTED' : redactValueInner(val, seen);
+      out[redactString(key)] = SECRET_KEY_RE.test(key) ? 'REDACTED' : redactValueInner(val, seen);
     }
     return out;
   }
@@ -248,16 +309,21 @@ function redactValueInner(value: unknown, seen: WeakSet<object>): unknown {
 }
 
 /**
- * Deep-walks `value`, redacting as it goes: a string has every embedded URL run
- * through {@link redactUrl}, then any signing parameter still written in its
- * text (`sig=…` in a bare query string, or after a URL whose path held a raw
- * space) removed; an array is walked element by element; an object has
- * each key checked against a known secret pattern (`authorization`, `api-key`,
- * `token`, `secret`, `bearer` — case-insensitive) — a match replaces the whole
- * value with `'REDACTED'` without recursing into it, anything else recurses; every
- * other value (numbers, booleans, `null`, `undefined`) passes through unchanged. A
- * value already visited earlier on the same walk (a circular reference) is
- * reported as the literal string `'[Circular]'` rather than recursed into again.
+ * Deep-walks `value`, redacting as it goes. A string has every embedded URL run
+ * through {@link redactUrl}, then loses any user info or secret parameter
+ * still written in its text (`sig=…` in a bare query string, an HTML body's
+ * `&amp;sig=…`, a percent-encoded `%3Fsig%3D…`), any `Bearer` credential
+ * (`Bearer REDACTED`) and any JWT (`REDACTED`). An array is walked element by
+ * element. An object has each key checked against a known secret pattern
+ * (`authorization`, `cookie`, `sig`, and anything naming a token, secret,
+ * password, credential, API key, private key, signature or bearer —
+ * case-insensitive) — a match replaces the whole value with `'REDACTED'`
+ * without recursing into it, anything else recurses — and each key is itself
+ * redacted as a string, so a URL used as a key loses its signature too. Every
+ * other value (numbers, booleans, `null`, `undefined`) passes through
+ * unchanged. A value already visited earlier on the same walk (a circular
+ * reference) is reported as the literal string `'[Circular]'` rather than
+ * recursed into again.
  *
  * This is the SDK's general-purpose redaction path for anything that is not
  * already known to be a bare URL or a header set — {@link redactUrl} and

@@ -67,8 +67,7 @@ export interface AssetJSON {
  * ```
  */
 export class Asset {
-  /** The presigned read URL naming this asset — unredacted; see the class docs. */
-  readonly url: string;
+  readonly #url: string;
   /** Timing derived from the job that produced this asset. */
   readonly meta: JobMeta;
   readonly #fetch: FetchLike;
@@ -77,9 +76,20 @@ export class Asset {
    * @param options - See {@link AssetOptions}.
    */
   constructor(options: AssetOptions) {
-    this.url = options.url;
+    this.#url = options.url;
     this.meta = options.meta;
     this.#fetch = options.fetch ?? (globalThis.fetch as FetchLike);
+  }
+
+  /**
+   * The presigned read URL naming this asset — unredacted; see the class
+   * docs. A get-only accessor over a private field rather than a plain
+   * public field, so it never becomes an enumerable own property: spread,
+   * `Object.keys`, `Object.assign`, `structuredClone`, `console.dir`, and
+   * `console.table` all skip it, while `asset.url` itself is unaffected.
+   */
+  get url(): string {
+    return this.#url;
   }
 
   /**
@@ -141,7 +151,7 @@ export class Asset {
 
   /** The redacted, JSON-safe shape `JSON.stringify(asset)` produces. */
   toJSON(): AssetJSON {
-    return { url: redactUrl(this.url), meta: this.meta };
+    return { url: redactUrl(this.#url), meta: this.meta };
   }
 
   /** The same redacted shape as {@link toJSON}, serialized. */
@@ -165,10 +175,10 @@ export class Asset {
    * once its status is confirmed successful.
    */
   async #fetchOk(): Promise<Response> {
-    const res = await this.#fetch(this.url);
+    const res = await this.#fetch(this.#url);
     if (!res.ok) {
       throw new AudioVideoError({
-        message: `Fetching the asset at ${redactUrl(this.url)} failed with status ${res.status}.`,
+        message: `Fetching the asset at ${redactUrl(this.#url)} failed with status ${res.status}.`,
         code: 'asset_fetch_failed',
         status: res.status,
       });

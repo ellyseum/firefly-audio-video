@@ -1,4 +1,5 @@
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { Console } from 'node:console';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
@@ -94,6 +95,21 @@ function captureChunks(): { stream: Writable; chunks: Buffer[] } {
     },
   });
   return { stream, chunks };
+}
+
+/** `console.table(value)`'s rendered output, captured via a private `Console` instance. */
+function captureConsoleTable(value: unknown): string {
+  const chunks: string[] = [];
+  const capture = new Console({
+    stdout: new Writable({
+      write(chunk: Buffer, _encoding, callback) {
+        chunks.push(chunk.toString('utf8'));
+        callback();
+      },
+    }),
+  });
+  capture.table(value);
+  return chunks.join('');
 }
 
 // --- buffer() ----------------------------------------------------------------------
@@ -363,6 +379,19 @@ test('toJSON()/toString()/util.inspect redact the URL while .url itself still ca
     expect(s).not.toContain('sig=');
     expect(s).toContain('rest=keep');
   }
+});
+
+test('the url is never an own enumerable property, so a printer that bypasses toJSON/inspect cannot expose it', () => {
+  const asset = new Asset({ url: SAS_URL, meta: sampleMeta() });
+
+  expect(asset.url).toContain('sig=SUPER_SECRET');
+
+  expect(Object.keys(asset)).toEqual(['meta']);
+  expect('url' in { ...asset }).toBe(false);
+  expect('url' in Object.assign({}, asset)).toBe(false);
+  expect('url' in structuredClone(asset)).toBe(false);
+  expect(inspect(asset, { customInspect: false })).not.toContain('SUPER_SECRET');
+  expect(captureConsoleTable(asset)).not.toContain('SUPER_SECRET');
 });
 
 test('toJSON() reports the meta alongside the redacted url', () => {

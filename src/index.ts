@@ -7,3 +7,6 @@ export type {
   PresetRef,
   EncodeConfig,
 } from './dgr/schemas.js';
+
+export { AudioVideoError } from './core/errors.js';
+export type { AudioVideoErrorOptions, AudioVideoErrorJSON } from './core/errors.js';

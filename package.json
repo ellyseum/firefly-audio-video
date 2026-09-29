@@ -1,0 +1,106 @@
+{
+  "name": "firefly-audio-video",
+  "version": "0.1.0",
+  "description": "Node/TypeScript client for Adobe Firefly Services' audio/video (DGR) API — promises that resolve with the finished asset, native preset/.epr authoring, redacted logging, and an npx CLI.",
+  "keywords": [
+    "adobe",
+    "firefly",
+    "firefly-services",
+    "audio-video",
+    "dgr",
+    "video",
+    "render",
+    "mogrt",
+    "prores",
+    "hevc",
+    "sdk",
+    "cli"
+  ],
+  "license": "Apache-2.0",
+  "author": "ellyseum",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ellyseum/firefly-audio-video.git"
+  },
+  "homepage": "https://github.com/ellyseum/firefly-audio-video#readme",
+  "bugs": {
+    "url": "https://github.com/ellyseum/firefly-audio-video/issues"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "sideEffects": false,
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "bin": {
+    "dgr": "./dist/cli.cjs"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "coverage": "vitest run --coverage",
+    "smoke": "vitest run --config vitest.smoke.config.ts",
+    "prepare": "husky",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "@adobe/aio-lib-files": "*"
+  },
+  "peerDependenciesMeta": {
+    "@adobe/aio-lib-files": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "@adobe/firefly-services-common-apis": "^2.0.0",
+    "zod": "^4.6.5",
+    "commander": "^13.1.0",
+    "dotenv": "^18.0.4"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^21.2.3",
+    "@commitlint/config-conventional": "^21.2.3",
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^24.19.0",
+    "@vitest/coverage-v8": "^5.0.2",
+    "eslint": "^10.11.0",
+    "globals": "^17.12.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.6.0",
+    "prettier": "^3.9.9",
+    "tsup": "^8.5.1",
+    "typescript": "~6.0.3",
+    "typescript-eslint": "^8.71.0",
+    "undici": "^8.11.2",
+    "vitest": "^5.0.2"
+  },
+  "lint-staged": {
+    "*.{ts,js,json,md}": [
+      "prettier --write"
+    ],
+    "*.ts": [
+      "eslint --fix"
+    ]
+  }
+}

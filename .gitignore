@@ -1,0 +1,22 @@
+# deps / build / local
+node_modules/
+dist/
+coverage/
+*.tgz
+.env
+.env.*
+*.tmp
+.DS_Store
+
+# agentic-dev artifacts — never shipped
+.claude/
+.cursor/
+.cursorrules
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+.github/copilot-instructions.md
+plans/
+docs/superpowers/
+*.plan.md
+.superpowers/

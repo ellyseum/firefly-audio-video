@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: 'If you use this software, please cite it as below.'
+title: 'firefly-audio-video'
+abstract: >-
+  Node/TypeScript client for Adobe Firefly Services' audio/video (DGR) API —
+  promises that resolve with the finished asset, native preset/.epr authoring,
+  redacted logging, and an npx CLI.
+authors:
+  - name: 'ellyseum'
+    website: 'https://github.com/ellyseum'
+license: Apache-2.0
+repository-code: 'https://github.com/ellyseum/firefly-audio-video'

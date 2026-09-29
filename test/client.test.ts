@@ -26,6 +26,7 @@ import {
   recordingLogger,
   running,
   succeeded,
+  succeededWithoutOutputs,
   until,
   wireOutput,
 } from './support/mock-api.js';
@@ -230,12 +231,39 @@ test('outputs sharing a variationIndex and presetIndex are told apart by destina
   expect(assets.map((asset) => asset.meta.queueMs)).toEqual([5_000, 30_000]);
 });
 
-test('an output the terminal status does not list still resolves, with no timing of its own', async () => {
+test('a spec output the terminal status does not list rejects invalid_response naming its pair', async () => {
   api.submit(['job-4']);
   api.status('job-4', () => succeeded('job-4', []));
-  const asset = await client().render(singleSpec(), { pollIntervalMs: 0 });
-  expect(asset.url).toBe(READ);
-  expect(asset.meta).toEqual({ jobId: 'job-4', createdAt: Date.parse(CREATED), perItem: [] });
+  const error = await rejection(client().render(singleSpec(), { pollIntervalMs: 0 }));
+  expect(error.code).toBe('invalid_response');
+  expect(error.jobId).toBe('job-4');
+  expect(error.message).toContain('variationIndex=0');
+  expect(error.message).toContain('presetIndex=0');
+  expect(error.message).not.toContain(READ);
+  expect(error.message).not.toContain(WRITE);
+});
+
+test('a wire output the spec did not declare rejects invalid_response naming its pair, never its URL', async () => {
+  api.submit(['job-4b']);
+  api.status('job-4b', () =>
+    succeeded('job-4b', [
+      wireOutput(0, 0, 10, 40, WRITE),
+      wireOutput(7, 0, 10, 40, `${STORAGE}/out/extra.mov`),
+    ]),
+  );
+  const error = await rejection(client().render(singleSpec(), { pollIntervalMs: 0 }));
+  expect(error.code).toBe('invalid_response');
+  expect(error.jobId).toBe('job-4b');
+  expect(error.message).toContain('variationIndex=7');
+  expect(error.message).not.toContain(STORAGE);
+});
+
+test('a terminal status with no outputs at all rejects invalid_response', async () => {
+  api.submit(['job-4c']);
+  api.status('job-4c', () => succeededWithoutOutputs('job-4c'));
+  const error = await rejection(client().render(singleSpec(), { pollIntervalMs: 0 }));
+  expect(error.code).toBe('invalid_response');
+  expect(error.jobId).toBe('job-4c');
 });
 
 // --- render: presets -----------------------------------------------------------------

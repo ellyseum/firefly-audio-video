@@ -182,6 +182,24 @@ export class MockApi {
       .persist();
   }
 
+  /**
+   * The same as {@link MockApi.download}, but the response answers only after
+   * `delayMs` — for a test that aborts a download already in flight. `onStart`
+   * fires the moment the request lands, before the delay.
+   */
+  downloadDelayed(pathPrefix: string, bytes: Buffer, delayMs: number, onStart?: () => void): void {
+    this.agent
+      .get(STORAGE)
+      .intercept({ path: (path) => path.startsWith(pathPrefix), method: 'GET' })
+      .reply(200, async (reply) => {
+        onStart?.();
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        await this.#record(STORAGE, reply);
+        return bytes;
+      })
+      .persist();
+  }
+
   /** Records one request an interceptor answered. */
   async #record(origin: string, opts: ReplyOptions): Promise<void> {
     this.calls.push({
@@ -225,6 +243,11 @@ export function succeeded(jobId: string, outputs: object[]): object {
     totalJobItems: outputs.length,
     outputs,
   };
+}
+
+/** A succeeded status body for `jobId` carrying no `outputs` key at all. */
+export function succeededWithoutOutputs(jobId: string): object {
+  return { jobId, status: 'succeeded', createdDate: CREATED };
 }
 
 /** A fake {@link StorageProvider} that records every call and returns SAS-shaped URLs. */

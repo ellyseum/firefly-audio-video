@@ -197,20 +197,42 @@ export async function materializeRender(
  * so each is matched to its spec output by that numeric pair — never by
  * position — and outputs sharing a pair are told apart by destination. An
  * asset's `meta` carries its own output's timing.
+ *
+ * @throws {@link AudioVideoError} `invalid_response`, `jobId` set, when the
+ *   terminal status carries no `outputs` array, when a submitted output has
+ *   no matching entry in it, or when an entry in it matches no submitted
+ *   output — the service reported something other than what was submitted.
+ *   The message names the mismatched `(variationIndex, presetIndex)` pairs,
+ *   never a URL.
  */
 export function renderAssets(
   terminal: JobStatusLike,
   meta: JobMeta,
   outputs: readonly MaterializedOutput[],
 ): Asset[] {
-  const wire = Array.isArray(terminal.outputs) ? terminal.outputs : [];
+  const wire = terminal.outputs;
+  if (!Array.isArray(wire)) {
+    throw outputMismatch(meta.jobId, 'The terminal status carried no outputs.');
+  }
   const claimed = new Set<number>();
-  return outputs.map((output, index) => {
+  const assets: Asset[] = [];
+  const unmatched: MaterializedOutput[] = [];
+  for (const [index, output] of outputs.entries()) {
     const position = matchWireOutput(wire, output, claimed);
-    if (position !== undefined) claimed.add(position);
-    const item = position === undefined ? undefined : meta.perItem[position];
-    return new Asset({ url: output.readUrl, meta: assetMeta(meta, index, item) });
-  });
+    if (position === undefined) {
+      unmatched.push(output);
+      continue;
+    }
+    claimed.add(position);
+    assets.push(
+      new Asset({ url: output.readUrl, meta: assetMeta(meta, index, meta.perItem[position]) }),
+    );
+  }
+  const unclaimed = wire.filter((_entry, position) => !claimed.has(position));
+  if (unmatched.length > 0 || unclaimed.length > 0) {
+    throw outputMismatch(meta.jobId, mismatchMessage(unmatched, unclaimed));
+  }
+  return assets;
 }
 
 /**
@@ -471,6 +493,40 @@ function wireIndex(value: unknown): number {
         ? Number(value)
         : Number.NaN;
   return Number.isInteger(n) && n >= 0 ? n : -1;
+}
+
+/** @internal An {@link AudioVideoError} `code: 'invalid_response'`, naming the render job it came from. */
+function outputMismatch(jobId: string | undefined, message: string): AudioVideoError {
+  return new AudioVideoError({ message, code: 'invalid_response', jobId });
+}
+
+/** Every side of an output mismatch, by its `(variationIndex, presetIndex)` pair — never a URL. */
+function mismatchMessage(
+  unmatched: readonly MaterializedOutput[],
+  unclaimed: readonly JobItemLike[],
+): string {
+  const parts: string[] = [];
+  if (unmatched.length > 0) {
+    const pairs = unmatched.map((output) => pairLabel(output.variationIndex, output.presetIndex));
+    parts.push(`the spec declared ${pairs.join(', ')} with no matching output in the response`);
+  }
+  if (unclaimed.length > 0) {
+    parts.push(
+      `the response reported ${unclaimed.map(wirePairLabel).join(', ')} the spec did not declare`,
+    );
+  }
+  return `The rendered outputs did not match the spec: ${parts.join('; ')}.`;
+}
+
+/** A `(variationIndex, presetIndex)` pair, formatted for an error message. */
+function pairLabel(variationIndex: number, presetIndex: number): string {
+  return `(variationIndex=${variationIndex}, presetIndex=${presetIndex})`;
+}
+
+/** A wire `outputs[]` entry's `(variationIndex, presetIndex)` pair, coerced the same way matching does. */
+function wirePairLabel(entry: JobItemLike): string {
+  if (!isRecord(entry)) return pairLabel(-1, -1);
+  return pairLabel(wireIndex(entry.variationIndex), wireIndex(entry.presetIndex));
 }
 
 /** An asset's timing: the job's ID and acceptance time, with its own output's durations. */

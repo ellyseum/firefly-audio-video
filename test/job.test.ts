@@ -660,7 +660,7 @@ test('timeoutMs → rejects job_timeout, stops polling, and issues no cancel req
 test('a rejected submit rejects the job with that same error; jobId and meta stay undefined', async () => {
   const failure = new AudioVideoError({
     message: 'Request failed with status 400.',
-    code: 'HTTP_400',
+    code: 'http_400',
     status: 400,
   });
   const job = runJob(http(), {
@@ -680,7 +680,7 @@ test('a failing status poll rejects the job with the HTTP error', async () => {
 
   const err = await rejectionOf(job);
 
-  expect(err?.code).toBe('HTTP_500');
+  expect(err?.code).toBe('http_500');
   expect(err?.status).toBe(500);
 });
 

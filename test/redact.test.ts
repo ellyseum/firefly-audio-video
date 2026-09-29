@@ -146,7 +146,7 @@ test('redactValue: never throws on a circular array', () => {
 test('AudioVideoError: redacts message + items; secrets never survive JSON.stringify, toString, or util.inspect', () => {
   const err = new AudioVideoError({
     message: 'Render failed for https://x.blob/f?sig=SECRETSIG&se=2026, retry exhausted',
-    code: 'RENDER_FAILED',
+    code: 'render_failed',
     status: 403,
     jobId: 'job-1',
     requestId: 'req-1',
@@ -164,14 +164,14 @@ test('AudioVideoError: redacts message + items; secrets never survive JSON.strin
 
   expect(err).toBeInstanceOf(AudioVideoError);
   expect(err).toBeInstanceOf(Error);
-  expect(err.code).toBe('RENDER_FAILED');
+  expect(err.code).toBe('render_failed');
   expect(err.cause).toBeInstanceOf(Error);
   expect((err.cause as Error).message).toBe('network reset');
 });
 
 test('AudioVideoError: .code defaults to a stable value when omitted', () => {
   const err = new AudioVideoError({ message: 'boom' });
-  expect(err.code).toBe('AUDIO_VIDEO_ERROR');
+  expect(err.code).toBe('audio_video_error');
 });
 
 test('AudioVideoError: toJSON returns only the documented, redacted fields', () => {

@@ -18,10 +18,11 @@ export interface AudioVideoErrorOptions {
   /** The HTTP status this error corresponds to, when it came from a response. */
   status?: number;
   /**
-   * A stable, machine-checkable identifier for what went wrong (e.g. `'HTTP_429'`,
-   * `'JOB_ITEM_ERROR'`) — meant for `===`/`switch` handling, never for parsing
-   * `.message` text. Defaults to `'AUDIO_VIDEO_ERROR'` when omitted, so `.code` is
-   * always a defined string.
+   * A stable, machine-checkable identifier for what went wrong (e.g. `'http_429'`,
+   * `'job_failed'`) — meant for `===`/`switch` handling, never for parsing
+   * `.message` text. Every code this SDK produces is lowercase `snake_case`; a
+   * new code keeps that shape. Defaults to `'audio_video_error'` when omitted, so
+   * `.code` is always a defined string.
    */
   code?: string;
   /** The DGR job this error relates to, when one exists. */
@@ -69,7 +70,7 @@ export interface AudioVideoErrorJSON {
  * ```ts
  * throw new AudioVideoError({
  *   message: `Render failed for ${redactUrl(sourceUrl)}`,
- *   code: 'RENDER_FAILED',
+ *   code: 'render_failed',
  *   status: 403,
  *   jobId,
  *   cause: fetchError,
@@ -98,7 +99,7 @@ export class AudioVideoError extends Error {
     Object.setPrototypeOf(this, AudioVideoError.prototype);
 
     this.name = 'AudioVideoError';
-    this.code = options.code ?? 'AUDIO_VIDEO_ERROR';
+    this.code = options.code ?? 'audio_video_error';
     this.status = options.status;
     this.jobId = options.jobId;
     this.requestId = options.requestId;

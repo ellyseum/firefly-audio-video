@@ -253,7 +253,7 @@ test('429 exhausting maxRetries throws a redacted AudioVideoError, not an infini
 
   expect(err).toBeInstanceOf(AudioVideoError);
   expect((err as AudioVideoError).status).toBe(429);
-  expect((err as AudioVideoError).code).toBe('HTTP_429');
+  expect((err as AudioVideoError).code).toBe('http_429');
   expect(agent.pendingInterceptors()).toHaveLength(0);
 });
 
@@ -280,7 +280,7 @@ test('a non-2xx response throws AudioVideoError whose serialized form has no sig
   expect(err).toBeInstanceOf(AudioVideoError);
   const e = err as AudioVideoError;
   expect(e.status).toBe(403);
-  expect(e.code).toBe('HTTP_403');
+  expect(e.code).toBe('http_403');
   expect(e.requestId).toBe('req-err-1');
 
   const serialized = [JSON.stringify(e), String(e), inspect(e), e.message];
@@ -331,7 +331,7 @@ test('401 twice throws — no infinite loop, and forceRefresh is only requested 
 
   expect(err).toBeInstanceOf(AudioVideoError);
   expect((err as AudioVideoError).status).toBe(401);
-  expect((err as AudioVideoError).code).toBe('HTTP_401');
+  expect((err as AudioVideoError).code).toBe('http_401');
   expect(getAccessTokenMock).toHaveBeenCalledTimes(2);
   expect(agent.pendingInterceptors()).toHaveLength(0);
 });

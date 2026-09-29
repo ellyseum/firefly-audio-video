@@ -120,7 +120,7 @@ export class HttpClient {
    * @param body - A JSON-serializable request body; omit for a bodyless request.
    * @param init - Per-call signal/header overrides; see {@link HttpRequestInit}.
    * @returns The status, headers, and parsed body of the eventual success response.
-   * @throws {@link AudioVideoError} — `code: 'HTTP_<status>'` — for any non-2xx
+   * @throws {@link AudioVideoError} — `code: 'http_<status>'` — for any non-2xx
    *   response left after retries are exhausted. Its `.message` and `.items`
    *   (the redacted response body) are built via {@link redactUrl}/`redactValue`
    *   so a presigned URL's SAS params or a leaked secret never reach it.
@@ -295,7 +295,7 @@ async function toAudioVideoError(res: Response, url: URL): Promise<AudioVideoErr
   const requestId = res.headers.get('x-request-id') ?? undefined;
   return new AudioVideoError({
     message: `Request to ${redactUrl(url.toString())} failed with status ${res.status}.`,
-    code: `HTTP_${res.status}`,
+    code: `http_${res.status}`,
     status: res.status,
     requestId,
     items: body === undefined ? undefined : Array.isArray(body) ? body : [body],

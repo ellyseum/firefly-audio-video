@@ -6,6 +6,7 @@ import { inspect } from 'node:util';
 import { afterAll, afterEach, beforeAll, beforeEach, expect, expectTypeOf, test } from 'vitest';
 import { Asset } from '../src/core/asset.js';
 import { AudioVideoError } from '../src/core/errors.js';
+import { InMemoryPool } from '../src/core/pool.js';
 import type { RenderBuilder } from '../src/dgr/builder.js';
 import { createClient, type Client, type ClientConfig } from '../src/dgr/client.js';
 import { Preset } from '../src/dgr/preset.js';
@@ -200,6 +201,21 @@ test('.buffer(), .save() and .stream() render, then read the finished asset', as
   expect(api.count('POST', '/v1/templates/render')).toBe(3);
 });
 
+test('.save() creates its destination directory, the same as Asset.save', async () => {
+  jobsSucceed('job-mkdir');
+  api.download('/out/', BYTES);
+  const dir = mkdtempSync(join(tmpdir(), 'firefly-audio-video-builder-'));
+  const nested = join(dir, 'nested', 'deep', 'out.mov');
+
+  await client().render(CAPSULE, { pollIntervalMs: 0 }).prores.save(nested);
+
+  expect(Buffer.compare(readFileSync(nested), BYTES)).toBe(0);
+  unlinkSync(nested);
+  rmdirSync(join(dir, 'nested', 'deep'));
+  rmdirSync(join(dir, 'nested'));
+  rmdirSync(dir);
+});
+
 test('the builder signal cancels an in-progress .save(), writing nothing to disk, even after the render has settled', async () => {
   jobsSucceed('job-save-cancel');
   let started = false;
@@ -293,6 +309,58 @@ test('cancel() after the submit asks the service to stop the job', async () => {
   await builder.cancel();
   expect((await settled).code).toBe('cancelled');
   expect(api.count('PUT', '/v1/cancel/job-1')).toBe(1);
+});
+
+test('a signal aborted after a fluent render submits stops polling and cancels the job remotely', async () => {
+  const controller = new AbortController();
+  api.submit(['job-2']);
+  api.status('job-2', () => running('job-2'));
+  api.cancel('job-2');
+  const builder = client().render(CAPSULE, { pollIntervalMs: 1, signal: controller.signal }).prores;
+  const settled = rejection(builder);
+  await until(() => builder.jobId === 'job-2');
+
+  controller.abort();
+  const error = await settled;
+  expect(error.code).toBe('cancelled');
+  expect(api.count('PUT', '/v1/cancel/job-2')).toBe(1);
+});
+
+test('an already-aborted signal makes the fluent render reject cancelled, submitting nothing', async () => {
+  jobsSucceed('job-never');
+  const controller = new AbortController();
+  controller.abort();
+  const error = await rejection(client().render(CAPSULE, { signal: controller.signal }).prores);
+  expect(error.code).toBe('cancelled');
+  expect(api.calls).toEqual([]);
+});
+
+test('a signal aborted while a fluent render is still queued for a pool slot submits nothing', async () => {
+  const pool = new InMemoryPool({ concurrency: 1 });
+  let open = false;
+  api.submit(['holder', 'queued']);
+  api.status('holder', () =>
+    open ? succeeded('holder', [wireOutput(0, 0, 1, 2)]) : running('holder'),
+  );
+  const c = client({ pool });
+
+  const holder = c.render(CAPSULE, { pollIntervalMs: 1 }).prores;
+  void holder.catch(() => undefined); // starts the render now; its real outcome is awaited below
+  await until(() => api.count('POST', '/v1/templates/render') === 1);
+
+  const controller = new AbortController();
+  const queued = c.render(CAPSULE, { pollIntervalMs: 1, signal: controller.signal }).prores;
+  const settled = rejection(queued);
+  await flush();
+  expect(pool.queued).toBe(1);
+
+  controller.abort();
+  const error = await settled;
+  expect(error.code).toBe('cancelled');
+
+  open = true;
+  await holder;
+  expect(api.count('POST', '/v1/templates/render')).toBe(1);
 });
 
 test('the preset option starts the chain, fileName names the output, and a URL or { url } is a source', async () => {

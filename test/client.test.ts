@@ -1,3 +1,6 @@
+import { existsSync, mkdtempSync, rmdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { Readable } from 'node:stream';
 import { inspect } from 'node:util';
 import { afterAll, afterEach, beforeAll, beforeEach, expect, expectTypeOf, test } from 'vitest';
@@ -167,6 +170,23 @@ test('a 202 is never delayed by its Retry-After header, whatever it says', async
   expect(asset.url).toBe(READ);
 });
 
+test('onProgress is called with each status poll, terminal included', async () => {
+  const seen: (string | undefined)[] = [];
+  api.submit(['job-op']);
+  let poll = 0;
+  api.status('job-op', () => {
+    const body =
+      poll === 0 ? running('job-op') : succeeded('job-op', [wireOutput(0, 0, 1, 2, WRITE)]);
+    poll += 1;
+    return body;
+  });
+  await client().render(singleSpec(), {
+    pollIntervalMs: 0,
+    onProgress: (status) => seen.push(status.status),
+  });
+  expect(seen).toEqual(['running', 'succeeded']);
+});
+
 // --- render: several outputs ---------------------------------------------------------
 
 test('two outputs whose wire entries arrive reversed, indexes as strings, resolve Asset[] in spec order with their own timing', async () => {
@@ -224,6 +244,28 @@ test('outputs sharing a variationIndex and presetIndex are told apart by destina
       outputs: [
         { presetIndex: 0, destination: writeA },
         { presetIndex: 0, destination: writeB },
+      ],
+    },
+    { pollIntervalMs: 0 },
+  )) as Asset[];
+  expect(assets.map((asset) => asset.meta.queueMs)).toEqual([5_000, 30_000]);
+});
+
+test('outputs sharing a variationIndex and presetIndex with no destination match are matched in order, each keeping its own timing', async () => {
+  api.submit(['job-3b']);
+  api.status('job-3b', () =>
+    succeeded('job-3b', [
+      wireOutput(0, 0, 5, 50, `${STORAGE}/out/unrelated-0.mov`),
+      wireOutput(0, 0, 30, 50, `${STORAGE}/out/unrelated-1.mov`),
+    ]),
+  );
+  const assets = (await client().render(
+    {
+      source: CAPSULE,
+      presets: ['h264Land1080pHq'],
+      outputs: [
+        { presetIndex: 0, destination: `${STORAGE}/out/a.mov` },
+        { presetIndex: 0, destination: `${STORAGE}/out/b.mov` },
       ],
     },
     { pollIntervalMs: 0 },
@@ -411,6 +453,31 @@ test("resolveAs: 'file' without a savePath, or an unknown mode, rejects before a
   expect(api.calls).toEqual([]);
 });
 
+test('the render signal cancels a resolveAs download in progress, writing nothing to disk', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'firefly-audio-video-client-'));
+  const savePath = join(dir, 'out.mov');
+  const controller = new AbortController();
+  api.submit(['job-dl']);
+  succeedsAt('job-dl');
+  let started = false;
+  api.downloadDelayed('/out/a.mov', Buffer.from('bytes'), 200, () => {
+    started = true;
+  });
+
+  const job = client().render(singleSpec(), {
+    resolveAs: 'file',
+    savePath,
+    signal: controller.signal,
+    pollIntervalMs: 0,
+  });
+  await until(() => started);
+  controller.abort();
+  const error = await rejection(job);
+  expect(error.code).toBe('cancelled');
+  expect(existsSync(savePath)).toBe(false);
+  rmdirSync(dir);
+});
+
 // --- logging -------------------------------------------------------------------------------
 
 /** Every string a record must never carry. */
@@ -586,6 +653,34 @@ test('at concurrency 1, renders whose presets need staging complete: staging nev
   expect(storage.staged).toHaveLength(2);
 });
 
+test('at concurrency 1, a describe behind a running render submits nothing until the render settles', async () => {
+  const timeline: string[] = [];
+  let renderDone = false;
+  api.submit(['job-r'], { onSubmit: () => timeline.push('submit:render') });
+  api.status('job-r', () => {
+    if (!renderDone) return running('job-r');
+    timeline.push('done:render');
+    return succeeded('job-r', [wireOutput(0, 0, 1, 2, WRITE)]);
+  });
+  api.submit(['d-x'], {
+    path: '/v1/templates/describe',
+    onSubmit: () => timeline.push('submit:describe'),
+  });
+  api.status('d-x', () => ({ jobId: 'd-x', status: 'succeeded' }));
+
+  const c = client({ concurrency: 1 });
+  const render = c.render(singleSpec(), { pollIntervalMs: 1 });
+  await until(() => timeline.includes('submit:render'));
+  const describe = c.describe(CAPSULE, { pollIntervalMs: 1 });
+  for (let turn = 0; turn < 20; turn += 1) await flush();
+  expect(timeline).toEqual(['submit:render']);
+
+  renderDone = true;
+  await render;
+  await describe;
+  expect(timeline).toEqual(['submit:render', 'done:render', 'submit:describe']);
+});
+
 test('status, cancel, listPresets and stage take no pool slot', async () => {
   const pool = new InMemoryPool({ concurrency: 1 });
   const storage = fakeStorage();
@@ -632,6 +727,20 @@ test('cancel() after the submit asks the service to stop the job and rejects can
   const error = await rejection(job);
   expect(error).toMatchObject({ code: 'cancelled', jobId: 'job-11' });
   expect(api.count('PUT', '/v1/cancel/job-11')).toBe(1);
+});
+
+test('a signal aborted after the submit stops polling and cancels the job remotely', async () => {
+  const controller = new AbortController();
+  api.submit(['job-abort']);
+  api.status('job-abort', () => running('job-abort'));
+  api.cancel('job-abort');
+  const job = client().render(singleSpec(), { pollIntervalMs: 1, signal: controller.signal });
+  await until(() => job.jobId === 'job-abort');
+
+  controller.abort();
+  const error = await rejection(job);
+  expect(error.code).toBe('cancelled');
+  expect(api.count('PUT', '/v1/cancel/job-abort')).toBe(1);
 });
 
 test('util.inspect of a render job shows its job ID and state, nothing else', async () => {
@@ -691,6 +800,44 @@ test('describe of an After Effects project without a compName rejects before any
   const error = await rejection(client().describe({ source: { url: CAPSULE }, type: 'aep' }));
   expect(error.code).toBe('invalid_argument');
   expect(api.calls).toEqual([]);
+});
+
+test('a signal aborted after a describe submits stops polling and cancels the job remotely', async () => {
+  const controller = new AbortController();
+  api.submit(['d-abort'], { path: '/v1/templates/describe' });
+  api.status('d-abort', () => running('d-abort'));
+  api.cancel('d-abort');
+  const job = client().describe(CAPSULE, { pollIntervalMs: 1, signal: controller.signal });
+  await until(() => job.jobId === 'd-abort');
+
+  controller.abort();
+  const error = await rejection(job);
+  expect(error.code).toBe('cancelled');
+  expect(api.count('PUT', '/v1/cancel/d-abort')).toBe(1);
+});
+
+test('describe emits exactly one record on settle, success and failure', async () => {
+  const logger = recordingLogger();
+  api.submit(['d-log'], { path: '/v1/templates/describe' });
+  api.status('d-log', () => ({ jobId: 'd-log', status: 'succeeded' }));
+  await client({ logging: logger }).describe(CAPSULE, { pollIntervalMs: 0 });
+  await flush();
+  expect(logger.records).toHaveLength(1);
+  expect(logger.records[0]).toMatchObject({
+    level: 'info',
+    msg: 'describe completed',
+    jobId: 'd-log',
+    endpoint: 'POST /v1/templates/describe',
+  });
+
+  const failLogger = recordingLogger();
+  const error = await rejection(
+    client({ logging: failLogger }).describe({ source: { url: CAPSULE }, type: 'aep' }),
+  );
+  expect(error.code).toBe('invalid_argument');
+  await flush();
+  expect(failLogger.records).toHaveLength(1);
+  expect(failLogger.records[0]).toMatchObject({ level: 'error', msg: 'describe failed' });
 });
 
 // --- status, cancel, listPresets, stage -------------------------------------------------------
@@ -869,6 +1016,25 @@ test('an invalid config throws invalid_argument from createClient', () => {
   for (const config of invalid) {
     expect(thrown(() => createClient(config as ClientConfig)).code).toBe('invalid_argument');
   }
+});
+
+test('retry.maxRetries bounds how many 429 responses HttpClient retries before giving up', async () => {
+  let attempts = 0;
+  api.agent
+    .get(API)
+    .intercept({ path: '/v1/templates/render', method: 'POST' })
+    .reply(
+      429,
+      () => {
+        attempts += 1;
+        return {};
+      },
+      { headers: { 'retry-after': '0' } },
+    )
+    .persist();
+  const error = await rejection(client({ retry: { maxRetries: 0 } }).render(singleSpec()));
+  expect(error.code).toBe('http_429');
+  expect(attempts).toBe(1);
 });
 
 test('a scope given as a JSON-array string or an array is sent to IMS as one comma-joined string', async () => {

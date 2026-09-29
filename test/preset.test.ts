@@ -258,6 +258,17 @@ describe('building from a config', () => {
     );
   });
 
+  test('a codec-less preset explains where the codec should come from', async () => {
+    const direct = thrown(() => new Preset({} as unknown as EncodeConfig)).message;
+    expect(direct).toContain('empty base, resize(), or a URL-loaded .epr');
+    expect(direct).toContain('.with({ codec })');
+
+    await expect(resolvePreset(resize('9:16'), stagingContext())).rejects.toMatchObject({
+      code: 'invalid_preset',
+      message: expect.stringContaining('empty base, resize(), or a URL-loaded .epr'),
+    });
+  });
+
   test('modifier values are validated', () => {
     const hevc = Preset.encode({ codec: 'hevc' });
     expect(thrown(() => hevc.bitDepth(9 as never)).message).toContain(
@@ -318,6 +329,12 @@ describe('toPreset', () => {
     expect(thrown(() => toPreset(join(tmpdir(), 'no-such-dir', 'missing.epr'))).message).toContain(
       'Could not read',
     );
+  });
+
+  test("a Preset's own JSON form names itself rather than failing as a bare config", () => {
+    const error = thrown(() => toPreset(Preset.prores.toJSON() as never));
+    expect(error.message).toContain("Preset's JSON form");
+    expect(error.message).not.toContain('Unrecognized keys');
   });
 });
 
@@ -479,6 +496,9 @@ describe('resolvePreset', () => {
     });
     await expect(
       resolvePreset(Preset.hevc4k10bit, {} as ResolvePresetContext),
+    ).rejects.toMatchObject({ code: 'invalid_argument' });
+    await expect(
+      resolvePreset(Preset.hevc4k10bit, undefined as unknown as ResolvePresetContext),
     ).rejects.toMatchObject({ code: 'invalid_argument' });
   });
 

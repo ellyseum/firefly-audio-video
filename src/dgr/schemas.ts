@@ -107,7 +107,7 @@ export const CODECS = ['h264', 'hevc', 'prores4444', 'prores4444xq'] as const;
 export const CodecSchema = z.enum(CODECS, {
   error: (issue) =>
     issue.input === undefined
-      ? `codec is required: one of ${oneOf(CODECS)}`
+      ? `codec is required: one of ${oneOf(CODECS)} (a preset from an empty base, resize(), or a URL-loaded .epr has no codec; add one with .with({ codec })).`
       : `codec must be one of ${oneOf(CODECS)}; got ${quoted(issue.input)}`,
 });
 
@@ -224,7 +224,7 @@ export const EncodeConfigSchema = z.strictObject({
   chroma: ChromaSchema.optional(),
   /** HEVC target bitrate — bits per second, or `'120M'` / `'2500k'`. */
   bitrate: BitrateSchema.optional(),
-  /** One of DGR's native H.264 rate tiers; see {@link ModeSchema}. */
+  /** One of DGR's native H.264 rate tiers; see {@link ModeSchema}. H.264 only; any other codec rejects it at render time. */
   mode: ModeSchema.optional(),
   /** Encode an alpha channel (ProRes 4444 and 4444 XQ). */
   alpha: z.boolean().optional(),

@@ -365,6 +365,10 @@ const EXPECTED_PRESET = `Expected a preset name (${PRESET_NAMES.join(', ')}), a 
  * the named preset for it; raw `.epr` XML, an http(s) URL, a string ending
  * `.epr`, or the path of an existing file → {@link Preset.fromEpr}.
  *
+ * A string is checked as a filesystem path before being rejected, so never
+ * pass untrusted input as a preset string: a path that happens to exist is
+ * read and staged as its `.epr` contents.
+ *
  * @throws {@link AudioVideoError} — `code: 'invalid_preset'` — for anything
  *   else, with a message listing the valid names.
  *
@@ -379,8 +383,14 @@ const EXPECTED_PRESET = `Expected a preset name (${PRESET_NAMES.join(', ')}), a 
 export function toPreset(input: PresetInput): Preset {
   if (input instanceof Preset) return input;
   if (typeof input === 'string') return presetFromString(input);
-  if (typeof input === 'object' && input !== null && !Array.isArray(input))
+  if (typeof input === 'object' && input !== null && !Array.isArray(input)) {
+    if ('kind' in input && 'config' in input) {
+      throw invalidPreset(
+        "this is a Preset's JSON form (toJSON()); pass the Preset itself, or its .config, not the JSON.",
+      );
+    }
     return new Preset(input);
+  }
   throw invalidPreset(
     `Unrecognized preset of type ${input === null ? 'null' : typeof input}. ${EXPECTED_PRESET}`,
   );
@@ -467,7 +477,7 @@ export async function resolvePreset(preset: Preset, ctx: ResolvePresetContext): 
     if (entry.kind === 'passthrough') return { presetId: entry.presetId };
   }
   const config = parseOrThrow(EncodeConfigSchema, effectiveConfig(state), 'preset config');
-  const presetId = (ctx.matchNamed ?? matchNativePreset)(config);
+  const presetId = (ctx?.matchNamed ?? matchNativePreset)(config);
   if (typeof presetId === 'string' && presetId !== '') return { presetId };
   return { url: await stageXml(ctx, toEpr(config)) };
 }
@@ -498,7 +508,7 @@ export const encode = Preset.encode;
 
 /**
  * An empty base preset at a fixed frame size — `new Preset().resize(target)`;
- * chain `.with({ codec })` or a modifier to finish it.
+ * chain `.with({ codec })` to finish it.
  *
  * @example
  * ```ts

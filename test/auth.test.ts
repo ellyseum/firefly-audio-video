@@ -160,7 +160,7 @@ test('a forceRefresh call that arrives while a mint is already in flight shares 
   expect(ims.requests).toHaveLength(1);
 });
 
-// --- JWT exp decode --------------------------------------------------------------
+// --- expiry from the token's claims -------------------------------------------------
 
 test('a decodable JWT exp claim drives the cache expiry, not the assumed TTL', async () => {
   useFakeClock();
@@ -185,7 +185,97 @@ test('a decodable JWT exp claim drives the cache expiry, not the assumed TTL', a
   expect(ims.requests).toHaveLength(2);
 });
 
-test('a JWT with no exp claim falls back to the configured TTL', async () => {
+/** The claim set a real IMS access token carries — no `exp`; `created_at` and `expires_in` as strings. */
+function imsClaims(
+  createdAt: number | string,
+  expiresIn: number | string,
+): Record<string, unknown> {
+  return {
+    id: 'fake-token-id',
+    org: 'FAKEORG@AdobeOrg',
+    type: 'access_token',
+    client_id: CLIENT_ID,
+    user_id: 'FAKEUSER@techacct.adobe.com',
+    as: 'ims-na1',
+    aa_id: 'FAKEUSER@techacct.adobe.com',
+    ctp: 0,
+    moi: 'fake-moi',
+    expires_in: expiresIn,
+    scope: DEFAULT_SCOPE,
+    created_at: createdAt,
+  };
+}
+
+const HOUR_MS = 60 * 60 * 1000;
+
+test.each<[label: string, form: (value: number) => number | string]>([
+  ['strings, as IMS sends them', String],
+  ['numbers', Number],
+])(
+  'a token with created_at and expires_in as %s, and no exp, is re-minted refreshMarginMs before it expires',
+  async (_label, form) => {
+    useFakeClock();
+    vi.setSystemTime(new Date('2026-09-29T12:00:00.000Z'));
+    const jwt = fakeJwt(imsClaims(form(Date.now()), form(HOUR_MS)));
+    ims.token(jwt);
+    ims.token('TOKEN_2');
+    const provider = new ClientCredentialsProvider(CREDS, { refreshMarginMs: 300_000 });
+
+    await expect(provider.getAccessToken()).resolves.toBe(jwt);
+
+    // One millisecond before the refresh point (the 1h lifetime minus the 5-minute margin).
+    await vi.advanceTimersByTimeAsync(HOUR_MS - 300_000 - 1);
+    await expect(provider.getAccessToken()).resolves.toBe(jwt);
+    expect(ims.requests).toHaveLength(1);
+
+    // At the refresh point: re-mints, long before the 24h fallback TTL.
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(provider.getAccessToken()).resolves.toBe('TOKEN_2');
+    expect(ims.requests).toHaveLength(2);
+  },
+);
+
+test('exp, when present, decides the expiry over created_at and expires_in', async () => {
+  useFakeClock();
+  const exp = Math.floor(Date.now() / 1000) + 120; // expires in at most 2 minutes
+  const jwt = fakeJwt({ ...imsClaims(String(Date.now()), String(HOUR_MS)), exp });
+  ims.token(jwt);
+  ims.token('TOKEN_2');
+  const provider = new ClientCredentialsProvider(CREDS);
+
+  await expect(provider.getAccessToken()).resolves.toBe(jwt);
+
+  // Past exp minus the default 60s margin, far inside created_at + expires_in (1h): re-mints.
+  await vi.advanceTimersByTimeAsync(61_000);
+  await expect(provider.getAccessToken()).resolves.toBe('TOKEN_2');
+  expect(ims.requests).toHaveLength(2);
+});
+
+test.each([
+  ['only created_at', { created_at: '1790680000000' }],
+  ['only expires_in', { expires_in: '3600000' }],
+  ['a created_at that is not a number', { created_at: 'yesterday', expires_in: '3600000' }],
+  ['an expires_in that is not a number', { created_at: '1790680000000', expires_in: '1h' }],
+  ['an exp that is a string', { exp: '1790680000' }],
+])('a token whose claims carry %s falls back to the configured TTL', async (_label, claims) => {
+  useFakeClock();
+  const jwt = fakeJwt(claims);
+  ims.token(jwt);
+  ims.token('TOKEN_2');
+  const provider = new ClientCredentialsProvider(CREDS, {
+    tokenTtlMs: 10_000,
+    refreshMarginMs: 1_000,
+  });
+
+  await expect(provider.getAccessToken()).resolves.toBe(jwt);
+  await vi.advanceTimersByTimeAsync(8_999);
+  await expect(provider.getAccessToken()).resolves.toBe(jwt);
+  await vi.advanceTimersByTimeAsync(1);
+  await expect(provider.getAccessToken()).resolves.toBe('TOKEN_2');
+  expect(ims.requests).toHaveLength(2);
+});
+
+test('a JWT whose claims give no expiry falls back to the configured TTL', async () => {
   useFakeClock();
   const jwt = fakeJwt({ sub: 'someone' });
   ims.token(jwt);

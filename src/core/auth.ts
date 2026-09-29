@@ -71,14 +71,14 @@ export const DEFAULT_SCOPE = 'openid,AdobeID,firefly_api,ff_apis';
 /**
  * The commonly documented lifetime of an IMS server-to-server access token —
  * the FALLBACK {@link ClientCredentialsProvider} refreshes against when a
- * minted token cannot be read as a JWT with an `exp` claim (see
- * {@link ClientCredentialsProvider}'s class docs: the wrapped provider itself
- * never reports the real `expires_in` it receives). The preferred path reads
- * the real expiry directly from the token, so this constant is a safety net,
- * not the primary mechanism. Override via
+ * minted token's claims give no expiry (neither `exp` nor `created_at` plus
+ * `expires_in`; see {@link ClientCredentialsProvider}'s class docs: the
+ * wrapped provider itself never reports the real `expires_in` it receives).
+ * The preferred path reads the expiry directly from the token, so this
+ * constant is a safety net, not the primary mechanism. Override via
  * {@link ClientCredentialsProviderOptions.tokenTtlMs} if a given
- * integration's actual token lifetime differs and its tokens are not
- * decodable JWTs.
+ * integration's actual token lifetime differs and its tokens carry no such
+ * claims.
  *
  * @internal
  */
@@ -92,8 +92,8 @@ const DEFAULT_REFRESH_MARGIN_MS = 60_000;
  */
 export interface ClientCredentialsProviderOptions {
   /**
-   * How long a minted token is assumed valid, in milliseconds, before this
-   * provider re-mints. Defaults to 24 hours.
+   * How long a minted token is assumed valid, in milliseconds, when its own
+   * claims give no expiry. Defaults to 24 hours.
    */
   tokenTtlMs?: number;
   /**
@@ -130,17 +130,20 @@ export interface ClientCredentialsProviderOptions {
  * names IMS's OAuth `error` code when the reply carried one (only a plain
  * code that contains neither credential), and never the secret.
  *
- * **The real expiry comes from the token itself, not a guess.** IMS access
- * tokens are JWTs, so each freshly minted token is decoded (its middle
- * segment, base64url → JSON) and its `exp` claim (seconds since epoch) is
- * used as the assumed expiry when present and numeric — the wrapped
- * provider's silence about `expires_in` (above) turns out not to matter,
- * because this class reads the same fact directly off the wire format. The
- * configured TTL (24 hours unless overridden via
+ * **The expiry comes from the token's own claims.** IMS access tokens are
+ * JWTs, so each freshly minted token's payload is decoded (its middle
+ * segment, base64url → JSON). An `exp` claim (seconds since epoch) is used
+ * when present; otherwise `created_at` plus `expires_in`, both in
+ * milliseconds — the pair real IMS tokens carry, as numeric strings, in
+ * place of `exp`. The wrapped provider's silence about `expires_in` (above)
+ * therefore does not matter: this class reads the same fact off the token.
+ * The configured TTL (24 hours unless overridden via
  * {@link ClientCredentialsProviderOptions.tokenTtlMs}) is only a fallback for
- * a token that is not a decodable JWT, or has no `exp` claim; the decode
- * never throws, so a malformed or opaque token degrades to that fallback
- * rather than breaking authentication.
+ * a token whose claims give no expiry; the decode never throws, so a
+ * malformed or opaque token degrades to that fallback rather than breaking
+ * authentication. A token is re-minted
+ * {@link ClientCredentialsProviderOptions.refreshMarginMs} (60 seconds by
+ * default) before its expiry.
  *
  * Concurrent calls while a mint is in flight share the same underlying
  * request rather than each triggering their own — including a
@@ -209,7 +212,7 @@ export class ClientCredentialsProvider implements TokenProvider {
       if (typeof token !== 'string' || token === '') {
         throw refusedError(imsErrorCode(vendor, this.#details));
       }
-      const expiresAt = decodeJwtExpiryMs(token) ?? Date.now() + this.#tokenTtlMs;
+      const expiresAt = claimedExpiryMs(token) ?? Date.now() + this.#tokenTtlMs;
       this.#cachedToken = token;
       this.#expiresAt = expiresAt;
       return token;
@@ -256,36 +259,49 @@ function refusedError(imsError: string | undefined): AudioVideoError {
 }
 
 /**
- * Best-effort decode of a JWT's `exp` claim (seconds since epoch) into a
+ * Best-effort decode of when a JWT's own claims say it expires, as an epoch
  * millisecond timestamp — WITHOUT verifying the token's signature. This SDK
- * only reads the claim to size its own cache; it never treats the token as
+ * only reads the claims to size its own cache; it never treats the token as
  * trusted input on the strength of this decode, so signature verification
  * would add cost without adding safety here.
  *
+ * `exp` (seconds since epoch) decides when it is a finite number; otherwise
+ * `created_at` plus `expires_in`, both milliseconds, each a finite number or
+ * a string of digits (IMS sends them as strings).
+ *
  * Returns `undefined` for anything that is not a three-segment JWT, whose
- * payload segment does not decode to JSON, or whose decoded payload has no
- * finite numeric `exp` (including a payload that parses to something other
- * than an object). Never throws: an opaque, non-JWT access token — or a
- * malformed one — is a legitimate shape this SDK must tolerate, not an
+ * payload segment does not decode to a JSON object, or whose claims give no
+ * expiry by either rule. Never throws: an opaque, non-JWT access token — or
+ * a malformed one — is a legitimate shape this SDK must tolerate, not an
  * error; `ClientCredentialsProvider`'s `#mint` falls back to its configured
  * TTL ({@link DEFAULT_TOKEN_TTL_MS} by default) whenever this returns
  * `undefined`.
  *
  * @param token - The raw access token, as returned by `authenticate()`.
- * @returns The token's `exp` claim in epoch milliseconds, or `undefined`.
+ * @returns The claimed expiry in epoch milliseconds, or `undefined`.
  */
-function decodeJwtExpiryMs(token: string): number | undefined {
+function claimedExpiryMs(token: string): number | undefined {
   const segments = token.split('.');
   const payload = segments.length === 3 ? segments[1] : undefined;
   if (!payload) return undefined;
+  let claims: unknown;
   try {
-    const claims: unknown = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
-    const exp =
-      claims && typeof claims === 'object' ? (claims as { exp?: unknown }).exp : undefined;
-    return typeof exp === 'number' && Number.isFinite(exp) ? exp * 1000 : undefined;
+    claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
   } catch {
     return undefined;
   }
+  if (claims === null || typeof claims !== 'object') return undefined;
+  const { exp, created_at: createdAt, expires_in: expiresIn } = claims as Record<string, unknown>;
+  if (typeof exp === 'number' && Number.isFinite(exp)) return exp * 1000;
+  const issuedAt = millisecondsClaim(createdAt);
+  const lifetime = millisecondsClaim(expiresIn);
+  return issuedAt === undefined || lifetime === undefined ? undefined : issuedAt + lifetime;
+}
+
+/** A millisecond claim: a finite number, or a string of digits as IMS sends it. */
+function millisecondsClaim(value: unknown): number | undefined {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
+  return typeof value === 'string' && /^\d{1,15}$/.test(value) ? Number(value) : undefined;
 }
 
 /**

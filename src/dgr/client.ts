@@ -49,7 +49,7 @@ import {
   type DescribeInput,
   type TemplateDescription,
 } from './describe.js';
-import { encode, presets, resize } from './preset.js';
+import { encode, presets, resize, type PresetInput } from './preset.js';
 import {
   invalidArgument,
   isTemplateSource,
@@ -63,7 +63,7 @@ import {
   type PreparedRender,
   type TemplateSource,
 } from './render.js';
-import type { RenderRequest, RenderRequestOutput } from './schemas.js';
+import type { PresetRef, RenderRequest, RenderRequestOutput } from './schemas.js';
 
 /**
  * The handle `render()` and `describe()` return: awaitable like a promise,
@@ -79,6 +79,27 @@ import type { RenderRequest, RenderRequestOutput } from './schemas.js';
  * ```
  */
 export type RenderJob<T> = JobHandle<T>;
+
+/**
+ * A {@link RenderRequest} with exactly one output — the shape that types
+ * `render()`'s result as {@link Asset} rather than `Asset | Asset[]`.
+ * `presets` and `outputs` both accept a readonly array as well as a mutable
+ * one, so a spec built with `as const` still matches.
+ *
+ * @example
+ * ```ts
+ * const spec: SingleOutputRenderRequest = {
+ *   source: capsuleUrl,
+ *   presets: ['h264Land1080pHq'],
+ *   outputs: [{ presetIndex: 0, destination: writeUrl, readUrl }],
+ * };
+ * const asset = await render(spec); // Asset, not Asset | Asset[]
+ * ```
+ */
+export type SingleOutputRenderRequest = Omit<RenderRequest, 'presets' | 'outputs'> & {
+  presets: readonly (PresetInput | PresetRef)[];
+  outputs: readonly [RenderRequestOutput];
+};
 
 /**
  * Configuration for {@link createClient} and `configure()`. `clientId` is
@@ -290,16 +311,17 @@ export interface Client {
    *
    * @example
    * ```ts
-   * const asset = await render({
+   * const spec: SingleOutputRenderRequest = {
    *   source: capsuleUrl,
    *   presets: ['h264Land1080pHq'],
    *   outputs: [{ presetIndex: 0, destination: writeUrl, readUrl }],
-   * });
+   * };
+   * const asset = await render(spec);
    * await asset.save('./out.mp4');
    * ```
    */
   render(
-    spec: Omit<RenderRequest, 'outputs'> & { outputs: [RenderRequestOutput] },
+    spec: SingleOutputRenderRequest,
     options?: RenderOptions & { resolveAs?: undefined },
   ): RenderJob<Asset>;
   /**

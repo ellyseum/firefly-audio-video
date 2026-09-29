@@ -267,8 +267,9 @@ test('emit: a sink failure is still swallowed when stderr itself throws', () => 
   expect(() => emit(failing, record())).not.toThrow();
 });
 
-test('emit: a record whose own property access throws is swallowed too, never propagating', () => {
+test('emit: a record whose own property access throws still reaches the sink, that field unreadable, and never propagates', () => {
   const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  const sink = vi.fn();
   const poisoned = {
     time: NOW,
     level: 'info',
@@ -277,9 +278,11 @@ test('emit: a record whose own property access throws is swallowed too, never pr
     },
   } as unknown as LogRecord;
 
-  expect(() => emit({ log: vi.fn() }, poisoned)).not.toThrow();
-  expect(stderr).toHaveBeenCalledTimes(1);
-  expect(String(stderr.mock.calls[0]?.[0])).toContain('accessor boom');
+  expect(() => emit({ log: sink }, poisoned)).not.toThrow();
+  expect(sink).toHaveBeenCalledTimes(1);
+  expect(sink.mock.calls[0]?.[0]).toEqual({ time: NOW, level: 'info', msg: '[Unreadable]' });
+  // The sink did not fail, so nothing reports that it did.
+  expect(stderr).not.toHaveBeenCalled();
 });
 
 test('emit: a logging option that bypassed resolveLogger validation cannot make emit throw', () => {

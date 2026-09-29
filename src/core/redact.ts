@@ -289,23 +289,35 @@ function redactString(s: string): string {
     .replace(JWT_RE, 'REDACTED');
 }
 
+/** What an object, array or property that cannot be read — a throwing getter or Proxy trap, a revoked Proxy — becomes. */
+const UNREADABLE = '[Unreadable]';
+
 function redactValueInner(value: unknown, seen: WeakSet<object>): unknown {
   if (typeof value === 'string') return redactString(value);
-  if (Array.isArray(value)) {
+  if (value === null || typeof value !== 'object') return value;
+  try {
     if (seen.has(value)) return '[Circular]';
     seen.add(value);
-    return value.map((item) => redactValueInner(item, seen));
-  }
-  if (value && typeof value === 'object') {
-    if (seen.has(value)) return '[Circular]';
-    seen.add(value);
+    if (Array.isArray(value)) return value.map((item) => redactValueInner(item, seen));
     const out: Record<string, unknown> = {};
-    for (const [key, val] of Object.entries(value)) {
-      out[redactString(key)] = SECRET_KEY_RE.test(key) ? 'REDACTED' : redactValueInner(val, seen);
+    for (const key of Object.keys(value)) {
+      out[redactString(key)] = SECRET_KEY_RE.test(key)
+        ? 'REDACTED'
+        : redactValueInner(readProperty(value, key), seen);
     }
     return out;
+  } catch {
+    return UNREADABLE;
   }
-  return value;
+}
+
+/** `value[key]`, or {@link UNREADABLE} when reading it throws — one bad getter never costs its siblings. */
+function readProperty(value: object, key: string): unknown {
+  try {
+    return (value as Record<string, unknown>)[key];
+  } catch {
+    return UNREADABLE;
+  }
 }
 
 /**
@@ -323,7 +335,8 @@ function redactValueInner(value: unknown, seen: WeakSet<object>): unknown {
  * other value (numbers, booleans, `null`, `undefined`) passes through
  * unchanged. A value already visited earlier on the same walk (a circular
  * reference) is reported as the literal string `'[Circular]'` rather than
- * recursed into again.
+ * recursed into again, and one that cannot be read — a throwing getter or
+ * Proxy trap, a revoked Proxy — as `'[Unreadable]'`.
  *
  * This is the SDK's general-purpose redaction path for anything that is not
  * already known to be a bare URL or a header set — {@link redactUrl} and

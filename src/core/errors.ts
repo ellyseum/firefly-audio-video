@@ -89,20 +89,28 @@ export class AudioVideoError extends Error {
   /** See {@link AudioVideoErrorOptions.items} — already redacted. */
   readonly items?: unknown[];
 
+  /**
+   * Never throws: an option that cannot be read — `options` itself missing,
+   * a throwing getter — is left unset, and a non-string `message` is taken by
+   * its string form.
+   */
   constructor(options: AudioVideoErrorOptions) {
-    super(redactValue(options.message), { cause: options.cause });
+    super(redactValue(messageText(readOption(options, 'message'))), {
+      cause: readOption(options, 'cause'),
+    });
 
     // The prototype of the class actually being constructed — this one or a
     // subclass — so `instanceof` holds for both even under a build target that
     // downlevels `class` syntax, where the built-in `Error` constructor resets it.
     Object.setPrototypeOf(this, new.target.prototype);
 
+    const items = readOption(options, 'items');
     this.name = 'AudioVideoError';
-    this.code = options.code ?? 'audio_video_error';
-    this.status = options.status;
-    this.jobId = options.jobId;
-    this.requestId = options.requestId;
-    this.items = options.items === undefined ? undefined : redactValue(options.items);
+    this.code = readOption(options, 'code') ?? 'audio_video_error';
+    this.status = readOption(options, 'status');
+    this.jobId = readOption(options, 'jobId');
+    this.requestId = readOption(options, 'requestId');
+    this.items = items === undefined ? undefined : redactValue(items);
   }
 
   /**
@@ -136,5 +144,28 @@ export class AudioVideoError extends Error {
    */
   [Symbol.for('nodejs.util.inspect.custom')](): AudioVideoErrorJSON {
     return this.toJSON();
+  }
+}
+
+/** One constructor option, or `undefined` when reading it throws — `options` itself `null`, a throwing getter. */
+function readOption<K extends keyof AudioVideoErrorOptions>(
+  options: AudioVideoErrorOptions,
+  key: K,
+): AudioVideoErrorOptions[K] | undefined {
+  try {
+    return options[key];
+  } catch {
+    return undefined;
+  }
+}
+
+/** A message as text: a string as-is, nothing as empty, anything else by its string form. */
+function messageText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (value === undefined) return '';
+  try {
+    return String(value);
+  } catch {
+    return '[Unreadable message]';
   }
 }

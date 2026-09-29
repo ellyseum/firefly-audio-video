@@ -1,7 +1,7 @@
 import { inspect } from 'node:util';
 import { expect, test } from 'vitest';
 import { redactError, redactUrl, redactHeaders, redactValue } from '../src/core/redact.js';
-import { AudioVideoError } from '../src/core/errors.js';
+import { AudioVideoError, type AudioVideoErrorOptions } from '../src/core/errors.js';
 
 // --- redactUrl ---------------------------------------------------------------
 
@@ -331,6 +331,55 @@ test('redactValue: never throws on a circular object graph', () => {
   }).not.toThrow();
   expect(() => JSON.stringify(out)).not.toThrow();
   expect((out as Record<string, unknown>).self).toBe('[Circular]');
+});
+
+test('redactValue: never throws on a throwing getter, a throwing Proxy trap or a revoked Proxy', () => {
+  const withGetter = {
+    ok: 'https://h.example/f?sig=GETTERSIG',
+    get boom(): string {
+      throw new Error('getter exploded');
+    },
+  };
+  expect(redactValue(withGetter)).toEqual({ ok: 'https://h.example/f', boom: '[Unreadable]' });
+
+  const trapped = new Proxy(
+    {},
+    {
+      ownKeys() {
+        throw new Error('ownKeys exploded');
+      },
+    },
+  );
+  expect(redactValue({ trapped, kept: 1 })).toEqual({ trapped: '[Unreadable]', kept: 1 });
+
+  const { proxy, revoke } = Proxy.revocable([1, 2], {});
+  revoke();
+  expect(redactValue([proxy, 'kept'])).toEqual(['[Unreadable]', 'kept']);
+});
+
+test('AudioVideoError: construction never throws — hostile items, a throwing option getter, no options at all', () => {
+  const hostileItem = {
+    get boom(): string {
+      throw new Error('getter exploded');
+    },
+  };
+  const withItems = new AudioVideoError({ message: 'm', code: 'c', items: [hostileItem] });
+  expect(withItems.items).toEqual([{ boom: '[Unreadable]' }]);
+
+  const options = {
+    code: 'kept_code',
+    get message(): string {
+      throw new Error('message getter exploded');
+    },
+  };
+  const withGetter = new AudioVideoError(options);
+  expect(withGetter.code).toBe('kept_code');
+  expect(withGetter.message).toBe('');
+
+  const withNothing = new AudioVideoError(null as unknown as AudioVideoErrorOptions);
+  expect(withNothing.code).toBe('audio_video_error');
+  expect(withNothing.message).toBe('');
+  expect(new AudioVideoError({ message: 42 as unknown as string }).message).toBe('42');
 });
 
 test('redactValue: never throws on a circular array', () => {

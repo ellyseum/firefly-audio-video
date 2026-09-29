@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
@@ -65,6 +65,23 @@ function multiChunkBody(chunks: readonly Uint8Array[]): ReadableStream<Uint8Arra
       controller.close();
     },
   });
+}
+
+/** A `ReadableStream` that enqueues each of `chunks`, then errors instead of closing — a mid-download reset. */
+function resettingBody(chunks: readonly Uint8Array[], error: Error): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(chunk);
+      controller.error(error);
+    },
+  });
+}
+
+/** The single `*.partial` temp file `save()` is currently writing beside `destPath`, if any. */
+function findTempFile(dir: string, destBaseName: string): string | undefined {
+  return readdirSync(dir).find(
+    (name) => name.startsWith(`${destBaseName}.`) && name.endsWith('.partial'),
+  );
 }
 
 /** A writable that records each written chunk as its own `Buffer`. */
@@ -203,7 +220,7 @@ test('save() writes a file whose bytes match, creating the parent directory', as
   expect(readFileSync(path).equals(bytes)).toBe(true);
 });
 
-test('save() streams incrementally rather than buffering the whole body before writing', async () => {
+test('save() streams incrementally to its temp file rather than buffering the whole body before writing', async () => {
   let controller!: ReadableStreamDefaultController<Uint8Array>;
   const body = new ReadableStream<Uint8Array>({
     start(c) {
@@ -224,15 +241,21 @@ test('save() streams incrementally rather than buffering the whole body before w
   controller.enqueue(firstChunk);
 
   // The source is still open — a save() that buffered the whole response
-  // first could not have written anything yet. Poll briefly rather than a
-  // single fixed delay, so the assertion is not a race against the pipeline.
+  // first could not have written anything yet, to the temp file or anywhere
+  // else. Poll briefly rather than a single fixed delay, so the assertion is
+  // not a race against the pipeline.
   const deadline = Date.now() + 2_000;
-  while (!existsSync(path) || readFileSync(path).length === 0) {
+  let tempName: string | undefined;
+  for (;;) {
+    tempName = findTempFile(dir, 'out.bin');
+    if (tempName !== undefined && readFileSync(join(dir, tempName)).length > 0) break;
     if (Date.now() > deadline)
       throw new Error('timed out waiting for the first chunk to reach disk');
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
-  expect(readFileSync(path).equals(firstChunk)).toBe(true);
+  expect(readFileSync(join(dir, tempName)).equals(firstChunk)).toBe(true);
+  // The destination itself gets nothing until the whole download completes.
+  expect(existsSync(path)).toBe(false);
 
   const secondChunk = Buffer.from('second-chunk');
   controller.enqueue(secondChunk);
@@ -240,9 +263,10 @@ test('save() streams incrementally rather than buffering the whole body before w
   await savePromise;
 
   expect(readFileSync(path).equals(Buffer.concat([firstChunk, secondChunk]))).toBe(true);
+  expect(readdirSync(dir)).toEqual(['out.bin']);
 });
 
-test('a non-2xx response makes save() reject with the same AudioVideoError, having written nothing', async () => {
+test('a non-2xx response makes save() reject with the same AudioVideoError, leaving the destination absent', async () => {
   const asset = new Asset({
     url: 'https://x/out.bin',
     meta: sampleMeta(),
@@ -253,10 +277,77 @@ test('a non-2xx response makes save() reject with the same AudioVideoError, havi
   const path = join(dir, 'out.bin');
 
   await expect(asset.save(path)).rejects.toMatchObject({ code: 'asset_fetch_failed' });
-  // node:fs creates (and would truncate) the destination file as soon as
-  // pipeline() opens it, before the source ever produces a byte — so the file
-  // exists, but it is empty: nothing was written before the failure.
-  expect(readFileSync(path).length).toBe(0);
+  expect(existsSync(path)).toBe(false);
+  expect(readdirSync(dir)).toEqual([]);
+});
+
+test('a non-2xx response onto an existing destination leaves it byte-identical, with no temp file left behind', async () => {
+  const asset = new Asset({
+    url: 'https://x/out.bin',
+    meta: sampleMeta(),
+    fetch: async () => fakeResponse('forbidden', 403),
+  });
+
+  const dir = tempDir();
+  const path = join(dir, 'out.bin');
+  const original = Buffer.from('already here, do not touch');
+  writeFileSync(path, original);
+
+  await expect(asset.save(path)).rejects.toMatchObject({ code: 'asset_fetch_failed' });
+  expect(readFileSync(path).equals(original)).toBe(true);
+  expect(readdirSync(dir)).toEqual(['out.bin']);
+});
+
+test('a mid-download reset leaves an absent destination absent, with no temp file left behind', async () => {
+  const asset = new Asset({
+    url: 'https://x/out.bin',
+    meta: sampleMeta(),
+    fetch: async () =>
+      fakeResponse(resettingBody([Buffer.from('partial-bytes')], new Error('reset'))),
+  });
+
+  const dir = tempDir();
+  const path = join(dir, 'out.bin');
+
+  await expect(asset.save(path)).rejects.toThrow();
+  expect(existsSync(path)).toBe(false);
+  expect(readdirSync(dir)).toEqual([]);
+});
+
+test('a mid-download reset leaves an existing destination byte-identical, with no temp file left behind', async () => {
+  const asset = new Asset({
+    url: 'https://x/out.bin',
+    meta: sampleMeta(),
+    fetch: async () =>
+      fakeResponse(resettingBody([Buffer.from('partial-bytes')], new Error('reset'))),
+  });
+
+  const dir = tempDir();
+  const path = join(dir, 'out.bin');
+  const original = Buffer.from('already here, do not touch');
+  writeFileSync(path, original);
+
+  await expect(asset.save(path)).rejects.toThrow();
+  expect(readFileSync(path).equals(original)).toBe(true);
+  expect(readdirSync(dir)).toEqual(['out.bin']);
+});
+
+test('save() replaces an existing destination with the new bytes on success', async () => {
+  const bytes = Buffer.from('brand new bytes');
+  const asset = new Asset({
+    url: 'https://x/out.bin',
+    meta: sampleMeta(),
+    fetch: async () => fakeResponse(bytes),
+  });
+
+  const dir = tempDir();
+  const path = join(dir, 'out.bin');
+  writeFileSync(path, Buffer.from('stale'));
+
+  await asset.save(path);
+
+  expect(readFileSync(path).equals(bytes)).toBe(true);
+  expect(readdirSync(dir)).toEqual(['out.bin']);
 });
 
 // --- redaction on toJSON / toString / util.inspect ------------------------------------

@@ -6,8 +6,9 @@
  * timing derived from the job that produced it.
  */
 
+import { randomUUID } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, rename, rm } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -115,14 +116,27 @@ export class Asset {
    * directories first. Never buffers the whole file in memory — bytes reach
    * disk as they arrive over the network, not after the response completes. A
    * fetch failure, including a non-2xx response, rejects with the same
-   * {@link AudioVideoError} {@link buffer} would throw, leaving on disk
-   * whatever bytes had already been written.
+   * {@link AudioVideoError} {@link buffer} would throw. The download lands in
+   * a temporary file beside `path` first and is moved into place with a
+   * single rename once it completes; on any failure — the response status,
+   * a transport error, or a write/rename error — the temp file is removed
+   * and `path` is left exactly as it was beforehand: absent stays absent, an
+   * existing file stays byte-identical.
    *
    * @param path - The destination file path.
    */
   async save(path: string): Promise<void> {
+    const res = await this.#fetchOk();
     await mkdir(dirname(path), { recursive: true });
-    await pipeline(this.stream(), createWriteStream(path));
+    const tmpPath = tempSavePath(path);
+    const body = res.body === null ? Readable.from([]) : Readable.fromWeb(res.body);
+    try {
+      await pipeline(body, createWriteStream(tmpPath));
+      await rename(tmpPath, path);
+    } catch (err) {
+      await rm(tmpPath, { force: true }).catch(() => undefined);
+      throw err;
+    }
   }
 
   /** The redacted, JSON-safe shape `JSON.stringify(asset)` produces. */
@@ -177,6 +191,15 @@ export class Asset {
     if (body === null) return;
     yield* Readable.fromWeb(body);
   }
+}
+
+/**
+ * A same-directory path {@link Asset.save} streams into before the atomic
+ * rename onto `path`, chosen fresh per call so concurrent saves to the same
+ * destination never collide and the temp file always shares `path`'s volume.
+ */
+function tempSavePath(path: string): string {
+  return `${path}.${randomUUID()}.partial`;
 }
 
 /**

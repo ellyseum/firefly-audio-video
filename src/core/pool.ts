@@ -39,11 +39,19 @@ export interface PoolBackend {
    * affects any other task's — a rejection here is reported only to this
    * call's caller.
    *
+   * A task must never itself await a `run` call on this same pool: once every
+   * slot is held by tasks each waiting on their own queued work, no slot can
+   * ever free, and the pool deadlocks at any concurrency.
+   *
    * @typeParam T - The task's own result type.
    * @param task - The work to run once admitted. Called at most once.
    */
   run<T>(task: () => Promise<T>): Promise<T>;
-  /** Resolves once nothing is active or queued. */
+  /**
+   * Resolves the first time nothing is active or queued; a task submitted
+   * after the call extends the wait, so under continuous submission it never
+   * resolves.
+   */
   drain(): Promise<void>;
   /** How many tasks currently hold a slot and are running. */
   readonly active: number;
@@ -72,10 +80,15 @@ export interface InMemoryPoolOptions {
  * can still exceed whatever rate budget that credential is held to. A fleet
  * like that needs a distributed {@link PoolBackend} instead.
  *
+ * A task run on a pool must never itself await `run` on that same pool — see
+ * {@link PoolBackend.run}.
+ *
  * @example
  * ```ts
- * const pool = new InMemoryPool({ concurrency: 10 });
- * const assets = await Promise.all(specs.map((spec) => pool.run(() => render(spec))));
+ * // `render()` and `describe()` already run inside the client's own pool, so
+ * // a caller never calls run() on it directly — configure it instead:
+ * const a = createClient({ clientId, clientSecret, concurrency: 4 });
+ * const b = createClient({ clientId, clientSecret, pool: new InMemoryPool({ concurrency: 4 }) });
  * ```
  */
 export class InMemoryPool implements PoolBackend {

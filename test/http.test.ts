@@ -4,6 +4,7 @@ import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import type { TokenProvider } from '../src/core/auth.js';
 import { AudioVideoError } from '../src/core/errors.js';
 import { DEFAULT_HOST, HttpClient } from '../src/core/http.js';
+import { deferred } from './support/fake-ims.js';
 import { flush, until } from './support/mock-api.js';
 
 const originalDispatcher = getGlobalDispatcher();
@@ -30,20 +31,14 @@ function pool(host = DEFAULT_HOST) {
   return agent.get(host);
 }
 
-/**
- * True iff `p` has NOT settled by the current microtask tick — used to prove
- * a retry has not fired yet, without relying on `MockAgent#pendingInterceptors()`
- * (its bookkeeping for an already-dispatched-but-retried interceptor lags
- * behind the actual retry by up to one more dispatch, so it cannot answer
- * "has the next attempt gone out yet" reliably).
- */
-async function isPending(p: Promise<unknown>): Promise<boolean> {
-  const sentinel = Symbol('still-pending');
-  const settled = p.then(
-    () => 'settled',
-    () => 'settled',
+/** The {@link AudioVideoError} a request rejects with; fails the test if it resolves or rejects with anything else. */
+async function rejection(request: Promise<unknown>): Promise<AudioVideoError> {
+  const outcome: unknown = await request.then(
+    () => 'resolved',
+    (error: unknown) => error,
   );
-  return (await Promise.race([settled, Promise.resolve(sentinel)])) === sentinel;
+  expect(outcome).toBeInstanceOf(AudioVideoError);
+  return outcome as AudioVideoError;
 }
 
 // --- success + header injection ------------------------------------------------
@@ -398,19 +393,22 @@ test('401 twice throws — no infinite loop, and forceRefresh is only requested 
 
 // --- cancellation ------------------------------------------------------------------
 
-test('a caller signal that is already aborted rejects the request without hitting the network', async () => {
+test('a caller signal that is already aborted rejects cancelled without hitting the network', async () => {
   const client = new HttpClient({ apiKey: 'key', tokenProvider });
   const controller = new AbortController();
   controller.abort();
 
-  await expect(
+  const err = await rejection(
     client.request('GET', '/v1/presets', undefined, { signal: controller.signal }),
-  ).rejects.toMatchObject({ name: 'AbortError' });
+  );
 
+  expect(err.code).toBe('cancelled');
+  expect(err.message).toBe(`Request to ${DEFAULT_HOST}/v1/presets was cancelled.`);
+  expect((err.cause as Error).name).toBe('AbortError');
   expect(agent.pendingInterceptors()).toHaveLength(0);
 });
 
-test('aborting the caller signal mid-request rejects the in-flight fetch', async () => {
+test('aborting the caller signal mid-request rejects the in-flight request cancelled', async () => {
   const scope = pool()
     .intercept({ path: '/v1/presets', method: 'GET' })
     .reply(200, { presets: [] });
@@ -422,11 +420,11 @@ test('aborting the caller signal mid-request rejects the in-flight fetch', async
   const pending = client.request('GET', '/v1/presets', undefined, { signal: controller.signal });
   queueMicrotask(() => controller.abort());
 
-  await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+  expect((await rejection(pending)).code).toBe('cancelled');
 });
 
-test('aborting the caller signal during a 429 backoff wait rejects immediately, without waiting out the delay', async () => {
-  vi.useFakeTimers();
+test('aborting the caller signal during a 429 backoff wait rejects cancelled at once, with a copy of the reason as cause', async () => {
+  useFakeClock();
   pool()
     .intercept({ path: '/v1/presets', method: 'GET' })
     .reply(429, { error: 'rate_limit' }, { headers: { 'retry-after': '10' } });
@@ -437,12 +435,15 @@ test('aborting the caller signal during a 429 backoff wait rejects immediately, 
 
   const pending = client.request('GET', '/v1/presets', undefined, { signal: controller.signal });
 
-  // Well inside the 10s wait — if the abort were ignored, nothing would settle yet.
-  await vi.advanceTimersByTimeAsync(1_000);
-  expect(await isPending(pending)).toBe(true);
-
+  // The 10 s backoff is armed and the fake clock never reaches it.
+  await until(() => vi.getTimerCount() === 1);
   controller.abort(abortReason);
-  await expect(pending).rejects.toBe(abortReason);
+
+  const err = await rejection(pending);
+  expect(err.code).toBe('cancelled');
+  expect(err.cause).not.toBe(abortReason);
+  expect((err.cause as Error).message).toBe('caller gave up');
+  expect(vi.getTimerCount()).toBe(0);
 });
 
 test('a signal aborted in the gap between attempts short-circuits the next wait rather than sleeping it out', async () => {
@@ -473,7 +474,101 @@ test('a signal aborted in the gap between attempts short-circuits the next wait 
 
   // Real timers: if the already-aborted signal were NOT short-circuited, this would
   // hang waiting out a real 10-second delay and fail on the test timeout instead.
-  await expect(
+  const err = await rejection(
     client.request('GET', '/v1/presets', undefined, { signal: controller.signal }),
-  ).rejects.toBe(abortReason);
+  );
+  expect(err.code).toBe('cancelled');
+  expect((err.cause as Error).message).toBe('gave up between attempts');
+});
+
+// --- every other failure is an AudioVideoError too ----------------------------------
+
+test('a transport failure rejects request_failed, naming its system code, with a redacted copy of the error chain as cause', async () => {
+  const signedUrl = 'https://acct.blob.core.windows.net/c/f.mov?sv=2021&sig=TRANSPORT_SIG';
+  const raw = Object.assign(new Error(`connect failed for ${signedUrl}`), { code: 'ECONNRESET' });
+  pool().intercept({ path: '/v1/presets', method: 'GET' }).replyWithError(raw);
+
+  const err = await rejection(
+    new HttpClient({ apiKey: 'key', tokenProvider }).request('GET', '/v1/presets'),
+  );
+
+  expect(err.code).toBe('request_failed');
+  expect(err.message).toBe(
+    `Request to ${DEFAULT_HOST}/v1/presets failed before a complete response arrived (ECONNRESET).`,
+  );
+  // fetch's own `TypeError: fetch failed`, whose cause is the connection error.
+  const cause = err.cause as Error;
+  expect(cause.name).toBe('TypeError');
+  expect(cause.message).toBe('fetch failed');
+  const inner = cause.cause as Error & { code?: unknown };
+  expect(inner).not.toBe(raw);
+  expect(inner.code).toBe('ECONNRESET');
+  expect(inner.message).toBe('connect failed for https://acct.blob.core.windows.net/c/f.mov');
+  expect(inspect(err.cause, { depth: null })).not.toContain('TRANSPORT_SIG');
+});
+
+test("this client's own per-attempt timeout rejects request_timeout", async () => {
+  const attemptTimeout = new AbortController();
+  vi.spyOn(AbortSignal, 'timeout').mockReturnValue(attemptTimeout.signal);
+  const held = deferred();
+  let arrived = false;
+  pool()
+    .intercept({ path: '/v1/presets', method: 'GET' })
+    .reply(200, async () => {
+      arrived = true;
+      await held.promise;
+      return { presets: [] };
+    });
+
+  const pending = new HttpClient({ apiKey: 'key', tokenProvider }).request('GET', '/v1/presets');
+  await until(() => arrived);
+  attemptTimeout.abort(new DOMException('The operation timed out.', 'TimeoutError'));
+
+  const err = await rejection(pending);
+  held.resolve();
+  expect(err.code).toBe('request_timeout');
+  expect(err.message).toBe(
+    `Request to ${DEFAULT_HOST}/v1/presets did not complete within 30 seconds.`,
+  );
+  expect((err.cause as Error).name).toBe('TimeoutError');
+});
+
+test('a token provider failing with a plain error rejects auth_failed with a redacted copy of it as cause', async () => {
+  const raw = new Error('vault unreachable: https://vault.example/v1/token?sig=VAULT_SIG');
+  getAccessTokenMock.mockReset().mockRejectedValue(raw);
+
+  const err = await rejection(
+    new HttpClient({ apiKey: 'key', tokenProvider }).request('GET', '/v1/presets'),
+  );
+
+  expect(err.code).toBe('auth_failed');
+  expect(err.cause).not.toBe(raw);
+  expect((err.cause as Error).message).toBe('vault unreachable: https://vault.example/v1/token');
+  expect(agent.pendingInterceptors()).toHaveLength(0);
+});
+
+test('a forced refresh after a 401 that fails with a plain error rejects auth_failed', async () => {
+  getAccessTokenMock
+    .mockReset()
+    .mockResolvedValueOnce('STALE_TOKEN')
+    .mockRejectedValueOnce(new TypeError('refresh broke'));
+  pool().intercept({ path: '/v1/presets', method: 'GET' }).reply(401, { error: 'unauthorized' });
+
+  const err = await rejection(
+    new HttpClient({ apiKey: 'key', tokenProvider }).request('GET', '/v1/presets'),
+  );
+
+  expect(err.code).toBe('auth_failed');
+  expect((err.cause as Error).name).toBe('TypeError');
+});
+
+test('an AudioVideoError from the token provider passes through unchanged', async () => {
+  const failure = new AudioVideoError({ message: 'no token', code: 'auth_failed' });
+  getAccessTokenMock.mockReset().mockRejectedValue(failure);
+
+  const err = await rejection(
+    new HttpClient({ apiKey: 'key', tokenProvider }).request('GET', '/v1/presets'),
+  );
+
+  expect(err).toBe(failure);
 });

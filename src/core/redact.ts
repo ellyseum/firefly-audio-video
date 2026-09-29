@@ -282,3 +282,42 @@ export function redactValue(value: unknown): unknown;
 export function redactValue(value: unknown): unknown {
   return redactValueInner(value, new WeakSet());
 }
+
+/** How many levels of an error's `cause` chain {@link redactError} copies. */
+const MAX_CAUSE_DEPTH = 4;
+
+/**
+ * A redacted stand-in for an error about to become another error's
+ * `cause`: a new `Error` carrying the original's `name`, its `code` (a string
+ * or number), its message run through {@link redactValue}, and — to a depth
+ * of four — its own `cause` copied the same way. The original is never kept:
+ * a transport error can still hold an unredacted URL in its message or its
+ * cause. A value that is not an `Error` becomes one from its string form.
+ * Never throws.
+ *
+ * @param error - Whatever was thrown or rejected.
+ * @returns A new `Error` safe to keep as a `cause`.
+ *
+ * @internal
+ */
+export function redactError(error: unknown): Error {
+  return redactErrorAt(error, 1);
+}
+
+function redactErrorAt(error: unknown, depth: number): Error {
+  let copy: Error;
+  try {
+    if (!(error instanceof Error)) return new Error(redactValue(String(error)));
+    copy = new Error(redactValue(String(error.message)));
+    copy.name = String(error.name);
+    const { code, cause } = error as Error & { code?: unknown };
+    if (typeof code === 'string' || typeof code === 'number') {
+      (copy as Error & { code?: string | number }).code = code;
+    }
+    if (cause !== undefined && depth < MAX_CAUSE_DEPTH)
+      copy.cause = redactErrorAt(cause, depth + 1);
+  } catch {
+    return new Error('[Unreadable error]');
+  }
+  return copy;
+}

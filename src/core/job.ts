@@ -585,7 +585,10 @@ async function pollUntilTerminal<T>(
     try {
       response = await http.request<unknown>('GET', statusUrl, undefined, { signal });
     } catch (err) {
-      if (signal.aborted || !isTransientPollFailure(err)) throw err;
+      // The request's own `cancelled` is this job's abort arriving through it: rethrow the abort
+      // reason so the job settles as its own `cancelled` or `job_timeout`.
+      if (signal.aborted) throw isCancellation(err) ? signal.reason : err;
+      if (!isTransientPollFailure(err)) throw err;
       failedPolls += 1;
       if (failedPolls >= maxPollFailures) throw pollFailedError(jobId, failedPolls, err);
       await sleep(pollRetryDelayMs(failedPolls, intervalFor(Date.now() - startedAt)), signal);
@@ -732,15 +735,22 @@ function resolveMaxPollFailures(value: number | undefined): number {
 }
 
 /**
- * True for a status-poll failure worth retrying: a transport error (no response
- * at all — a connection reset, a DNS failure, the per-attempt timeout), or a
- * response whose status is in {@link TRANSIENT_POLL_STATUSES}. Any other failed
- * response, and an error carrying no status, is final: repeating the request
- * cannot change it.
+ * The codes the HTTP client rejects with when a request fails in transit — a
+ * connection reset, a DNS failure — or runs past its per-attempt timeout.
+ */
+const TRANSIENT_REQUEST_CODES: ReadonlySet<string> = new Set(['request_failed', 'request_timeout']);
+
+/**
+ * True for a status-poll failure worth retrying: a transport failure or the
+ * per-attempt timeout (one of {@link TRANSIENT_REQUEST_CODES}, or an error
+ * that is not an {@link AudioVideoError} at all), or a response whose status
+ * is in {@link TRANSIENT_POLL_STATUSES}. Any other failure is final:
+ * repeating the request cannot change it.
  */
 function isTransientPollFailure(err: unknown): boolean {
   if (!(err instanceof AudioVideoError)) return true;
-  return err.status !== undefined && TRANSIENT_POLL_STATUSES.has(err.status);
+  if (err.status === undefined) return TRANSIENT_REQUEST_CODES.has(err.code);
+  return TRANSIENT_POLL_STATUSES.has(err.status);
 }
 
 /**

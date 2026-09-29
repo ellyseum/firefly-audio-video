@@ -1,6 +1,6 @@
 import { inspect } from 'node:util';
 import { expect, test } from 'vitest';
-import { redactUrl, redactHeaders, redactValue } from '../src/core/redact.js';
+import { redactError, redactUrl, redactHeaders, redactValue } from '../src/core/redact.js';
 import { AudioVideoError } from '../src/core/errors.js';
 
 // --- redactUrl ---------------------------------------------------------------
@@ -187,6 +187,56 @@ test('redactValue: never throws on a circular array', () => {
     out = redactValue(circular);
   }).not.toThrow();
   expect(out[2]).toBe('[Circular]');
+});
+
+// --- redactError -------------------------------------------------------------------
+
+test('redactError: a new Error keeping name and code, with its message redacted and its cause chain copied', () => {
+  const inner = Object.assign(new Error('reset reaching https://x.blob/f?sig=INNERSIG'), {
+    code: 'ECONNRESET',
+  });
+  const outer = new TypeError('fetch failed for https://x.blob/g?sig=OUTERSIG', { cause: inner });
+
+  const copy = redactError(outer);
+
+  expect(copy).not.toBe(outer);
+  expect(copy.name).toBe('TypeError');
+  expect(copy.message).toBe('fetch failed for https://x.blob/g');
+  const copiedInner = copy.cause as Error & { code?: unknown };
+  expect(copiedInner).not.toBe(inner);
+  expect(copiedInner.code).toBe('ECONNRESET');
+  expect(copiedInner.message).toBe('reset reaching https://x.blob/f');
+  expect(inspect(copy, { depth: null })).not.toMatch(/INNERSIG|OUTERSIG/);
+});
+
+test('redactError: a numeric code is kept, the cause chain stops after four levels, and a non-Error becomes one', () => {
+  const abort = new DOMException('This operation was aborted', 'AbortError');
+  expect(redactError(abort)).toMatchObject({ name: 'AbortError', code: 20 });
+
+  let chain: Error = new Error('level 5');
+  for (const level of [4, 3, 2, 1]) chain = new Error(`level ${level}`, { cause: chain });
+  const copy = redactError(chain);
+  const messages: string[] = [];
+  for (let current: unknown = copy; current instanceof Error; current = current.cause) {
+    messages.push(current.message);
+  }
+  expect(messages).toEqual(['level 1', 'level 2', 'level 3', 'level 4']);
+
+  const fromString = redactError('boom at https://x.blob/f?sig=STRINGSIG');
+  expect(fromString).toBeInstanceOf(Error);
+  expect(fromString.message).toBe('boom at https://x.blob/f');
+  expect(redactError(Symbol('reason')).message).toBe('Symbol(reason)');
+});
+
+test('redactError: never throws, even for an error whose properties throw', () => {
+  const hostile = new Error('hidden');
+  Object.defineProperty(hostile, 'message', {
+    get() {
+      throw new Error('getter exploded');
+    },
+  });
+  expect(redactError(hostile)).toBeInstanceOf(Error);
+  expect(redactError(hostile).message).toBe('[Unreadable error]');
 });
 
 // --- AudioVideoError --------------------------------------------

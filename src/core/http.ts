@@ -10,7 +10,7 @@
 
 import type { TokenProvider } from './auth.js';
 import { AudioVideoError } from './errors.js';
-import { redactUrl } from './redact.js';
+import { redactError, redactUrl } from './redact.js';
 
 /** @internal The default host every {@link HttpClient} targets unless {@link HttpClientOptions.host} overrides it. */
 export const DEFAULT_HOST = 'https://audio-video-api.adobe.io';
@@ -52,7 +52,8 @@ export interface HttpRequestInit {
    * Combined, via `AbortSignal.any`, with this client's own per-attempt
    * `AbortSignal.timeout` — aborting this signal aborts the in-flight fetch
    * (and, if it fires during a 429 backoff wait, cancels that wait too)
-   * regardless of which attempt is in progress.
+   * regardless of which attempt is in progress; the request then rejects
+   * with `code: 'cancelled'`.
    */
   signal?: AbortSignal;
   /**
@@ -124,14 +125,23 @@ export class HttpClient {
    * @param body - A JSON-serializable request body; omit for a bodyless request.
    * @param init - Per-call signal/header overrides; see {@link HttpRequestInit}.
    * @returns The status, headers, and parsed body of the eventual success response.
+   * Every rejection is an {@link AudioVideoError}, and each one is redacted:
+   * its `.message` names the URL through {@link redactUrl}, and a `.cause` is
+   * a redacted copy of the original error, never the error itself.
+   *
    * @throws {@link AudioVideoError} — `code: 'http_<status>'` — for any non-2xx
-   *   response left after retries are exhausted. Its `.message` and `.items`
-   *   (the redacted response body) are built via {@link redactUrl}/`redactValue`
-   *   so a presigned URL's SAS params or a leaked secret never reach it.
-   * @throws Whatever `fetch` rejects with when `init.signal` (or the caller's
-   *   own signal) aborts before a response is received — this SDK does not
-   *   wrap an abort into {@link AudioVideoError}, since no response, and so no
-   *   status, ever existed to build one from.
+   *   response left after retries are exhausted, with `.items` holding the
+   *   redacted response body.
+   * @throws {@link AudioVideoError} — `code: 'cancelled'` — when `init.signal`
+   *   aborts before the request settles, including during a backoff wait.
+   * @throws {@link AudioVideoError} — `code: 'request_timeout'` — when one
+   *   attempt runs past this client's own 30-second budget.
+   * @throws {@link AudioVideoError} — `code: 'request_failed'` — when the
+   *   request fails in transit before a complete response arrives: a DNS
+   *   failure, a refused or reset connection.
+   * @throws {@link AudioVideoError} — `code: 'auth_failed'` — when the token
+   *   provider fails with anything but an {@link AudioVideoError}; one it
+   *   rejects with passes through unchanged.
    */
   async request<T>(
     method: HttpMethod,
@@ -140,45 +150,118 @@ export class HttpClient {
     init: HttpRequestInit = {},
   ): Promise<HttpResponse<T>> {
     const url = new URL(path, this.#host);
-    let token = await this.#tokenProvider.getAccessToken();
+    let token = await this.#token(false);
     let usedAuthRetry = false;
 
     for (let attempt = 0; ;) {
       const timeoutSignal = AbortSignal.timeout(DEFAULT_ATTEMPT_TIMEOUT_MS);
       const signal = init.signal ? AbortSignal.any([timeoutSignal, init.signal]) : timeoutSignal;
 
-      const res = await fetch(url, {
-        method,
-        headers: buildRequestHeaders(token, this.#apiKey, body !== undefined, init.headers),
-        body: body === undefined ? undefined : JSON.stringify(body),
-        signal,
-      });
+      try {
+        const res = await fetch(url, {
+          method,
+          headers: buildRequestHeaders(token, this.#apiKey, body !== undefined, init.headers),
+          body: body === undefined ? undefined : JSON.stringify(body),
+          signal,
+        });
 
-      if (res.status === 429 && attempt < this.#maxRetries) {
-        await drainBody(res);
-        await sleep(computeDelayMs(res.headers.get('retry-after'), attempt), init.signal);
-        attempt += 1;
-        continue;
+        if (res.status === 429 && attempt < this.#maxRetries) {
+          await drainBody(res);
+          await sleep(computeDelayMs(res.headers.get('retry-after'), attempt), init.signal);
+          attempt += 1;
+          continue;
+        }
+
+        if (res.status === 401 && !usedAuthRetry) {
+          await drainBody(res);
+          usedAuthRetry = true;
+          token = await this.#token(true);
+          continue;
+        }
+
+        if (res.status >= 200 && res.status < 300) {
+          return {
+            status: res.status,
+            headers: headersToRecord(res.headers),
+            body: await parseBody<T>(res),
+          };
+        }
+
+        throw await toAudioVideoError(res, url);
+      } catch (error) {
+        if (error instanceof AudioVideoError) throw error;
+        throw requestFailure(error, url, init.signal, timeoutSignal);
       }
-
-      if (res.status === 401 && !usedAuthRetry) {
-        await drainBody(res);
-        usedAuthRetry = true;
-        token = await this.#tokenProvider.getAccessToken({ forceRefresh: true });
-        continue;
-      }
-
-      if (res.status >= 200 && res.status < 300) {
-        return {
-          status: res.status,
-          headers: headersToRecord(res.headers),
-          body: await parseBody<T>(res),
-        };
-      }
-
-      throw await toAudioVideoError(res, url);
     }
   }
+
+  /**
+   * A token from the provider — force-refreshed when `forceRefresh` is set.
+   * A provider failure that is not already an {@link AudioVideoError}
+   * becomes `auth_failed`, with a redacted copy of it as `cause`.
+   */
+  async #token(forceRefresh: boolean): Promise<string> {
+    try {
+      return forceRefresh
+        ? await this.#tokenProvider.getAccessToken({ forceRefresh: true })
+        : await this.#tokenProvider.getAccessToken();
+    } catch (error) {
+      if (error instanceof AudioVideoError) throw error;
+      throw new AudioVideoError({
+        message: 'The token provider failed to supply an access token.',
+        code: 'auth_failed',
+        cause: redactError(error),
+      });
+    }
+  }
+}
+
+/**
+ * The {@link AudioVideoError} for an attempt that failed before a response
+ * settled it: `cancelled` when the caller's signal aborted, `request_timeout`
+ * when this client's own per-attempt timeout did, and `request_failed` for
+ * any other transport failure. The `cause` is a redacted copy of `error`, and
+ * a `request_failed` message names the innermost system error code (such as
+ * `ECONNRESET`) when the cause chain carries one.
+ */
+function requestFailure(
+  error: unknown,
+  url: URL,
+  callerSignal: AbortSignal | undefined,
+  timeoutSignal: AbortSignal,
+): AudioVideoError {
+  const target = redactUrl(url.toString());
+  const cause = redactError(error);
+  if (callerSignal?.aborted) {
+    return new AudioVideoError({
+      message: `Request to ${target} was cancelled.`,
+      code: 'cancelled',
+      cause,
+    });
+  }
+  if (timeoutSignal.aborted) {
+    return new AudioVideoError({
+      message: `Request to ${target} did not complete within ${DEFAULT_ATTEMPT_TIMEOUT_MS / 1_000} seconds.`,
+      code: 'request_timeout',
+      cause,
+    });
+  }
+  const systemCode = innermostCode(cause);
+  return new AudioVideoError({
+    message: `Request to ${target} failed before a complete response arrived${systemCode === undefined ? '' : ` (${systemCode})`}.`,
+    code: 'request_failed',
+    cause,
+  });
+}
+
+/** The deepest string `code` along an error's `cause` chain, such as `ENOTFOUND`. */
+function innermostCode(error: Error): string | undefined {
+  let found: string | undefined;
+  for (let current: unknown = error; current instanceof Error; current = current.cause) {
+    const { code } = current as Error & { code?: unknown };
+    if (typeof code === 'string') found = code;
+  }
+  return found;
 }
 
 /** Builds the header set every attempt sends, before `extra` (caller headers) is merged on top. */

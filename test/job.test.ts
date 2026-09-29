@@ -9,6 +9,8 @@ import { DEFAULT_HOST, HttpClient } from '../src/core/http.js';
 import { AsyncJob, DEFAULT_MAX_POLL_FAILURES, parseTimings, runJob } from '../src/core/job.js';
 import type { JobItemLike, JobStatusLike, JobSubmission } from '../src/core/job.js';
 import type { JobStatusResponse } from '../src/dgr/types.js';
+import { deferred } from './support/fake-ims.js';
+import { until } from './support/mock-api.js';
 
 const originalDispatcher = getGlobalDispatcher();
 let agent: MockAgent;
@@ -714,6 +716,80 @@ test('an external signal abort cancels the job the same way, with the abort reas
   await vi.waitFor(() => expect(cancels()).toBe(1));
   expect(polls()).toBe(1);
   expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+});
+
+/** A status endpoint that holds its answer until released; `arrived` turns true once a poll reaches it. */
+function heldStatus(): { arrived: () => boolean; release: () => void } {
+  const held = deferred();
+  let arrived = false;
+  pool()
+    .intercept({ path: STATUS_PATH, method: 'GET' })
+    .reply(200, async () => {
+      arrived = true;
+      await held.promise;
+      return { jobId: 'j1', status: 'running' };
+    });
+  return { arrived: () => arrived, release: held.resolve };
+}
+
+test("cancel() while a status poll is in flight rejects with the job's own cancelled error, not the request's", async () => {
+  const status = heldStatus();
+  const cancels = cancelEndpoint();
+  const job = runJob(http(), { submit: submitJ1, mapResult: () => 'unreached' });
+  await until(status.arrived);
+
+  await job.cancel();
+  const err = await rejectionOf(job);
+  status.release();
+
+  expect(err?.code).toBe('cancelled');
+  expect(err?.message).toBe('Job j1 was cancelled.');
+  expect(err?.jobId).toBe('j1');
+  expect(err?.cause).toBeUndefined();
+  expect(cancels()).toBe(1);
+});
+
+test('timeoutMs elapsing while a status poll is in flight rejects job_timeout', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+  const status = heldStatus();
+  const job = runJob(http(), { submit: submitJ1, mapResult: () => 'unreached', timeoutMs: 5_000 });
+  const settled = rejectionOf(job);
+  await until(status.arrived);
+
+  await vi.advanceTimersByTimeAsync(5_000);
+  const err = await settled;
+  status.release();
+
+  expect(err?.code).toBe('job_timeout');
+  expect(err?.jobId).toBe('j1');
+});
+
+test('a status poll that runs past the per-attempt timeout is retried, and the job resolves once a poll answers', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+  const attemptTimeouts: AbortController[] = [];
+  const timeout = vi.spyOn(AbortSignal, 'timeout').mockImplementation(() => {
+    const controller = new AbortController();
+    attemptTimeouts.push(controller);
+    return controller.signal;
+  });
+  try {
+    const status = heldStatus();
+    statusReplies({ status: 'completed' });
+    const { client, gets } = countingHttp();
+    const job = runJob(client, { submit: submitJ1, mapResult: () => 'done', pollIntervalMs: 0 });
+    const settled = rejectionOf(job);
+    await until(status.arrived);
+
+    attemptTimeouts.at(-1)?.abort(new DOMException('The operation timed out.', 'TimeoutError'));
+    await vi.advanceTimersByTimeAsync(1_000); // the first retry's 1 s wait
+    status.release();
+
+    expect(await settled).toBeUndefined();
+    expect(await job).toBe('done');
+    expect(gets()).toBe(2);
+  } finally {
+    timeout.mockRestore();
+  }
 });
 
 test('the listener on the caller signal is detached when the job settles without that signal aborting', async () => {

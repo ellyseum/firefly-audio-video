@@ -550,6 +550,35 @@ test('a failed render emits exactly one redacted error record', async () => {
   for (const secret of SECRETS) expect(text).not.toContain(secret);
 });
 
+test('a failed render whose output error names a write URL with ( ) in its path keeps the signature out of every printed form', async () => {
+  const raw =
+    'https://acct.blob.core.windows.net/out/render (1).mov?sv=2021&sp=cw&sig=PARENS_WRITE_SIG';
+  const encoded =
+    'https://acct.blob.core.windows.net/out/render%20(1).mov?sv=2021&sp=cw&sig=ENCODED_WRITE_SIG';
+  api.submit(['job-parens']);
+  api.status('job-parens', () => ({
+    jobId: 'job-parens',
+    status: 'failed',
+    createdDate: CREATED,
+    totalJobItems: 1,
+    outputs: [
+      {
+        variationIndex: '0',
+        presetIndex: '0',
+        errors: [{ message: `Could not write ${raw}` }, { message: `Could not write ${encoded}` }],
+      },
+    ],
+  }));
+  const error = await rejection(client().render(singleSpec(), { pollIntervalMs: 0 }));
+
+  expect(error.code).toBe('job_failed');
+  for (const printed of [JSON.stringify(error), inspect(error), String(error)]) {
+    expect(printed).not.toContain('PARENS_WRITE_SIG');
+    expect(printed).not.toContain('ENCODED_WRITE_SIG');
+  }
+  expect(JSON.stringify(error.items)).toContain('render%20(1).mov');
+});
+
 test('a render that fails before submitting emits exactly one record, with no job ID', async () => {
   const logger = recordingLogger();
   await rejection(

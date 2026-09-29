@@ -106,6 +106,54 @@ test('redactValue: redacts an embedded URL inside a larger prose string', () => 
   expect(out).toContain('after 3 attempts.');
 });
 
+test('redactValue: a URL whose path holds ( ) or an apostrophe loses its signature', () => {
+  const parens = redactValue(
+    'https://a.blob.core.windows.net/c/render%20(1).mp4?sv=2021&se=2026&sig=PARENSIG',
+  );
+  expect(parens).toBe('https://a.blob.core.windows.net/c/render%20(1).mp4');
+
+  const apostrophe = redactValue(
+    "https://a.blob.core.windows.net/c/mom's%20clip.mp4?sv=2021&sig=APOSSIG&rest=keep",
+  );
+  expect(apostrophe).toBe("https://a.blob.core.windows.net/c/mom's%20clip.mp4?rest=keep");
+});
+
+test('redactValue: a ) or quote wrapping a URL, and sentence punctuation after it, stay in the prose', () => {
+  expect(
+    redactValue('Upload failed (see https://a.blob.core.windows.net/c/f.mp4?sig=WRAPSIG).'),
+  ).toBe('Upload failed (see https://a.blob.core.windows.net/c/f.mp4).');
+  expect(
+    redactValue(
+      "Could not read 'https://a.blob.core.windows.net/c/mom's.mp4?sig=QUOTESIG' in time",
+    ),
+  ).toBe("Could not read 'https://a.blob.core.windows.net/c/mom's.mp4' in time");
+  // The URL's own `(1)` stays; only the `)` it never opened goes back to the prose.
+  expect(redactValue('Saved (https://a.blob.core.windows.net/c/take(1)?sig=OWNPARENSIG)!')).toBe(
+    'Saved (https://a.blob.core.windows.net/c/take(1))!',
+  );
+});
+
+test('redactValue: a signing parameter left in the text after a URL run ends is still removed', () => {
+  const cases: Array<[input: string, kept: string]> = [
+    // A raw space in the path ends the URL run before its query string.
+    [
+      'Could not write https://acct.blob.core.windows.net/out/render (1).mov?sv=2021&sp=cw&sig=SPACESIG',
+      'Could not write https://acct.blob.core.windows.net/out/render (1).mov?',
+    ],
+    // A bare query string, no URL at all: the first parameter sits at the start.
+    ['sig=STARTSIG&keep=1', '&keep=1'],
+    // After whitespace.
+    ['signed with sig=SPACEDSIG today', 'signed with  today'],
+    // `;`-separated, which a URL parser does not treat as a separator.
+    ['/f?a=1;sig=SEMISIG', '/f?a=1'],
+  ];
+  for (const [input, kept] of cases) {
+    const out = redactValue(input);
+    expect(out, input).toBe(kept);
+    expect(out, input).not.toMatch(/SIG\b/);
+  }
+});
+
 test('redactValue: walks arrays element by element', () => {
   const out = redactValue(['https://x/f?sig=SECRET', { token: 'T', note: 'ok' }]);
   expect(JSON.stringify(out)).not.toContain('SECRET');

@@ -12,6 +12,9 @@ import type { RenderBodyOutput, RenderBodyPresetRef, RenderBodyWire } from './ty
  *
  * - `destination` is wrapped as `{ url }` — the published API spec types it as a
  *   bare string, which the real API rejects.
+ * - Every preset reference is wrapped as `{ source: { presetId } }` or
+ *   `{ source: { url } }` — a bare `{ presetId }` is rejected with a
+ *   `422 validation_error`.
  * - `variationIndex` defaults to `0` when omitted.
  * - `fileName` is left off the output entirely when absent, rather than sent as
  *   `undefined`.
@@ -35,6 +38,7 @@ import type { RenderBodyOutput, RenderBodyPresetRef, RenderBodyWire } from './ty
  *   presets: [{ presetId: 'ffs_video_api_prores' }],
  *   outputs: [{ presetIndex: 0, destination: 'https://example.com/out.mov?sig=…' }],
  * });
+ * // body.presets[0] -> { source: { presetId: 'ffs_video_api_prores' } }
  * // body.outputs[0].destination -> { url: 'https://example.com/out.mov?sig=…' }
  * ```
  */
@@ -42,7 +46,9 @@ export function buildRenderBody(spec: RenderSpec): RenderBodyWire {
   const parsed = RenderSpecSchema.parse(spec);
 
   const presets: RenderBodyPresetRef[] = parsed.presets.map((preset) =>
-    'presetId' in preset ? { presetId: preset.presetId } : { source: { url: preset.url } },
+    'presetId' in preset
+      ? { source: { presetId: preset.presetId } }
+      : { source: { url: preset.url } },
   );
 
   const outputs: RenderBodyOutput[] = parsed.outputs.map((output) => ({

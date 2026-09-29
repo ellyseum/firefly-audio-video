@@ -13,13 +13,13 @@ test('destination becomes an object {url}, not a string', () => {
   expect(body.presets[0]).toEqual({ source: { url: 'https://x/p.epr?sig=B' } });
 });
 
-test('named preset ref passes presetId through', () => {
+test('a named preset ref is wrapped as { source: { presetId } } on the wire', () => {
   const body = buildRenderBody({
     source: 's',
     presets: [{ presetId: 'ffs_video_api_prores' }],
     outputs: [{ presetIndex: 0, destination: 'd' }],
   });
-  expect(body.presets[0]).toEqual({ presetId: 'ffs_video_api_prores' });
+  expect(body.presets[0]).toEqual({ source: { presetId: 'ffs_video_api_prores' } });
 });
 
 test('variationIndex defaults to 0; fileName omitted when absent', () => {

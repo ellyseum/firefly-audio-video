@@ -15,11 +15,12 @@
 import type { RenderVariable } from './schemas.js';
 
 /**
- * A render preset reference in wire form: either a presigned URL to a staged `.epr`
- * (wrapped in the `{ source: { url } }` envelope every asset reference uses), or a
- * DGR-native `presetId` passed through unchanged.
+ * A render preset reference in wire form: a DGR-native `presetId`, or a presigned
+ * URL to a staged `.epr` — both wrapped in the `{ source: { … } }` envelope every
+ * asset reference uses. A bare `{ presetId }` (unwrapped) is rejected by the real
+ * API with a `422 validation_error`.
  */
-export type RenderBodyPresetRef = { source: { url: string } } | { presetId: string };
+export type RenderBodyPresetRef = { source: { presetId: string } } | { source: { url: string } };
 
 /**
  * One deliverable in wire form. `destination` MUST be an object — the published API

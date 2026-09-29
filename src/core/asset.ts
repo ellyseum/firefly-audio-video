@@ -14,7 +14,7 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { AudioVideoError } from './errors.js';
 import type { JobMeta } from './job.js';
-import { redactUrl } from './redact.js';
+import { redactUrl, redactValue } from './redact.js';
 
 /**
  * The subset of the global `fetch` function {@link Asset} needs: called with
@@ -99,11 +99,17 @@ export class Asset {
    *
    * @returns The asset's bytes.
    * @throws {@link AudioVideoError} — `code: 'asset_fetch_failed'` — for a
-   *   non-2xx response, with a redacted URL in the message.
+   *   non-2xx response or any other fetch failure (a malformed URL, a DNS
+   *   failure, a reset mid-download), always with a redacted URL and a
+   *   sanitized `cause` in place of the raw error.
    */
   async buffer(): Promise<Buffer> {
     const res = await this.#fetchOk();
-    return Buffer.from(await res.arrayBuffer());
+    try {
+      return Buffer.from(await res.arrayBuffer());
+    } catch (cause) {
+      throw this.#wrapTransportError(cause);
+    }
   }
 
   /**
@@ -112,8 +118,10 @@ export class Asset {
    * in memory. Lazy: the underlying fetch does not start until the stream is
    * first read — via `.pipe()`, a `'data'` listener, `.resume()`, or an
    * explicit `.read()` — so a `stream()` call that is never consumed issues no
-   * request at all. A fetch failure, including a non-2xx response, surfaces as
-   * an `'error'` event on the returned stream, never as an unhandled rejection.
+   * request at all. A fetch failure — a non-2xx response, a malformed URL, a
+   * DNS failure, a reset mid-download — surfaces as an `'error'` event
+   * carrying the same {@link AudioVideoError} {@link buffer} would throw,
+   * never as an unhandled rejection.
    *
    * @returns A readable stream of the asset's bytes.
    */
@@ -125,13 +133,14 @@ export class Asset {
    * Streams the asset directly to `path`, creating any missing parent
    * directories first. Never buffers the whole file in memory — bytes reach
    * disk as they arrive over the network, not after the response completes. A
-   * fetch failure, including a non-2xx response, rejects with the same
-   * {@link AudioVideoError} {@link buffer} would throw. The download lands in
-   * a temporary file beside `path` first and is moved into place with a
-   * single rename once it completes; on any failure — the response status,
-   * a transport error, or a write/rename error — the temp file is removed
-   * and `path` is left exactly as it was beforehand: absent stays absent, an
-   * existing file stays byte-identical.
+   * fetch failure — a non-2xx response, a malformed URL, a DNS failure, a
+   * reset mid-download — rejects with the same {@link AudioVideoError}
+   * {@link buffer} would throw. The download lands in a temporary file
+   * beside `path` first and is moved into place with a single rename once
+   * it completes; on any failure — the response status, a transport error,
+   * or a write/rename error — the temp file is removed and `path` is left
+   * exactly as it was beforehand: absent stays absent, an existing file
+   * stays byte-identical.
    *
    * @param path - The destination file path.
    */
@@ -145,7 +154,7 @@ export class Asset {
       await rename(tmpPath, path);
     } catch (err) {
       await rm(tmpPath, { force: true }).catch(() => undefined);
-      throw err;
+      throw err instanceof AudioVideoError ? err : this.#wrapTransportError(err);
     }
   }
 
@@ -172,10 +181,17 @@ export class Asset {
 
   /**
    * Issues the fetch every accessor is built on, resolving with the response
-   * once its status is confirmed successful.
+   * once its status is confirmed successful. Any rejection from the fetch
+   * itself — a malformed or host-relative URL, a DNS failure, a network
+   * error — is wrapped the same way a non-2xx response is.
    */
   async #fetchOk(): Promise<Response> {
-    const res = await this.#fetch(this.#url);
+    let res: Response;
+    try {
+      res = await this.#fetch(this.#url);
+    } catch (cause) {
+      throw this.#wrapTransportError(cause);
+    }
     if (!res.ok) {
       throw new AudioVideoError({
         message: `Fetching the asset at ${redactUrl(this.#url)} failed with status ${res.status}.`,
@@ -191,15 +207,34 @@ export class Asset {
    * not run until the returned stream's first pull, which is what makes
    * {@link stream} lazy: fetching and status-checking happen here, on first
    * read, rather than when `stream()` is called. A rejection thrown from here
-   * — the fetch itself failing, or the non-2xx check below — is turned by
-   * `Readable.from` into an `'error'` event on the stream it returned, never
-   * an unhandled rejection.
+   * — the fetch itself failing, the non-2xx check inside {@link #fetchOk}, or
+   * a failure reading the body below — is turned by `Readable.from` into an
+   * `'error'` event on the stream it returned, never an unhandled rejection.
    */
   async *#streamChunks(): AsyncGenerator<Buffer> {
     const res = await this.#fetchOk();
     const body = res.body;
     if (body === null) return;
-    yield* Readable.fromWeb(body);
+    try {
+      yield* Readable.fromWeb(body);
+    } catch (cause) {
+      throw this.#wrapTransportError(cause);
+    }
+  }
+
+  /**
+   * Wraps a rejected fetch or a failed body read as the `asset_fetch_failed`
+   * error every accessor promises: a redacted URL in the message, and —
+   * rather than the raw error — a sanitized `cause` (see
+   * {@link sanitizeTransportError}) that cannot reintroduce the URL through
+   * `err.cause` on any printable surface.
+   */
+  #wrapTransportError(cause: unknown): AudioVideoError {
+    return new AudioVideoError({
+      message: `Fetching the asset at ${redactUrl(this.#url)} failed.`,
+      code: 'asset_fetch_failed',
+      cause: sanitizeTransportError(cause, this.#url),
+    });
   }
 }
 
@@ -210,6 +245,28 @@ export class Asset {
  */
 function tempSavePath(path: string): string {
   return `${path}.${randomUUID()}.partial`;
+}
+
+/**
+ * Builds a safe substitute for a transport error before it becomes an
+ * {@link AudioVideoError}'s `cause`: a plain `Error` carrying the original's
+ * `name` (and `code`, when the platform set one) with every occurrence of
+ * `rawUrl` — and, as a second pass, any other embedded URL a wrapping
+ * message might carry — replaced by its {@link redactUrl}-redacted form.
+ * `err` itself, and any `cause` chain hanging off it, is never attached:
+ * either could still be holding the unredacted URL.
+ */
+function sanitizeTransportError(err: unknown, rawUrl: string): Error {
+  const original = err instanceof Error ? err : new Error(String(err));
+  const withRawUrlRedacted =
+    rawUrl.length > 0 && original.message.includes(rawUrl)
+      ? original.message.split(rawUrl).join(redactUrl(rawUrl))
+      : original.message;
+  const sanitized = new Error(redactValue(withRawUrlRedacted));
+  sanitized.name = original.name;
+  const code = (original as Error & { code?: unknown }).code;
+  if (typeof code === 'string') (sanitized as Error & { code?: string }).code = code;
+  return sanitized;
 }
 
 /**

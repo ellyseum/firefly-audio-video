@@ -177,7 +177,7 @@ test('stream() is lazy — no fetch is issued until the stream is read', async (
   expect(fetchCalls).toBe(1);
 });
 
-test('a fetch rejection on stream() surfaces as a stream error event, not an unhandled rejection', async () => {
+test('a fetch rejection on stream() surfaces as a wrapped asset_fetch_failed error event, not an unhandled rejection', async () => {
   const asset = new Asset({
     url: 'https://x/out.mov',
     meta: sampleMeta(),
@@ -187,13 +187,15 @@ test('a fetch rejection on stream() surfaces as a stream error event, not an unh
   });
 
   const stream = asset.stream();
-  const errorEvent = new Promise<Error>((resolve) => {
-    stream.once('error', (err: Error) => resolve(err));
+  const errorEvent = new Promise<AudioVideoError>((resolve) => {
+    stream.once('error', (err: AudioVideoError) => resolve(err));
   });
   stream.resume();
 
   const err = await errorEvent;
-  expect(err.message).toBe('network down');
+  expect(err).toBeInstanceOf(AudioVideoError);
+  expect(err.code).toBe('asset_fetch_failed');
+  expect((err.cause as Error).message).toBe('network down');
 });
 
 test('a non-2xx response on stream() surfaces as a redacted stream error event', async () => {
@@ -402,6 +404,66 @@ test('toJSON() reports the meta alongside the redacted url', () => {
     url: 'https://x.blob.core.windows.net/out.mov?rest=keep',
     meta,
   });
+});
+
+// --- transport failures wrap as asset_fetch_failed, cause included -------------------
+
+const MALFORMED_URL = 'https://[invalid/out.mov?sig=SUPER_SECRET';
+
+/** Every printable surface a caller might reach an AudioVideoError, or its cause, through. */
+function printedSurfaces(err: AudioVideoError): string[] {
+  return [
+    err.message,
+    String(err),
+    inspect(err, { depth: null }),
+    JSON.stringify(err),
+    String(err.cause),
+    inspect(err.cause, { depth: null }),
+  ];
+}
+
+test('a malformed URL makes buffer() reject asset_fetch_failed, with the secret absent from every printable surface including the cause', async () => {
+  const asset = new Asset({ url: MALFORMED_URL, meta: sampleMeta() });
+
+  const err = (await asset.buffer().catch((e: unknown) => e)) as AudioVideoError;
+
+  expect(err).toBeInstanceOf(AudioVideoError);
+  expect(err.code).toBe('asset_fetch_failed');
+  for (const s of printedSurfaces(err)) {
+    expect(s).not.toContain('SUPER_SECRET');
+  }
+});
+
+test('a malformed URL makes save() reject asset_fetch_failed, with the secret absent from every printable surface including the cause', async () => {
+  const asset = new Asset({ url: MALFORMED_URL, meta: sampleMeta() });
+  const dir = tempDir();
+  const path = join(dir, 'out.bin');
+
+  const err = (await asset.save(path).catch((e: unknown) => e)) as AudioVideoError;
+
+  expect(err).toBeInstanceOf(AudioVideoError);
+  expect(err.code).toBe('asset_fetch_failed');
+  for (const s of printedSurfaces(err)) {
+    expect(s).not.toContain('SUPER_SECRET');
+  }
+  expect(existsSync(path)).toBe(false);
+});
+
+test('a malformed URL makes stream() emit asset_fetch_failed, with the secret absent from every printable surface including the cause', async () => {
+  const asset = new Asset({ url: MALFORMED_URL, meta: sampleMeta() });
+
+  const stream = asset.stream();
+  const errorEvent = new Promise<AudioVideoError>((resolve) => {
+    stream.once('error', (err: AudioVideoError) => resolve(err));
+  });
+  stream.resume();
+
+  const err = await errorEvent;
+  expect(err).toBeInstanceOf(AudioVideoError);
+  expect(err.code).toBe('asset_fetch_failed');
+  for (const s of printedSurfaces(err)) {
+    expect(s).not.toContain('SUPER_SECRET');
+  }
 });
 
 // --- resolveAsset ----------------------------------------------------------------------

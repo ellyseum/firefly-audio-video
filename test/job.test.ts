@@ -669,6 +669,27 @@ test('a submit that fails while a cancel is waiting on it resolves the cancel wi
   expect(inspect(job)).toBe("{ jobId: undefined, state: 'cancelled' }");
 });
 
+test('cancel() while the submit is in flight still rejects cancelled, not submit_failed, even once the submit later rejects with a raw error', async () => {
+  const cancels = cancelEndpoint();
+  let failSubmit!: () => void;
+  const submit = vi.fn(
+    () =>
+      new Promise<JobSubmission>((_, reject) => {
+        failSubmit = () => reject(new TypeError('fetch failed'));
+      }),
+  );
+  const job = runJob(http(), { submit, mapResult: () => 'unreached' });
+
+  const cancelled = job.cancel();
+  expect((await rejectionOf(job))?.code).toBe('cancelled');
+  failSubmit();
+  await cancelled;
+
+  expect(cancels()).toBe(0);
+  expect(job.jobId).toBeUndefined();
+  expect(inspect(job)).toBe("{ jobId: undefined, state: 'cancelled' }");
+});
+
 test('an external signal abort cancels the job the same way, with the abort reason as cause', async () => {
   const polls = runningForever();
   const cancels = cancelEndpoint();
@@ -920,6 +941,31 @@ test('a rejected submit rejects the job with that same error, without a second s
   expect(job.jobId).toBeUndefined();
   expect(job.meta).toBeUndefined();
   expect(inspect(job)).toBe("{ jobId: undefined, state: 'rejected' }");
+});
+
+test('a submit rejecting with something other than AudioVideoError is wrapped submit_failed, keeping it as .cause', async () => {
+  const cause = new TypeError('fetch failed');
+  const submit = vi.fn(() => Promise.reject(cause));
+  const job = runJob(http(), { submit, mapResult: () => 'unreached' });
+
+  const err = await rejectionOf(job);
+  expect(err?.code).toBe('submit_failed');
+  expect(err?.cause).toBe(cause);
+  expect(err?.jobId).toBeUndefined();
+  expect(submit).toHaveBeenCalledTimes(1);
+  expect(job.jobId).toBeUndefined();
+  expect(job.meta).toBeUndefined();
+  expect(inspect(job)).toBe("{ jobId: undefined, state: 'rejected' }");
+});
+
+test("a TokenProvider's plain Error rejecting the submit is wrapped submit_failed the same way", async () => {
+  const cause = new Error('token endpoint unreachable');
+  const submit = vi.fn(() => Promise.reject(cause));
+  const job = runJob(http(), { submit, mapResult: () => 'unreached' });
+
+  const err = await rejectionOf(job);
+  expect(err?.code).toBe('submit_failed');
+  expect(err?.cause).toBe(cause);
 });
 
 // --- transient status-poll failures ------------------------------------------------------

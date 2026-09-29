@@ -102,7 +102,9 @@ export interface RunJobOptions<T> {
    * URL. It is not handed the job's abort signal: a cancel during submission lets
    * the request complete, so the job the service accepted is known by ID and is
    * sent the cancel request — aborting the request would leave that job running
-   * unseen. Never retried: a failing submit rejects the job with the error it threw.
+   * unseen. Never retried: a failing submit rejects the job with the error it
+   * threw when that error is already an {@link AudioVideoError} (a caller matches
+   * on its code), or with one wrapping it (`code: 'submit_failed'`) otherwise.
    */
   submit: () => Promise<JobSubmission>;
   /** Builds the job's result from a successful terminal status body and its derived timing. */
@@ -115,8 +117,8 @@ export interface RunJobOptions<T> {
   /**
    * Called once per poll with the raw status body, the terminal poll included. On
    * the terminal poll it runs after the outcome and `meta` have been derived, so
-   * nothing it does to the body changes them. An error it throws rejects the job
-   * with that error.
+   * nothing it does to the body changes them. An error it throws is the caller's
+   * own: it rejects the job exactly as thrown, never wrapped.
    */
   onProgress?: (status: JobStatusLike) => void;
   /**
@@ -221,16 +223,18 @@ const POLL_RETRY_MAX_MS = 30_000;
  * `job.cancel()`). It settles exactly once — with the capability's mapped result
  * when the job reaches a successful terminal state, or with an
  * {@link AudioVideoError} whose `code` is `job_failed`, `job_poll_failed`,
- * `cancelled` or `job_timeout` (or with the error a failing submit threw, or the
- * error of a status poll whose failure is final — a `404`, say).
+ * `submit_failed`, `cancelled` or `job_timeout` — or, when a submit or a final
+ * poll failure was already one (a `404`, say — repeating the request cannot
+ * change it), that same error unchanged.
  *
  * `util.inspect` / `console.log` print only `{ jobId, state }` — never a URL or a
  * status body — so a job can be logged freely.
  *
  * A job is a promise in this respect too: one that is never awaited (or given a
- * rejection handler) and ends in `job_failed`, `job_poll_failed`, `job_timeout` or
- * a service-side cancellation is an unhandled rejection. Only a job cancelled
- * through {@link AsyncJob.cancel} or `signal` carries a handler of its own.
+ * rejection handler) and ends in `job_failed`, `job_poll_failed`, `submit_failed`,
+ * `job_timeout` or a service-side cancellation is an unhandled rejection. Only a
+ * job cancelled through {@link AsyncJob.cancel} or `signal` carries a handler of
+ * its own.
  *
  * Instances are created by the SDK's job runner; application code receives them
  * from a capability method and has no reason to construct one directly.
@@ -465,8 +469,11 @@ export class AsyncJob<T> implements PromiseLike<T> {
  *   response) — each such failure is retried after a growing delay, and a
  *   successful poll resets the count;
  * - rejects at once with the request's own error when a status poll fails in any
- *   other way (a `404`, say — the job is gone) or when the submit fails. The
- *   submit is never retried.
+ *   other way (a `404`, say — the job is gone);
+ * - rejects `submit_failed`, with the rejection as `cause`, when the submit call
+ *   rejects with anything other than an {@link AudioVideoError}; a submit
+ *   rejecting with one (`http_429`, an auth failure, …) rejects the job with that
+ *   same error, unchanged. The submit is never retried.
  *
  * `job.meta` is populated from any terminal body, failed ones included. A status
  * body that is not a JSON object is treated as "not yet terminal" and polling
@@ -557,7 +564,10 @@ async function pollUntilTerminal<T>(
   const startedAt = Date.now();
 
   signal.throwIfAborted();
-  const { jobId, statusUrl } = await ctx.trackSubmission(opts.submit());
+  const submission = opts.submit().catch((err: unknown) => {
+    throw submitFailure(err);
+  });
+  const { jobId, statusUrl } = await ctx.trackSubmission(submission);
 
   let failedPolls = 0;
   for (;;) {
@@ -756,13 +766,30 @@ function pollFailedError(jobId: string, failedPolls: number, last: unknown): Aud
   });
 }
 
-/** Names a failed poll for a message: its HTTP status, or the error's name or message. */
+/** Names a failure for a message: its HTTP status, or the error's name or message. */
 function describeFailure(err: unknown): string {
   if (err instanceof AudioVideoError)
     return err.status === undefined ? err.code : `HTTP ${err.status}`;
   if (err instanceof DOMException) return err.name;
   if (err instanceof Error) return err.message.length > 0 ? err.message : err.name;
   return String(err);
+}
+
+/**
+ * The error a job rejects with when its submit call fails: `cause` itself when
+ * it is already an {@link AudioVideoError} — a caller matches on codes like
+ * `http_429` or `auth_failed`, and a submit is never retried, so replacing it
+ * would only discard that — otherwise a new one wrapping `cause` with
+ * `code: 'submit_failed'`. The job ID is never set: the submit that would have
+ * supplied it is the one that failed.
+ */
+function submitFailure(cause: unknown): AudioVideoError {
+  if (cause instanceof AudioVideoError) return cause;
+  return new AudioVideoError({
+    message: `${describeJob(undefined)} could not be submitted: ${describeFailure(cause)}.`,
+    code: 'submit_failed',
+    cause,
+  });
 }
 
 /** The service's cancel endpoint for a job. */

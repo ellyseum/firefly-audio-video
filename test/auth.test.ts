@@ -663,6 +663,29 @@ test('an unreachable IMS rejects auth_failed, and no surface carries the secret'
   expect(inspect(consoleError.mock.calls, { depth: null })).not.toContain(SECRET);
 });
 
+test('the official provider still writes to console.error when a mint that already timed out fails', async () => {
+  useFakeClock();
+  const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+  const authenticate = vi.spyOn(ServerToServerTokenProvider.prototype, 'authenticate');
+  const held = deferred();
+  ims.answer(502, '<html><body>Bad Gateway</body></html>', { hold: held.promise });
+  const provider = new ClientCredentialsProvider(CREDS);
+
+  try {
+    const waiter = track(provider.getAccessToken());
+    await until(() => ims.requests.length === 1);
+    await vi.advanceTimersByTimeAsync(MINT_TIMEOUT_MS);
+    await until(() => waiter.state === 'rejected');
+    expect(consoleError).not.toHaveBeenCalled();
+
+    held.resolve();
+    await expect(authenticate.mock.results[0]?.value).rejects.toThrow();
+    expect(consoleError).toHaveBeenCalledWith('Error while fetching token', expect.anything());
+  } finally {
+    held.resolve();
+  }
+});
+
 // --- an IMS reply without a usable token -------------------------------------------
 
 const UNUSABLE_REPLIES: Array<[label: string, status: number, body: object, imsError?: string]> = [

@@ -205,6 +205,14 @@ export interface ClientCredentialsProviderOptions {
  * containing `&`, `=`, `+`, `%` or `#` would reach IMS as a different value;
  * the constructor rejects such values, and empty or non-string ones, with
  * `invalid_argument` before any request is made.
+ *
+ * **Known upstream behaviour: the wrapped provider writes to
+ * `console.error`.** It logs `"Error while fetching token"` with the error
+ * whenever its request to IMS fails, IMS's reply is not JSON, or the reply
+ * is a falsy JSON value such as `null` — even for a mint that has already
+ * timed out. That output bypasses this SDK's logger, so `logging: false`
+ * cannot silence it. A JSON refusal (an IMS error object) is not logged
+ * this way; it surfaces only as the `auth_failed` rejection.
  */
 export class ClientCredentialsProvider implements TokenProvider {
   readonly #details: ServerToServerAuthDetails;

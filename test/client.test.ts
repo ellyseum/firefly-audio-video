@@ -607,6 +607,28 @@ test('a host carrying user credentials is refused when the client is created, wi
   expect(error.message).not.toContain('HOST_PASS');
 });
 
+test('a spec with thousands of problems rejects invalid_argument naming ten and counting the rest', async () => {
+  const outputs = Array.from({ length: 5_000 }, () => ({ bogus: true }));
+  const spec = { source: CAPSULE, presets: ['h264Land1080pHq'], outputs };
+
+  const error = await rejection(client().render(spec as unknown as RenderRequest));
+
+  expect(error.code).toBe('invalid_argument');
+  expect(error.message.split('; ')).toHaveLength(11);
+  expect(error.message).toMatch(/; and 14990 more$/);
+  expect(api.submitted()).toEqual([]);
+});
+
+test('an enormous unknown key in a spec is cut short in the invalid_argument message', async () => {
+  const spec = { ...singleSpec(), ['k'.repeat(100_000)]: 1 };
+
+  const error = await rejection(client().render(spec as unknown as RenderRequest));
+
+  expect(error.code).toBe('invalid_argument');
+  expect(error.message.length).toBeLessThan(300);
+  expect(error.message).toMatch(/\.\.\.$/);
+});
+
 test('a render that fails before submitting emits exactly one record, with no job ID', async () => {
   const logger = recordingLogger();
   await rejection(

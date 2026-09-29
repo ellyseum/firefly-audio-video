@@ -176,19 +176,33 @@ export function quoted(value: unknown): string {
   return text.length > QUOTE_LIMIT ? `${text.slice(0, QUOTE_LIMIT - 3)}...` : text;
 }
 
-/** A zod error's issues on one line: `codec: codec must be …; bitDepth: …`. */
+/** A validation message names at most this many issues and counts the rest. */
+const MAX_ISSUES_NAMED = 10;
+
+/** Each issue named in a validation message is cut to this many characters. */
+const ISSUE_LIMIT = 200;
+
+/**
+ * A zod error's issues on one line: `codec: codec must be …; bitDepth: …`. At
+ * most ten are named, each cut to 200 characters, and the rest are counted
+ * (`…; and 4990 more`), so a spec with thousands of malformed entries, or one
+ * enormous unknown key, never yields a message — or a log line — of
+ * unbounded size.
+ */
 export function describeIssues(error: z.ZodError): string {
-  return error.issues
-    .map((issue) =>
-      issue.path.length > 0 ? `${issue.path.join('.')}: ${issue.message}` : issue.message,
-    )
-    .join('; ');
+  const named = error.issues.slice(0, MAX_ISSUES_NAMED).map((issue) => {
+    const text =
+      issue.path.length > 0 ? `${issue.path.join('.')}: ${issue.message}` : issue.message;
+    return text.length > ISSUE_LIMIT ? `${text.slice(0, ISSUE_LIMIT - 3)}...` : text;
+  });
+  const unnamed = error.issues.length - named.length;
+  return unnamed > 0 ? `${named.join('; ')}; and ${unnamed} more` : named.join('; ');
 }
 
 /**
  * `schema.parse(value)`, with a validation failure rethrown as an
- * `invalid_preset` {@link AudioVideoError} whose message lists every issue and
- * whose `.cause` is the original zod error.
+ * `invalid_preset` {@link AudioVideoError} whose message lists the issues (see
+ * {@link describeIssues}) and whose `.cause` is the original zod error.
  */
 export function parseOrThrow<T>(schema: z.ZodType<T>, value: unknown, what: string): T {
   const result = schema.safeParse(value);

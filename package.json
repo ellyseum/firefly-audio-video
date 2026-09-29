@@ -60,6 +60,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "coverage": "vitest run --coverage",
+    "runtime-smoke": "node scripts/runtime-smoke.mjs",
     "smoke": "vitest run --config vitest.smoke.config.ts",
     "prepare": "husky",
     "prepublishOnly": "npm run build"

@@ -174,16 +174,22 @@ describe('patched fields', () => {
     expect(value(toEpr({ codec: 'prores4444' }), 'ADBEVideoBitDepth')).toBe('4');
   });
 
-  test("an HEVC frame size takes AME's default rates for that size and the lowest level admitting them", () => {
+  test("an HEVC frame size takes AME's default rates and level for that exact size", () => {
     const uhd = toEpr({ codec: 'hevc', resolution: '3840x2160' });
     expect(value(uhd, 'ADBEVideoTargetBitrate')).toBe('35.');
     expect(value(uhd, 'ADBEVideoMaxBitrate')).toBe('40.');
-    expect(value(uhd, 'ADBEVideoTargetBitrate', 'ParamMaxValue')).toBe('40.');
-    expect(value(uhd, 'ADBEVideoMPEGProfileLevel')).toBe('51');
+    expect(value(uhd, 'ADBEVideoTargetBitrate', 'ParamMaxValue')).toBe('60.');
+    expect(value(uhd, 'ADBEVideoMPEGProfileLevel')).toBe('52');
+
+    const hd720 = toEpr({ codec: 'hevc', resolution: '1280x720' });
+    expect(value(hd720, 'ADBEVideoTargetBitrate')).toBe('4.');
+    expect(value(hd720, 'ADBEVideoMaxBitrate')).toBe('6.');
+    expect(value(hd720, 'ADBEVideoMPEGProfileLevel')).toBe('31');
 
     const sd = toEpr({ codec: 'hevc', resolution: '640x480' });
     expect(value(sd, 'ADBEVideoTargetBitrate')).toBe('1.300000000000000044408921');
     expect(value(sd, 'ADBEVideoMaxBitrate')).toBe('1.800000000000000044408921');
+    expect(value(sd, 'ADBEVideoMPEGProfileLevel')).toBe('30');
   });
 
   test('a bitrate sets the target, a 1.25x maximum, and a level that admits the maximum', () => {

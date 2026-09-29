@@ -97,16 +97,29 @@ const HEVC_LEVELS: readonly HevcLevel[] = [
   { level: 62, maxLumaPs: 35_651_584, maxLumaSr: 4_278_190_080, maxMbps: 240 },
 ];
 
+/** The {@link HevcLevel} named `value` (`41` = level 4.1) in {@link HEVC_LEVELS}. */
+function levelOf(value: number): HevcLevel {
+  return HEVC_LEVELS.find((candidate) => candidate.level === value)!;
+}
+
 /**
- * Default HEVC target and maximum bitrates (Mbps) by frame size, as AME's own
- * HEVC presets set them: SD 480p, HD 720p, HD 1080p, 4K UHD, 8K UHD.
+ * Default HEVC target/maximum bitrate (Mbps) and level by frame size, as AME's
+ * own HEVC presets set them: SD 480p, HD 720p, HD 1080p, 4K UHD, 8K UHD. A
+ * source-driven-rate default (no fixed frame rate) takes the row's level as
+ * AME ships it; a fixed frame rate, or a custom bitrate, instead computes the
+ * lowest H.265 Main-tier level admitting the request (see {@link hevcRates}).
  */
-const HEVC_DEFAULT_RATES: readonly { maxPixels: number; target: number; max: number }[] = [
-  { maxPixels: 854 * 480, target: 1.3, max: 1.8 },
-  { maxPixels: 1280 * 720, target: 4, max: 6 },
-  { maxPixels: 1920 * 1080, target: 16, max: 20 },
-  { maxPixels: 3840 * 2160, target: 35, max: 40 },
-  { maxPixels: Number.POSITIVE_INFINITY, target: 120, max: 160 },
+const HEVC_DEFAULT_RATES: readonly {
+  maxPixels: number;
+  target: number;
+  max: number;
+  level: HevcLevel;
+}[] = [
+  { maxPixels: 854 * 480, target: 1.3, max: 1.8, level: levelOf(30) },
+  { maxPixels: 1280 * 720, target: 4, max: 6, level: levelOf(31) },
+  { maxPixels: 1920 * 1080, target: 16, max: 20, level: levelOf(41) },
+  { maxPixels: 3840 * 2160, target: 35, max: 40, level: levelOf(52) },
+  { maxPixels: Number.POSITIVE_INFINITY, target: 120, max: 160, level: levelOf(62) },
 ];
 
 /** The frame size AME stores in an HEVC preset whose frame size follows the source. */
@@ -313,9 +326,13 @@ function checkFrameSize(codec: EncodeConfig['codec'], size: FrameSize): void {
 
 /**
  * HEVC rate control: the target and maximum bitrate (the config's, or AME's
- * default for the frame size) and the lowest level that admits them. `undefined`
- * keeps the template's rates, which is the case for a source-sized preset with
- * no bitrate.
+ * default for the frame size) and the level. A default-rate config with no
+ * fixed frame rate takes AME's own level for that exact size
+ * ({@link HEVC_DEFAULT_RATES}); a fixed frame rate, or a custom bitrate,
+ * instead computes the lowest H.265 Main-tier level admitting the picture
+ * size, the sample rate — the fixed frame rate if one is given, else up to 60
+ * fps — and the bitrate. `undefined` keeps the template's rates, which is the
+ * case for a source-sized preset with no bitrate.
  */
 function hevcRates(
   config: EncodeConfig,
@@ -324,6 +341,7 @@ function hevcRates(
 ): EprPlan['rates'] {
   let target: number;
   let max: number;
+  let pinnedLevel: HevcLevel | undefined;
   if (config.bitrate !== undefined) {
     target = bitrateBps(config.bitrate) / 1e6;
     if (target < HEVC_MIN_MBPS || target > HEVC_MAX_MBPS) {
@@ -336,9 +354,12 @@ function hevcRates(
     const pixels = size.width * size.height;
     const defaults = HEVC_DEFAULT_RATES.find((rate) => pixels <= rate.maxPixels)!;
     ({ target, max } = defaults);
+    if (fps === undefined) pinnedLevel = defaults.level;
   } else {
     return undefined;
   }
+
+  if (pinnedLevel !== undefined) return { level: pinnedLevel, target, max };
 
   // A source-driven frame rate is sized for sources up to 60 fps; a source-driven
   // frame size keeps the frame size AME stores for it.

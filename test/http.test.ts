@@ -146,22 +146,22 @@ test.each([
   [
     'another host',
     'https://other-host.example/v1/status/xyz',
-    'The request URL is on https://other-host.example/, not https://audio-video-api.adobe.io/',
+    'The request URL is on https://other-host.example, not https://audio-video-api.adobe.io',
   ],
   [
     'another port',
     'https://audio-video-api.adobe.io:8443/v1/status/xyz',
-    'The request URL is on https://audio-video-api.adobe.io:8443/, not https://audio-video-api.adobe.io/',
+    'The request URL is on https://audio-video-api.adobe.io:8443, not https://audio-video-api.adobe.io',
   ],
   [
     'http: where the host is https:',
     'http://audio-video-api.adobe.io/v1/status/xyz',
-    'The request URL is on http://audio-video-api.adobe.io/, not https://audio-video-api.adobe.io/',
+    'The request URL is on http://audio-video-api.adobe.io, not https://audio-video-api.adobe.io',
   ],
   [
     'a protocol-relative URL',
     '//other-host.example/v1/status/xyz',
-    'The request URL is on https://other-host.example/, not https://audio-video-api.adobe.io/',
+    'The request URL is on https://other-host.example, not https://audio-video-api.adobe.io',
   ],
   [
     'user credentials',
@@ -204,7 +204,7 @@ test('a path that came from a response body and leaves the origin is refused inv
 
   expect(err.code).toBe('invalid_response');
   expect(err.message).toBe(
-    'The URL the response named is on http://collector.example/, not https://audio-video-api.adobe.io/' +
+    'The URL the response named is on http://collector.example, not https://audio-video-api.adobe.io' +
       NOT_SENT,
   );
   expect(collector()).toBe(0);
@@ -240,12 +240,12 @@ test.each([
   [
     'not a URL',
     'audio-video-api.adobe.io',
-    'host must be an http(s) URL, e.g. https://audio-video-api.adobe.io/.',
+    'host must be an http(s) URL, e.g. https://audio-video-api.adobe.io.',
   ],
   [
     'not http(s)',
     'ftp://files.example',
-    'host must be an http(s) URL, e.g. https://audio-video-api.adobe.io/.',
+    'host must be an http(s) URL, e.g. https://audio-video-api.adobe.io.',
   ],
   [
     'carrying user credentials',

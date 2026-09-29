@@ -39,12 +39,13 @@ function isSecretQueryParam(key: string): boolean {
  * Deletes every {@link isSecretQueryParam} match from `url`'s query string —
  * removing the parameter entirely (name and value), not just blanking its value,
  * so that no parameter name recognizable as a signing parameter (e.g. `sig=`)
- * survives in the result.
+ * survives in the result — and returns the re-serialized URL, or `undefined`
+ * when there was nothing to delete, so the caller can keep its original text.
  */
-function stripSecretSearchParams(url: URL): string {
-  for (const key of new Set(url.searchParams.keys())) {
-    if (isSecretQueryParam(key)) url.searchParams.delete(key);
-  }
+function stripSecretSearchParams(url: URL): string | undefined {
+  const secret = [...new Set(url.searchParams.keys())].filter(isSecretQueryParam);
+  if (secret.length === 0) return undefined;
+  for (const key of secret) url.searchParams.delete(key);
   return url.toString();
 }
 
@@ -67,7 +68,7 @@ const RAW_SECRET_PARAM_RE = new RegExp(
  */
 function stripSecretParamsFromRawString(u: string): string {
   const stripped = u.replace(RAW_SECRET_PARAM_RE, '');
-  return !stripped.includes('?') && stripped.includes('&') ? stripped.replace('&', '?') : stripped;
+  return u.includes('?') && !stripped.includes('?') ? stripped.replace('&', '?') : stripped;
 }
 
 /**
@@ -79,9 +80,10 @@ function stripSecretParamsFromRawString(u: string): string {
  * Never throws: an absolute URL is redacted directly against the native `URL`
  * parser; a relative reference (no scheme/host) is resolved against a throwaway
  * base first so the same parameter-level logic still applies; anything neither of
- * those can parse falls back to a textual scrub. A URL that parses but has nothing
- * to redact is still re-serialized through `URL`, which can normalize incidental
- * details (scheme/host casing, a default port) without changing its meaning.
+ * those can parse falls back to a textual scrub. A URL with nothing to redact is
+ * returned exactly as given. One that loses a parameter is re-serialized through
+ * `URL`, which can normalize incidental details (scheme/host casing, a default
+ * port, the encoding of the parameters that remain) without changing its meaning.
  *
  * @param u - A URL, absolute or relative, with or without a query string.
  * @returns `u` with every SAS/AWS signing parameter removed.
@@ -96,13 +98,14 @@ function stripSecretParamsFromRawString(u: string): string {
  */
 export function redactUrl(u: string): string {
   try {
-    return stripSecretSearchParams(new URL(u));
+    return stripSecretSearchParams(new URL(u)) ?? u;
   } catch {
     // Not an absolute URL (no scheme/host) — fall through to relative resolution.
   }
   try {
     const base = 'http://redact.invalid';
     const resolved = stripSecretSearchParams(new URL(u, base));
+    if (resolved === undefined) return u;
     return resolved.startsWith(base) ? resolved.slice(base.length) : resolved;
   } catch {
     // Not parseable even as a relative reference — fall through to the raw scrub.

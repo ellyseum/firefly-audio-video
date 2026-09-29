@@ -26,6 +26,22 @@ test('redactUrl: a URL with no secret params is returned with its params intact'
   expect(out).toContain('b=2');
 });
 
+test('redactUrl: a URL with nothing to redact comes back exactly as given', () => {
+  for (const url of [
+    'HTTPS://Example.COM:443/a%20b?name=a%20b&t=~x',
+    'https://other-host.example',
+    '/v1/presets?q=a%20b',
+    // An `&` with no `?` stays an `&` when nothing was removed, parseable or not.
+    '/v1/presets&debug=1',
+    'http://[bad-host]/f&keep=1',
+  ]) {
+    expect(redactUrl(url)).toBe(url);
+  }
+  expect(redactValue('is on https://other-host.example, not https://api.example:')).toBe(
+    'is on https://other-host.example, not https://api.example:',
+  );
+});
+
 test('redactUrl: never throws on a malformed URL, and still redacts what it can', () => {
   const input = 'http://[bad-host]?sig=SECRET&rest=keep';
   let out = '';
@@ -33,7 +49,8 @@ test('redactUrl: never throws on a malformed URL, and still redacts what it can'
     out = redactUrl(input);
   }).not.toThrow();
   expect(out).not.toContain('SECRET');
-  expect(out).toContain('rest=keep');
+  // The removed leading parameter took the `?` with it; the next parameter takes its place.
+  expect(out).toBe('http://[bad-host]?rest=keep');
 });
 
 test('redactUrl: never throws on a string with no URL structure at all', () => {

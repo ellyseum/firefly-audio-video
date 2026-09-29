@@ -3,8 +3,9 @@ import { Console } from 'node:console';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
-import { Writable } from 'node:stream';
+import { Readable, Writable } from 'node:stream';
 import { inspect } from 'node:util';
+import { getGlobalDispatcher, MockAgent, setGlobalDispatcher } from 'undici';
 import { afterAll, afterEach, beforeAll, expect, test } from 'vitest';
 import { AudioVideoError } from '../src/core/errors.js';
 import { Asset, resolveAsset } from '../src/core/asset.js';
@@ -13,6 +14,9 @@ import type { JobMeta } from '../src/core/job.js';
 
 const SAS_URL =
   'https://x.blob.core.windows.net/out.mov?sv=2021&sig=SUPER_SECRET&se=2026&rest=keep';
+
+/** Bytes outside the ASCII range, so a payload cannot survive a lossy UTF-8 round trip unnoticed. */
+const NON_ASCII_BYTES = Buffer.from([0xff, 0xfe, 0x80, 0x00, 0x01, 0xc0, 0xff, 0x7f]);
 
 const tempDirs: string[] = [];
 const unhandledRejections: unknown[] = [];
@@ -48,6 +52,21 @@ function tempDir(): string {
 /** Minimal, valid `JobMeta` — this file exercises `Asset`, not timing derivation. */
 function sampleMeta(): JobMeta {
   return { jobId: 'job-1', perItem: [] };
+}
+
+/** `JobMeta` carrying every timing field, so a copy that drops any of them is detectable. */
+function fullMeta(): JobMeta {
+  return {
+    jobId: 'job-42',
+    createdAt: 1_700_000_000_000,
+    queueMs: 120,
+    renderMs: 4_500,
+    totalMs: 4_620,
+    perItem: [
+      { index: 0, queueMs: 60, renderMs: 2_000, totalMs: 2_060 },
+      { index: 1, queueMs: 60, renderMs: 2_500, totalMs: 2_560 },
+    ],
+  };
 }
 
 /** A `Response` over a string, byte array, or web `ReadableStream` body. */
@@ -138,6 +157,16 @@ test('buffer() returns the exact bytes', async () => {
   expect((await asset.buffer()).equals(Buffer.from('hello world'))).toBe(true);
 });
 
+test('buffer() preserves non-ASCII bytes exactly, with no lossy text round trip', async () => {
+  const asset = new Asset({
+    url: 'https://x/out.bin',
+    meta: sampleMeta(),
+    fetch: async () => fakeResponse(NON_ASCII_BYTES),
+  });
+
+  expect((await asset.buffer()).equals(NON_ASCII_BYTES)).toBe(true);
+});
+
 test('a non-2xx response makes buffer() throw a redacted AudioVideoError', async () => {
   const asset = new Asset({
     url: SAS_URL,
@@ -169,6 +198,19 @@ test('stream() piped to a writable yields the exact concatenated bytes', async (
   await pipeline(asset.stream(), sink.stream);
 
   expect(Buffer.concat(sink.chunks).equals(Buffer.concat(chunks))).toBe(true);
+});
+
+test('stream() preserves non-ASCII bytes exactly, with no lossy text round trip', async () => {
+  const asset = new Asset({
+    url: 'https://x/out.bin',
+    meta: sampleMeta(),
+    fetch: async () => fakeResponse(NON_ASCII_BYTES),
+  });
+
+  const sink = captureChunks();
+  await pipeline(asset.stream(), sink.stream);
+
+  expect(Buffer.concat(sink.chunks).equals(NON_ASCII_BYTES)).toBe(true);
 });
 
 test('stream() is a byte stream, not object mode — read(n) returns exactly n bytes', async () => {
@@ -275,6 +317,21 @@ test('save() writes a file whose bytes match, creating the parent directory', as
 
   expect(existsSync(join(dir, 'nested', 'sub'))).toBe(true);
   expect(readFileSync(path).equals(bytes)).toBe(true);
+});
+
+test('save() preserves non-ASCII bytes exactly, with no lossy text round trip', async () => {
+  const asset = new Asset({
+    url: 'https://x/out.bin',
+    meta: sampleMeta(),
+    fetch: async () => fakeResponse(NON_ASCII_BYTES),
+  });
+
+  const dir = tempDir();
+  const path = join(dir, 'out.bin');
+
+  await asset.save(path);
+
+  expect(readFileSync(path).equals(NON_ASCII_BYTES)).toBe(true);
 });
 
 test('save() streams incrementally to its temp file rather than buffering the whole body before writing', async () => {
@@ -443,6 +500,27 @@ test('toJSON() reports the meta alongside the redacted url', () => {
     url: 'https://x.blob.core.windows.net/out.mov?rest=keep',
     meta,
   });
+});
+
+test('toString() is exactly JSON.stringify(asset.toJSON())', () => {
+  const asset = new Asset({ url: SAS_URL, meta: sampleMeta() });
+
+  expect(asset.toString()).toBe(JSON.stringify(asset.toJSON()));
+});
+
+test('util.inspect output carries meta alongside the redacted url', () => {
+  const meta = sampleMeta();
+  const asset = new Asset({ url: SAS_URL, meta });
+
+  expect(inspect(asset)).toContain(`jobId: '${meta.jobId}'`);
+});
+
+test('a meta with every timing field round-trips losslessly through the asset', () => {
+  const meta = fullMeta();
+  const asset = new Asset({ url: 'https://x/out.mov', meta });
+
+  expect(asset.meta).toEqual(meta);
+  expect(asset.toJSON().meta).toEqual(meta);
 });
 
 // --- transport failures wrap as asset_fetch_failed, cause included -------------------
@@ -690,6 +768,33 @@ test('the signal reaches the underlying fetch call, so an abort while the fetch 
   expect((err as AudioVideoError).code).toBe('cancelled');
 });
 
+// --- the default fetch (globalThis.fetch) path --------------------------------------
+
+test('an Asset with no fetch override drives the real default fetch, via an undici MockAgent', async () => {
+  const originalDispatcher = getGlobalDispatcher();
+  const mockAgent = new MockAgent();
+  mockAgent.disableNetConnect();
+  setGlobalDispatcher(mockAgent);
+
+  try {
+    mockAgent
+      .get('https://asset-default-fetch.example')
+      .intercept({ path: '/out.mov', method: 'GET' })
+      .reply(200, 'payload');
+
+    const asset = new Asset({
+      url: 'https://asset-default-fetch.example/out.mov',
+      meta: sampleMeta(),
+    });
+
+    const result = await asset.buffer();
+    expect(result.equals(Buffer.from('payload'))).toBe(true);
+  } finally {
+    await mockAgent.close();
+    setGlobalDispatcher(originalDispatcher);
+  }
+});
+
 // --- resolveAsset ----------------------------------------------------------------------
 
 test('resolveAsset(asset) with no mode returns the Asset itself', async () => {
@@ -723,6 +828,45 @@ test("resolveAsset(asset, { resolveAs: 'stream' }) returns a Readable over the a
   const sink = captureChunks();
   await pipeline(result as import('node:stream').Readable, sink.stream);
   expect(Buffer.concat(sink.chunks).toString()).toBe('payload');
+});
+
+test("resolveAsset(asset, { resolveAs: 'stream' }) resolves immediately with a lazy stream, not one buffered from the whole body first", async () => {
+  const { body, controller } = controllableBody();
+  let fetchCalls = 0;
+  const asset = new Asset({
+    url: 'https://x/out.mov',
+    meta: sampleMeta(),
+    fetch: async () => {
+      fetchCalls += 1;
+      return fakeResponse(body);
+    },
+  });
+
+  const TIMED_OUT = Symbol('timed out');
+  let timer!: ReturnType<typeof setTimeout>;
+  // asset.stream() returns synchronously without touching the network, so
+  // resolveAsset() should settle almost immediately here. If it instead
+  // buffered the body first (via asset.buffer()), this race would time out:
+  // the body below is never closed until after the race is decided.
+  const result = await Promise.race([
+    resolveAsset(asset, { resolveAs: 'stream' }),
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve(TIMED_OUT), 100);
+    }),
+  ]);
+  clearTimeout(timer);
+
+  expect(result).not.toBe(TIMED_OUT);
+  expect(fetchCalls).toBe(0);
+
+  const chunk = Buffer.from('payload');
+  controller.enqueue(chunk);
+  controller.close();
+
+  const sink = captureChunks();
+  await pipeline(result as Readable, sink.stream);
+  expect(Buffer.concat(sink.chunks).equals(chunk)).toBe(true);
+  expect(fetchCalls).toBe(1);
 });
 
 test("resolveAsset(asset, { resolveAs: 'file', savePath }) saves and returns the path", async () => {

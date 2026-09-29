@@ -92,6 +92,51 @@ jobs:
       - run: npm ci
       - run: npm run coverage
 
+  # The one build the runtime-smoke matrix downloads, independent of whether
+  # the build gate's Node 22 leg above passes — a portability failure there
+  # must never take the smoke matrix down with it.
+  build-dist-artifact:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist
+          retention-days: 7
+
+  # Proves the published `engines: { node: '>=18' }` against the actual built
+  # artifact, on every major from that floor through the current LTS. The
+  # dist/ under test is built exactly once, above, on .nvmrc's Node — an
+  # older major here only ever installs production dependencies and runs a
+  # zero-dependency script, never the dev toolchain that dropped support for
+  # it.
+  runtime-smoke:
+    needs: build-dist-artifact
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [18, 20, 22, 24]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist
+      - run: npm ci --omit=dev --ignore-scripts
+      - run: node scripts/runtime-smoke.mjs
+
   commitlint:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest

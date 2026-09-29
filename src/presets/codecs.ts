@@ -157,6 +157,25 @@ export function invalidPreset(message: string, cause?: unknown): AudioVideoError
   return new AudioVideoError({ message, code: 'invalid_preset', cause });
 }
 
+/** Caller input echoed into an error message is cut to this many characters. */
+const QUOTE_LIMIT = 80;
+
+/**
+ * `JSON.stringify(value)` — or `String(value)` when that throws or returns
+ * `undefined` — cut to {@link QUOTE_LIMIT} characters. Every message that echoes
+ * caller input goes through this, so an oversized or unserializable value never
+ * balloons the message.
+ */
+export function quoted(value: unknown): string {
+  let text: string;
+  try {
+    text = JSON.stringify(value) ?? String(value);
+  } catch {
+    text = String(value);
+  }
+  return text.length > QUOTE_LIMIT ? `${text.slice(0, QUOTE_LIMIT - 3)}...` : text;
+}
+
 /** A zod error's issues on one line: `codec: codec must be …; bitDepth: …`. */
 function describeIssues(error: z.ZodError): string {
   return error.issues

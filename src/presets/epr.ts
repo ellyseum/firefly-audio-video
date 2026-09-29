@@ -19,6 +19,7 @@ import {
   invalidPreset,
   normalizeFrameRate,
   parseOrThrow,
+  quoted,
   ticksPerFrame,
   type CodecTraits,
   type FrameSize,
@@ -221,7 +222,7 @@ function planEpr(config: EncodeConfig): EprPlan {
   }
   if (config.color !== undefined && config.color.toLowerCase() !== 'rec709') {
     throw invalidPreset(
-      `color ${JSON.stringify(config.color)} is not supported: generated .epr presets encode Rec. 709 ('rec709').`,
+      `color ${quoted(config.color)} is not supported: generated .epr presets encode Rec. 709 ('rec709').`,
     );
   }
   if (config.chroma !== undefined && config.chroma !== traits.chroma) {
@@ -327,7 +328,7 @@ function hevcRates(
     target = bitrateBps(config.bitrate) / 1e6;
     if (target < HEVC_MIN_MBPS || target > HEVC_MAX_MBPS) {
       throw invalidPreset(
-        `codec 'hevc' needs a bitrate between 192k and 240M; got ${JSON.stringify(config.bitrate)}.`,
+        `codec 'hevc' needs a bitrate between 192k and 240M; got ${quoted(config.bitrate)}.`,
       );
     }
     max = Math.min(Math.round(target * HEVC_PEAK_RATIO * 1000) / 1000, HEVC_MAX_MBPS);

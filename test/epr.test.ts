@@ -7,6 +7,7 @@ import {
   bitrateBps,
   canonicalConfig,
   frameRateOfTicks,
+  quoted,
   ticksPerFrame,
 } from '../src/presets/codecs.js';
 import { HEVC_BASE_EPR } from '../src/presets/epr-templates/hevc.js';
@@ -512,5 +513,45 @@ describe('templates and helpers', () => {
     expect(bitrateBps('120M')).toBe(120_000_000);
     expect(bitrateBps('2500k')).toBe(2_500_000);
     expect(bitrateBps(8_000_000)).toBe(8_000_000);
+  });
+});
+
+describe('quoted() bounds an echoed value to a readable length', () => {
+  test('short values pass through JSON.stringify unchanged', () => {
+    expect(quoted('short')).toBe('"short"');
+    expect(quoted(42)).toBe('42');
+    expect(quoted(['a', 'b'])).toBe('["a","b"]');
+  });
+
+  test('a value whose JSON form is oversized is cut to 80 characters', () => {
+    const big = 'x'.repeat(20_000);
+    const out = quoted(big);
+    expect(out.length).toBe(80);
+    expect(out.endsWith('...')).toBe(true);
+    expect(out.startsWith('"xxx')).toBe(true);
+  });
+
+  test('a value JSON.stringify cannot serialize falls back to String()', () => {
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    expect(quoted(circular)).toBe(String(circular));
+  });
+});
+
+describe('bounded echoes at render time', () => {
+  test('an oversized color value is bounded in the rejection message', () => {
+    const big = 'p'.repeat(20_000);
+    const message = presetError(() =>
+      toEpr({ codec: 'hevc', resolution: '1920x1080', color: big }),
+    ).message;
+    expect(message.length).toBeLessThan(300);
+    expect(message).toContain('is not supported');
+  });
+
+  test('an oversized bitrate value is bounded in the rejection message', () => {
+    const big = '1'.repeat(10_000);
+    const message = presetError(() => toEpr({ codec: 'hevc', bitrate: big })).message;
+    expect(message.length).toBeLessThan(300);
+    expect(message).toContain('needs a bitrate between');
   });
 });

@@ -268,6 +268,18 @@ describe('building from a config', () => {
     expect(thrown(() => hevc.alpha('yes' as never)).message).toContain('alpha');
     expect(thrown(() => hevc.with({ fps: 30 } as never)).message).toContain('Unrecognized key');
   });
+
+  test('oversized input echoed into a message is bounded', () => {
+    const bigCodec = thrown(() => new Preset({ codec: 'x'.repeat(20_000) } as never)).message;
+    expect(bigCodec.length).toBeLessThan(300);
+    expect(bigCodec).toContain('codec must be one of');
+
+    const bigResize = thrown(() =>
+      Preset.encode({ codec: 'hevc' }).resize('x'.repeat(20_000) as never),
+    ).message;
+    expect(bigResize.length).toBeLessThan(300);
+    expect(bigResize).toContain('resize target must be one of');
+  });
 });
 
 describe('toPreset', () => {
@@ -348,6 +360,13 @@ describe('Preset.fromEpr', () => {
     expect(thrown(() => Preset.fromEpr('<?xml version="1.0"?><other/>')).message).toContain(
       'The XML is not an Adobe Media Encoder preset',
     );
+  });
+
+  test('an oversized non-.epr string is bounded in the "could not read" message', () => {
+    const big = 'y'.repeat(20_000);
+    const message = thrown(() => Preset.fromEpr(big)).message;
+    expect(message.length).toBeLessThan(300);
+    expect(message).toContain('Could not read the .epr file at');
   });
 });
 

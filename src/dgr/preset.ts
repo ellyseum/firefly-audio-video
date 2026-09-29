@@ -13,7 +13,7 @@ import {
   nameForPresetId,
   type AspectRatio,
 } from '../presets/catalog.js';
-import { canonicalKey, invalidPreset, parseOrThrow } from '../presets/codecs.js';
+import { canonicalKey, invalidPreset, parseOrThrow, quoted } from '../presets/codecs.js';
 import { parseEprHeadline, toEpr } from '../presets/epr.js';
 import { PRESET_NAMES } from '../presets/names.js';
 import {
@@ -175,7 +175,7 @@ export class Preset extends NamedAccessorBase {
     const xml = looksLikeXml(text) ? src : readEprFile(text);
     if (!xml.includes('<PremiereData')) {
       throw invalidPreset(
-        `${looksLikeXml(text) ? 'The XML' : `The file at ${text}`} is not an Adobe Media Encoder preset: it has no <PremiereData> element.`,
+        `${looksLikeXml(text) ? 'The XML' : `The file at ${quoted(text)}`} is not an Adobe Media Encoder preset: it has no <PremiereData> element.`,
       );
     }
     return presetFrom({
@@ -317,7 +317,7 @@ function resolutionFor(target: ResizeTarget): ResolutionString {
     .map((aspect) => `'${aspect}'`)
     .join(', ');
   throw invalidPreset(
-    `resize target must be one of ${aspects} or a 'WxH' size such as '1920x1080'; got ${JSON.stringify(target)}.`,
+    `resize target must be one of ${aspects} or a 'WxH' size such as '1920x1080'; got ${quoted(target)}.`,
   );
 }
 
@@ -343,7 +343,7 @@ function readEprFile(path: string): string {
   try {
     return readFileSync(path, 'utf8');
   } catch (error) {
-    throw invalidPreset(`Could not read the .epr file at ${path}.`, error);
+    throw invalidPreset(`Could not read the .epr file at ${quoted(path)}.`, error);
   }
 }
 
@@ -357,11 +357,6 @@ function isFile(path: string): boolean {
 }
 
 const EXPECTED_PRESET = `Expected a preset name (${PRESET_NAMES.join(', ')}), a DGR presetId (ffs_video_api_…), an EncodeConfig object, an .epr file path, raw .epr XML, or an http(s) URL to a staged .epr.`;
-
-/** `JSON.stringify(text)`, cut to a readable length. */
-function quoted(text: string): string {
-  return JSON.stringify(text.length > 80 ? `${text.slice(0, 77)}...` : text);
-}
 
 /**
  * Normalizes anything a preset may be given as to a {@link Preset}, in this

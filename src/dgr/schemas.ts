@@ -9,6 +9,7 @@
  */
 
 import * as z from 'zod';
+import { quoted } from '../presets/codecs.js';
 import { PRESET_NAMES } from '../presets/names.js';
 
 /** Quotes and joins allowed values for an error message: `'a', 'b' or 'c'`. */
@@ -107,7 +108,7 @@ export const CodecSchema = z.enum(CODECS, {
   error: (issue) =>
     issue.input === undefined
       ? `codec is required: one of ${oneOf(CODECS)}`
-      : `codec must be one of ${oneOf(CODECS)}; got ${JSON.stringify(issue.input)}`,
+      : `codec must be one of ${oneOf(CODECS)}; got ${quoted(issue.input)}`,
 });
 
 /** A {@link CodecSchema} value. */
@@ -247,7 +248,7 @@ export type EncodeConfig = z.infer<typeof EncodeConfigSchema>;
  */
 export const PresetNameSchema = z.enum(PRESET_NAMES, {
   error: (issue) =>
-    `unknown preset name ${JSON.stringify(issue.input)}; expected one of ${PRESET_NAMES.join(', ')}`,
+    `unknown preset name ${quoted(issue.input)}; expected one of ${PRESET_NAMES.join(', ')}`,
 });
 
 /** A {@link PresetNameSchema} value. */

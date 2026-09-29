@@ -413,13 +413,21 @@ test('rotatingFileLogger: rolls at maxBytes, keeps every file within maxBytes, c
     expect(statSync(p).size).toBeLessThanOrEqual(200);
   }
 
+  // Each kept file holds exactly two ~68-69-byte records (138 B), never one — a
+  // size estimate left stale after a rotation would rotate again on every later
+  // write and keep only one record per file, which an upper-bound-only check
+  // (file exists, size <= 200, ordering) cannot tell apart from this.
+  expect(readLines(path)).toHaveLength(2);
+  expect(readLines(`${path}.1`)).toHaveLength(2);
+  expect(readLines(`${path}.2`)).toHaveLength(2);
+
   const current = indices(path);
   const older = indices(`${path}.1`);
   const oldest = indices(`${path}.2`);
   expect(current.at(-1)).toBe(29);
   expect(Math.min(...current)).toBeGreaterThan(Math.max(...older));
   expect(Math.min(...older)).toBeGreaterThan(Math.max(...oldest));
-  expect(current.length + older.length + oldest.length).toBeLessThan(30);
+  expect(current.length + older.length + oldest.length).toBeGreaterThanOrEqual(6);
 });
 
 test('rotatingFileLogger: a single record larger than maxBytes is still written — an empty file never rotates', () => {

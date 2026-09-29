@@ -76,6 +76,54 @@ test('admits queued tasks in FIFO order', async () => {
   expect(startOrder).toEqual([0, 1, 2, 3]);
 });
 
+test('a release admits its queued successor before a run() issued in the same microtask batch can take the slot', async () => {
+  const pool = new InMemoryPool({ concurrency: 1 });
+  const gate = deferred<void>();
+  const trigger = deferred<void>();
+  const startOrder: string[] = [];
+  let maxActive = 0;
+
+  const first = pool.run(() => {
+    startOrder.push('first');
+    return gate.promise;
+  });
+
+  await flush();
+  expect(pool.active).toBe(1);
+
+  const queued = pool.run(async () => {
+    maxActive = Math.max(maxActive, pool.active);
+    startOrder.push('queued');
+    return 'queued';
+  });
+
+  await flush();
+  expect(pool.queued).toBe(1);
+
+  // Registered before either gate settles, so this reaction and the first
+  // task's own await-continuation land in the same batch of microtasks that
+  // gate.resolve()/trigger.resolve() below schedule.
+  let late: Promise<string> | undefined;
+  trigger.promise.then(() => {
+    late = pool.run(async () => {
+      maxActive = Math.max(maxActive, pool.active);
+      startOrder.push('late');
+      return 'late';
+    });
+  });
+
+  gate.resolve();
+  trigger.resolve();
+
+  await flush();
+  expect(startOrder).toEqual(['first', 'queued', 'late']);
+  expect(maxActive).toBe(1);
+
+  await expect(first).resolves.toBeUndefined();
+  await expect(queued).resolves.toBe('queued');
+  await expect(late).resolves.toBe('late');
+});
+
 test('concurrency 1 fully serializes: never more than one task active at once', async () => {
   const pool = new InMemoryPool({ concurrency: 1 });
   const gates = Array.from({ length: 3 }, () => deferred<void>());
@@ -166,6 +214,27 @@ test('one queued task rejecting does not affect its siblings or wedge the queue'
   expect(pool.queued).toBe(0);
 });
 
+test('a task that throws synchronously still releases its slot and lets a queued sibling run', async () => {
+  const pool = new InMemoryPool({ concurrency: 1 });
+  const boom = new Error('boom');
+  const siblingGate = deferred<string>();
+
+  const first = pool.run(() => {
+    throw boom;
+  });
+  const queued = pool.run(() => siblingGate.promise);
+
+  await expect(first).rejects.toBe(boom);
+  expect(pool.queued).toBe(0);
+
+  await flush();
+  expect(pool.active).toBe(1); // the queued sibling was admitted into the freed slot
+
+  siblingGate.resolve('sibling');
+  await expect(queued).resolves.toBe('sibling');
+  expect(pool.active).toBe(0);
+});
+
 // --- drain ---------------------------------------------------------------------------
 
 test('drain() resolves immediately on an idle pool', async () => {
@@ -197,6 +266,65 @@ test('drain() resolves only once every active and queued task has settled', asyn
   expect(drained).toBe(true);
 
   await Promise.all(runs);
+});
+
+test('drain() keeps waiting for a task submitted after it was called, even once it is admitted into a freed slot', async () => {
+  const pool = new InMemoryPool({ concurrency: 2 });
+  const gate1 = deferred<void>();
+  let drained = false;
+
+  const task1 = pool.run(() => gate1.promise);
+  await flush();
+  expect(pool.active).toBe(1);
+
+  const drainPromise = pool.drain().then(() => {
+    drained = true;
+  });
+
+  const gate2 = deferred<void>();
+  const task2 = pool.run(() => gate2.promise);
+  await flush();
+  expect(pool.active).toBe(2);
+
+  gate1.resolve();
+  await flush();
+  expect(pool.active).toBe(1);
+  expect(drained).toBe(false); // task2 arrived after drain() was called; it must be awaited too
+
+  gate2.resolve();
+  await drainPromise;
+  expect(drained).toBe(true);
+
+  await Promise.all([task1, task2]);
+});
+
+test('drain() stays pending while a task is still active even though the queue is empty', async () => {
+  const pool = new InMemoryPool({ concurrency: 2 });
+  const gate1 = deferred<void>();
+  const gate2 = deferred<void>();
+  let drained = false;
+
+  const task1 = pool.run(() => gate1.promise);
+  const task2 = pool.run(() => gate2.promise);
+  await flush();
+  expect(pool.active).toBe(2);
+  expect(pool.queued).toBe(0);
+
+  const drainPromise = pool.drain().then(() => {
+    drained = true;
+  });
+
+  gate1.resolve();
+  await flush();
+  expect(pool.active).toBe(1);
+  expect(pool.queued).toBe(0);
+  expect(drained).toBe(false); // the queue is empty, but a task is still active
+
+  gate2.resolve();
+  await drainPromise;
+  expect(drained).toBe(true);
+
+  await Promise.all([task1, task2]);
 });
 
 // --- configuration + validation -------------------------------------------------------

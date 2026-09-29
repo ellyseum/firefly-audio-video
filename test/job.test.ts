@@ -1,3 +1,4 @@
+import { getEventListeners } from 'node:events';
 import { readFileSync } from 'node:fs';
 import { inspect } from 'node:util';
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
@@ -6,7 +7,7 @@ import type { TokenProvider } from '../src/core/auth.js';
 import { AudioVideoError } from '../src/core/errors.js';
 import { DEFAULT_HOST, HttpClient } from '../src/core/http.js';
 import { AsyncJob, DEFAULT_MAX_POLL_FAILURES, parseTimings, runJob } from '../src/core/job.js';
-import type { JobStatusLike, JobSubmission } from '../src/core/job.js';
+import type { JobItemLike, JobStatusLike, JobSubmission } from '../src/core/job.js';
 import type { JobStatusResponse } from '../src/dgr/types.js';
 
 const originalDispatcher = getGlobalDispatcher();
@@ -355,6 +356,73 @@ test('several failing outputs each get their own item, and the message names eve
   expect(err?.message).toContain('outputs 0, 2');
 });
 
+test('a null entry in outputs[] contributes no errors and no timing, and its neighbours keep their indices', async () => {
+  statusReplies({
+    jobId: 'j1',
+    status: 'running',
+    outputs: [null, { errors: [{ code: 'A' }] }],
+  });
+
+  const err = await rejectionOf(
+    runJob(http(), { submit: submitJ1, mapResult: () => 'unreached', pollIntervalMs: 0 }),
+  );
+
+  expect(err?.code).toBe('job_failed');
+  expect(err?.items).toEqual([{ index: 1, errors: [{ code: 'A' }] }]);
+  expect(err?.message).toContain('output 1');
+
+  const meta = parseTimings({
+    jobId: 'j1',
+    createdDate: CREATED,
+    outputs: [null as unknown as JobItemLike, { startedDate: at(1), completedDate: at(3) }],
+  });
+  expect(meta.perItem).toEqual([
+    { index: 0, queueMs: undefined, renderMs: undefined, totalMs: undefined },
+    { index: 1, queueMs: 1_000, renderMs: 2_000, totalMs: 3_000 },
+  ]);
+  expect(meta.renderMs).toBe(2_000);
+});
+
+test('an onProgress that throws on the terminal poll rejects the job with that error, meta already derived', async () => {
+  statusReplies(
+    { status: 'running' },
+    {
+      jobId: 'j1',
+      status: 'completed',
+      createdDate: CREATED,
+      outputs: [{ startedDate: at(1), completedDate: at(3) }],
+    },
+  );
+  const bug = new RangeError('callback bug');
+  const job = runJob(http(), {
+    submit: submitJ1,
+    mapResult: () => 'unreached',
+    pollIntervalMs: 0,
+    onProgress: (status) => {
+      if (status.status === 'completed') throw bug;
+    },
+  });
+
+  expect(await rejectionOf(job)).toBe(bug);
+  expect(job.meta?.renderMs).toBe(2_000);
+  expect(inspect(job)).toBe("{ jobId: 'j1', state: 'rejected' }");
+});
+
+test('the outcome is derived before onProgress sees the body, so mutating it there changes nothing', async () => {
+  statusReplies({ status: 'completed' });
+  const job = runJob(http(), {
+    submit: submitJ1,
+    mapResult: () => 'done',
+    pollIntervalMs: 0,
+    onProgress: (status) => {
+      status.errors = [{ code: 'INJECTED' }];
+    },
+  });
+
+  expect(await job).toBe('done');
+  expect(job.meta).toBeDefined();
+});
+
 test('status "failed" with no error detail → job_failed with empty items', async () => {
   statusReplies({ status: 'failed' });
 
@@ -624,6 +692,46 @@ test('an external signal abort cancels the job the same way, with the abort reas
   expect(err?.cause).toBe(reason);
   await vi.waitFor(() => expect(cancels()).toBe(1));
   expect(polls()).toBe(1);
+  expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+});
+
+test('the listener on the caller signal is detached when the job settles without that signal aborting', async () => {
+  const polls = runningForever();
+  cancelEndpoint();
+  const { onProgress, first } = progressGate();
+  const controller = new AbortController();
+  const job = runJob(http(), {
+    submit: submitJ1,
+    mapResult: () => 'unreached',
+    pollIntervalMs: 60_000,
+    onProgress,
+    signal: controller.signal,
+  });
+  await first;
+  expect(getEventListeners(controller.signal, 'abort')).toHaveLength(1);
+
+  await job.cancel();
+  expect((await rejectionOf(job))?.code).toBe('cancelled');
+
+  expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+  expect(polls()).toBe(1);
+});
+
+test('an AudioVideoError thrown by the run passes through unmasked even when the signal aborted in the same instant', async () => {
+  const external = new AbortController();
+  const failure = new AudioVideoError({ message: 'x', code: 'http_500', status: 500 });
+  const job = new AsyncJob<string>({
+    run: () => {
+      external.abort();
+      return Promise.reject(failure);
+    },
+    cancelRemote: () => Promise.resolve(),
+    signal: external.signal,
+  });
+
+  expect(await rejectionOf(job)).toBe(failure);
+  expect(inspect(job)).toBe("{ jobId: undefined, state: 'rejected' }");
+  await job.cancel();
 });
 
 test('an already-aborted external signal rejects cancelled without submitting or issuing a cancel request', async () => {
@@ -700,6 +808,9 @@ test('a numeric pollIntervalMs is used as-is', async () => {
 
   await job.cancel();
   expect((await rejectionOf(job))?.code).toBe('cancelled');
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect(polls()).toBe(3);
+  expect(vi.getTimerCount()).toBe(0);
 });
 
 test('an interval function returning a non-finite value falls back to the default tier, never a zero-delay loop', async () => {
@@ -753,6 +864,16 @@ test('timeoutMs → rejects job_timeout, stops polling, and issues no cancel req
   expect(polls()).toBe(3);
   expect(cancels()).toBe(0);
   expect(inspect(job)).toBe("{ jobId: 'j1', state: 'rejected' }");
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+test('a job that completes within timeoutMs leaves no timer armed', async () => {
+  vi.useFakeTimers();
+  statusReplies({ status: 'completed' });
+  const job = runJob(http(), { submit: submitJ1, mapResult: () => 'done', timeoutMs: 60_000 });
+
+  expect(await job).toBe('done');
+  expect(vi.getTimerCount()).toBe(0);
 });
 
 test('cancelOnTimeout: true → timeoutMs still rejects job_timeout, and the cancel request is issued', async () => {

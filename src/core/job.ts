@@ -112,7 +112,12 @@ export interface RunJobOptions<T> {
    * abort reason becomes the `cancelled` rejection's `cause`.
    */
   signal?: AbortSignal;
-  /** Called once per poll with the raw status body, the terminal poll included. */
+  /**
+   * Called once per poll with the raw status body, the terminal poll included. On
+   * the terminal poll it runs after the outcome and `meta` have been derived, so
+   * nothing it does to the body changes them. An error it throws rejects the job
+   * with that error.
+   */
   onProgress?: (status: JobStatusLike) => void;
   /**
    * Overrides the default tiered interval (1 s for the first 30 s, then 2 s until
@@ -221,6 +226,11 @@ const POLL_RETRY_MAX_MS = 30_000;
  *
  * `util.inspect` / `console.log` print only `{ jobId, state }` — never a URL or a
  * status body — so a job can be logged freely.
+ *
+ * A job is a promise in this respect too: one that is never awaited (or given a
+ * rejection handler) and ends in `job_failed`, `job_poll_failed`, `job_timeout` or
+ * a service-side cancellation is an unhandled rejection. Only a job cancelled
+ * through {@link AsyncJob.cancel} or `signal` carries a handler of its own.
  *
  * Instances are created by the SDK's job runner; application code receives them
  * from a capability method and has no reason to construct one directly.
@@ -471,7 +481,7 @@ export class AsyncJob<T> implements PromiseLike<T> {
  * ```ts
  * const job = runJob(http, {
  *   submit: () =>
- *     http.request<JobSubmission>('POST', '/v1/templates/render', body).then((res) => res.body),
+ *     http.request<JobSubmission>('POST', '/v1/some-capability', body).then((res) => res.body),
  *   mapResult: (terminal, meta) => ({ outputs: terminal.outputs, meta }),
  *   onProgress: (status) => console.log(status.status),
  * });
@@ -507,8 +517,9 @@ export function parseTimings(status: JobStatusLike, jobId: string = status.jobId
   let lastCompleted: number | undefined;
 
   for (const [index, item] of outputs.entries()) {
-    const started = parseWireDate(item.startedDate);
-    const completed = parseWireDate(item.completedDate);
+    const entry: JobItemLike = isRecord(item) ? item : {};
+    const started = parseWireDate(entry.startedDate);
+    const completed = parseWireDate(entry.completedDate);
     firstStarted = minDefined(firstStarted, started);
     lastCompleted = maxDefined(lastCompleted, completed);
     perItem.push({
@@ -564,14 +575,13 @@ async function pollUntilTerminal<T>(
     failedPolls = 0;
 
     const status = asStatusBody(response.body);
+    const outcome = terminalOutcome(status, jobId);
+    if (outcome !== undefined) ctx.setMeta(outcome.meta);
     opts.onProgress?.(status);
 
-    if (isTerminal(status)) {
-      const meta = parseTimings(status, jobId);
-      ctx.setMeta(meta);
-      const failure = terminalFailure(status, jobId);
-      if (failure !== undefined) throw failure;
-      return opts.mapResult(status, meta);
+    if (outcome !== undefined) {
+      if (outcome.failure !== undefined) throw outcome.failure;
+      return opts.mapResult(status, outcome.meta);
     }
 
     await sleep(intervalFor(Date.now() - startedAt), signal);
@@ -595,18 +605,34 @@ function normalizedStatus(status: JobStatusLike): string {
   return typeof status.status === 'string' ? status.status.trim().toLowerCase() : '';
 }
 
-/** True once `status` names a terminal state or any job-level or output-level errors are present. */
-function isTerminal(status: JobStatusLike): boolean {
-  return TERMINAL_STATUSES.has(normalizedStatus(status)) || collectFailures(status).length > 0;
+/** What settles a job once its status body is terminal: the derived timing and, for a failure, the error. */
+interface TerminalOutcome {
+  meta: JobMeta;
+  failure?: AudioVideoError;
 }
 
-/** Every non-empty `errors` array in the body, job-level first, then per output in order. */
+/**
+ * The outcome a status body settles the job with, or `undefined` while the job is
+ * still running. A body is terminal once `status` names a terminal state or any
+ * job-level or output-level errors are present.
+ */
+function terminalOutcome(status: JobStatusLike, jobId: string): TerminalOutcome | undefined {
+  const failures = collectFailures(status);
+  if (!TERMINAL_STATUSES.has(normalizedStatus(status)) && failures.length === 0) return undefined;
+  return { meta: parseTimings(status, jobId), failure: terminalFailure(status, jobId, failures) };
+}
+
+/**
+ * Every non-empty `errors` array in the body, job-level first, then per output in
+ * order. An `outputs[]` entry that is not an object contributes nothing.
+ */
 function collectFailures(status: JobStatusLike): JobFailureItem[] {
   const items: JobFailureItem[] = [];
   if (hasEntries(status.errors)) items.push({ errors: status.errors });
   if (Array.isArray(status.outputs)) {
     status.outputs.forEach((output, index) => {
-      if (hasEntries(output.errors)) items.push({ index, errors: output.errors });
+      if (isRecord(output) && hasEntries(output.errors))
+        items.push({ index, errors: output.errors });
     });
   }
   return items;
@@ -617,8 +643,11 @@ function collectFailures(status: JobStatusLike): JobFailureItem[] {
  * Errors present anywhere in the body win over the `status` string — a body that
  * carries errors is a failure whatever `status` says.
  */
-function terminalFailure(status: JobStatusLike, jobId: string): AudioVideoError | undefined {
-  const failures = collectFailures(status);
+function terminalFailure(
+  status: JobStatusLike,
+  jobId: string,
+  failures: JobFailureItem[],
+): AudioVideoError | undefined {
   const state = normalizedStatus(status);
   if (failures.length > 0 || state === 'failed') {
     return new AudioVideoError({
@@ -743,9 +772,12 @@ function defaultCancelPath(jobId: string): string {
 
 /** A parsed body that is not a JSON object is read as an empty (non-terminal) status. */
 function asStatusBody(body: unknown): JobStatusLike {
-  return body !== null && typeof body === 'object' && !Array.isArray(body)
-    ? (body as JobStatusLike)
-    : {};
+  return isRecord(body) ? (body as JobStatusLike) : {};
+}
+
+/** True for a JSON object: non-null, not an array. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 /**

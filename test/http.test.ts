@@ -4,6 +4,7 @@ import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import type { TokenProvider } from '../src/core/auth.js';
 import { AudioVideoError } from '../src/core/errors.js';
 import { DEFAULT_HOST, HttpClient } from '../src/core/http.js';
+import { flush, until } from './support/mock-api.js';
 
 const originalDispatcher = getGlobalDispatcher();
 let agent: MockAgent;
@@ -20,6 +21,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
   await agent.close();
   setGlobalDispatcher(originalDispatcher);
 });
@@ -163,84 +165,142 @@ test('429 with Retry-After: 0 then 200 — one retry, two upstream calls, resolv
   expect(agent.pendingInterceptors()).toHaveLength(0);
 });
 
-test('a numeric Retry-After (seconds) is honored — no retry before it elapses', async () => {
-  vi.useFakeTimers();
-  pool()
-    .intercept({ path: '/v1/presets', method: 'GET' })
-    .reply(429, { error: 'rate_limit' }, { headers: { 'retry-after': '1' } });
-  pool().intercept({ path: '/v1/presets', method: 'GET' }).reply(200, { presets: [] });
+/** Fakes the clock and `setTimeout` only, so real macrotasks keep driving the mocked fetch. */
+function useFakeClock(): void {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+}
 
-  const client = new HttpClient({ apiKey: 'key', tokenProvider });
-  const pending = client.request('GET', '/v1/presets');
+/**
+ * Queues one reply per entry on `GET /v1/presets` — a `429` (with the given
+ * `Retry-After`, when one is set) or a `200` — and returns how many requests
+ * have reached them so far.
+ */
+function presetsReplies(
+  ...replies: Array<{ status: 200 | 429; retryAfter?: string }>
+): () => number {
+  let sent = 0;
+  for (const { status, retryAfter } of replies) {
+    pool()
+      .intercept({ path: '/v1/presets', method: 'GET' })
+      .reply(
+        status,
+        () => {
+          sent += 1;
+          return status === 200 ? { presets: [] } : { error: 'rate_limit' };
+        },
+        retryAfter === undefined ? {} : { headers: { 'retry-after': retryAfter } },
+      );
+  }
+  return () => sent;
+}
 
-  // Just under 1s: the retry must not have resolved the request yet.
-  await vi.advanceTimersByTimeAsync(999);
-  expect(await isPending(pending)).toBe(true);
-
+/**
+ * Proves the next retry goes out exactly `delayMs` after its backoff starts:
+ * one millisecond short of it the backoff timer is still pending and no new
+ * request has been sent; at `delayMs` the next request reaches the server.
+ */
+async function expectRetryAfter(delayMs: number, sent: () => number): Promise<void> {
+  await until(() => vi.getTimerCount() === 1);
+  const before = sent();
+  await vi.advanceTimersByTimeAsync(delayMs - 1);
+  await flush();
+  expect(sent(), `no request before ${delayMs} ms`).toBe(before);
+  expect(vi.getTimerCount(), `the backoff is still pending at ${delayMs - 1} ms`).toBe(1);
   await vi.advanceTimersByTimeAsync(1);
+  await until(() => sent() === before + 1);
+}
+
+test('a Retry-After in seconds delays the retry by exactly that long', async () => {
+  useFakeClock();
+  const sent = presetsReplies({ status: 429, retryAfter: '7' }, { status: 200 });
+
+  const pending = new HttpClient({ apiKey: 'key', tokenProvider }).request('GET', '/v1/presets');
+
+  await expectRetryAfter(7_000, sent);
   await expect(pending).resolves.toMatchObject({ status: 200 });
 });
 
-test('an HTTP-date Retry-After is honored as an absolute time', async () => {
-  vi.useFakeTimers();
+test('an HTTP-date Retry-After delays the retry until that time', async () => {
+  useFakeClock();
   vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
   const retryAt = new Date('2026-01-01T00:00:05.000Z').toUTCString();
+  const sent = presetsReplies({ status: 429, retryAfter: retryAt }, { status: 200 });
 
-  pool()
-    .intercept({ path: '/v1/presets', method: 'GET' })
-    .reply(429, { error: 'rate_limit' }, { headers: { 'retry-after': retryAt } });
-  pool().intercept({ path: '/v1/presets', method: 'GET' }).reply(200, { presets: [] });
+  const pending = new HttpClient({ apiKey: 'key', tokenProvider }).request('GET', '/v1/presets');
 
-  const client = new HttpClient({ apiKey: 'key', tokenProvider });
-  const pending = client.request('GET', '/v1/presets');
-
-  await vi.advanceTimersByTimeAsync(4_999);
-  expect(await isPending(pending)).toBe(true);
-
-  await vi.advanceTimersByTimeAsync(1);
+  await expectRetryAfter(5_000, sent);
   await expect(pending).resolves.toMatchObject({ status: 200 });
 });
 
-test('a Retry-After that is neither a valid number nor a parseable date falls back to exponential backoff', async () => {
-  const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
-  pool()
-    .intercept({ path: '/v1/presets', method: 'GET' })
-    .reply(429, { error: 'rate_limit' }, { headers: { 'retry-after': 'not-a-number-or-date' } });
-  pool().intercept({ path: '/v1/presets', method: 'GET' }).reply(200, { presets: [] });
+test.each([
+  ['120 seconds', () => '120'],
+  ['an HTTP-date an hour out', () => new Date(Date.now() + 3_600_000).toUTCString()],
+  ['3,000,000 seconds, past the largest delay setTimeout honors', () => '3000000'],
+])('a Retry-After of %s is capped at 60 s', async (_case, retryAfter) => {
+  useFakeClock();
+  const sent = presetsReplies({ status: 429, retryAfter: retryAfter() }, { status: 200 });
 
-  const client = new HttpClient({ apiKey: 'key', tokenProvider });
-  // Math.random mocked to 0 makes the exponential-backoff delay exactly 0ms, so this
-  // resolves under real timers without needing to prove anything about its length —
-  // the point is that a garbage header falls through to backoff at all, rather than
-  // stalling on `NaN` or throwing.
-  const res = await client.request<{ presets: unknown[] }>('GET', '/v1/presets');
-  expect(res.status).toBe(200);
-  randomSpy.mockRestore();
+  const pending = new HttpClient({ apiKey: 'key', tokenProvider }).request('GET', '/v1/presets');
+
+  await expectRetryAfter(60_000, sent);
+  await expect(pending).resolves.toMatchObject({ status: 200 });
 });
 
-test('exponential backoff (no Retry-After) is always strictly below the 60s cap, even at high attempt counts', async () => {
-  vi.useFakeTimers();
-  const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.999999);
+test.each([
+  ['a negative', () => '-5'],
+  ['a non-finite', () => '1e400'],
+  ['an unparseable', () => 'not-a-number-or-date'],
+  ['an empty', () => ''],
+  ['a past HTTP-date', () => new Date(Date.now() - 3_600_000).toUTCString()],
+])('%s Retry-After falls back to the jittered exponential backoff', async (_case, retryAfter) => {
+  useFakeClock();
+  vi.spyOn(Math, 'random').mockReturnValue(0.25);
+  const sent = presetsReplies({ status: 429, retryAfter: retryAfter() }, { status: 200 });
 
-  const client = new HttpClient({ apiKey: 'key', tokenProvider, maxRetries: 8 });
-  for (let i = 0; i < 8; i += 1) {
-    pool().intercept({ path: '/v1/presets', method: 'GET' }).reply(429, { error: 'rate_limit' });
-  }
-  pool().intercept({ path: '/v1/presets', method: 'GET' }).reply(200, { presets: [] });
+  const pending = new HttpClient({ apiKey: 'key', tokenProvider }).request('GET', '/v1/presets');
 
+  // A quarter of the first attempt's 1 s base delay.
+  await expectRetryAfter(250, sent);
+  await expect(pending).resolves.toMatchObject({ status: 200 });
+});
+
+test('without Retry-After, each retry waits a uniform fraction of a doubling delay capped at 60 s before the fraction is taken', async () => {
+  useFakeClock();
+  const fractions = [0.25, 0.75, 0.5, 0.5, 0.5, 0.5, 0.5, 0.999];
+  const random = vi.spyOn(Math, 'random');
+  for (const fraction of fractions) random.mockReturnValueOnce(fraction);
+  const sent = presetsReplies(...fractions.map(() => ({ status: 429 as const })), { status: 200 });
+
+  const client = new HttpClient({ apiKey: 'key', tokenProvider, maxRetries: fractions.length });
   const pending = client.request('GET', '/v1/presets');
 
-  // Drain every attempt: advancing by just under 60s must never be enough to let the
-  // request resolve (proving each computed delay is strictly < 60_000ms), and
-  // advancing the remaining 1ms always eventually does.
-  for (let i = 0; i < 8; i += 1) {
-    await vi.advanceTimersByTimeAsync(59_999);
-    expect(await isPending(pending)).toBe(true);
-    await vi.advanceTimersByTimeAsync(1);
+  // min(60 s, 1 s × 2^attempt) × the fraction drawn for that attempt.
+  for (const delayMs of [250, 1_500, 2_000, 4_000, 8_000, 16_000, 30_000, 59_940]) {
+    await expectRetryAfter(delayMs, sent);
   }
-
   await expect(pending).resolves.toMatchObject({ status: 200 });
-  randomSpy.mockRestore();
+});
+
+test('a 202 carrying Retry-After resolves at once — the header is read on a 429 only', async () => {
+  useFakeClock();
+  pool()
+    .intercept({ path: '/v1/templates/render', method: 'POST' })
+    .reply(202, { jobId: 'j1' }, { headers: { 'retry-after': '1' } });
+
+  let settled = false;
+  const pending = new HttpClient({ apiKey: 'key', tokenProvider }).request(
+    'POST',
+    '/v1/templates/render',
+    {},
+  );
+  void pending.then(() => {
+    settled = true;
+  });
+
+  // The fake clock never moves, so a request waiting on that header would never settle.
+  await until(() => settled);
+  expect(vi.getTimerCount()).toBe(0);
+  await expect(pending).resolves.toMatchObject({ status: 202 });
 });
 
 test('429 exhausting maxRetries throws a redacted AudioVideoError, not an infinite retry', async () => {

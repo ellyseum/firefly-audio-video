@@ -107,10 +107,12 @@ export class HttpClient {
   }
 
   /**
-   * Issues one logical request, transparently retrying `429` (honoring
-   * `Retry-After`, else capped exponential backoff with jitter)
-   * and, once, a `401` against a force-refreshed token (a stale-cache safety
-   * net — see {@link TokenProvider.getAccessToken}'s `forceRefresh`).
+   * Issues one logical request, transparently retrying `429` (honoring its
+   * `Retry-After` up to 60 seconds, else capped exponential backoff with
+   * jitter) and, once, a `401` against a force-refreshed token (a stale-cache
+   * safety net — see {@link TokenProvider.getAccessToken}'s `forceRefresh`).
+   * `Retry-After` is read on a `429` only: every other response, a `202`
+   * carrying one included, is returned or thrown at once.
    *
    * `path` may be a path relative to this client's host (`'/v1/status/abc'`)
    * or an already-absolute URL (e.g. a `statusUrl` the API returned) — both
@@ -238,19 +240,31 @@ async function drainBody(res: Response): Promise<void> {
 }
 
 /**
- * Resolves the delay before the next 429 retry: `Retry-After` (seconds, or an
- * HTTP-date) when the response sent one, else {@link computeBackoffMs}. A
- * `Retry-After` that is neither a valid non-negative integer nor a parseable
- * date falls through to the exponential path rather than stalling forever.
+ * Resolves the delay before the next 429 retry: the wait `Retry-After` asks
+ * for (see {@link retryAfterMs}), capped at {@link MAX_BACKOFF_MS}, else
+ * {@link computeBackoffMs}. The cap also keeps every delay far below the
+ * largest one `setTimeout` honors (2^31 − 1 ms), past which Node fires the
+ * timer at once.
  */
 function computeDelayMs(retryAfterHeader: string | null, attempt: number): number {
-  if (retryAfterHeader !== null) {
-    const seconds = Number(retryAfterHeader);
-    if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
-    const dateMs = Date.parse(retryAfterHeader);
-    if (Number.isFinite(dateMs)) return Math.max(0, dateMs - Date.now());
-  }
-  return computeBackoffMs(attempt);
+  const asked = retryAfterMs(retryAfterHeader);
+  return asked === undefined ? computeBackoffMs(attempt) : Math.min(MAX_BACKOFF_MS, asked);
+}
+
+/**
+ * The wait a `Retry-After` header asks for, in milliseconds: a finite,
+ * non-negative number of seconds, or the time until an HTTP-date still in the
+ * future. `undefined` for anything else — an absent or empty header, a
+ * negative or non-finite number, an unparseable value, or a date that is not
+ * in the future — which leaves the exponential backoff to decide.
+ */
+function retryAfterMs(header: string | null): number | undefined {
+  const text = header?.trim() ?? '';
+  if (text === '') return undefined;
+  const seconds = Number(text);
+  if (Number.isFinite(seconds)) return seconds >= 0 ? seconds * 1000 : undefined;
+  const untilDate = Date.parse(text) - Date.now();
+  return untilDate > 0 ? untilDate : undefined;
 }
 
 /**

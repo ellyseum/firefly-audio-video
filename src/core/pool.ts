@@ -1,14 +1,13 @@
 /**
  * The ambient concurrency pool every job in this SDK runs inside, submit
- * through settle — not just its HTTP calls. Bounding *concurrently active
- * jobs* is what keeps a shared credential's request rate inside whatever
- * budget the API enforces: a caller brings their own loop (`Promise.all`, a
- * `for` loop, a stream) and this pool owns admission, queueing, and slot
- * release around it. It is capability-neutral — governs any job, not only
- * render — and sits behind {@link PoolBackend} so a distributed
- * implementation (e.g. Redis-backed, coordinating several processes that
- * share one credential) can stand in for {@link InMemoryPool} without the
- * client changing.
+ * through settle — not just its HTTP calls. It bounds how many jobs share one
+ * credential at once, the quantity the API's rate limit responds to. A
+ * caller brings their own loop (`Promise.all`, a `for` loop, a stream) and
+ * this pool owns admission, queueing, and slot release around it. It is
+ * capability-neutral — governs any job, not only render — and sits behind
+ * {@link PoolBackend} so a distributed implementation (e.g. Redis-backed,
+ * coordinating several processes that share one credential) can stand in for
+ * {@link InMemoryPool} without the client changing.
  */
 
 import { AudioVideoError } from './errors.js';
@@ -55,7 +54,7 @@ export interface PoolBackend {
   drain(): Promise<void>;
   /** How many tasks currently hold a slot and are running. */
   readonly active: number;
-  /** How many tasks are admitted-but-waiting for a free slot, FIFO. */
+  /** How many submitted tasks are waiting for a free slot, in FIFO order. */
   readonly queued: number;
 }
 
@@ -95,6 +94,7 @@ export class InMemoryPool implements PoolBackend {
   readonly #concurrency: number;
   #active = 0;
   readonly #queue: Array<() => void> = [];
+  #queueHead = 0;
   readonly #idleWaiters: Array<() => void> = [];
 
   /**
@@ -103,10 +103,12 @@ export class InMemoryPool implements PoolBackend {
    *   `concurrency` is not an integer `>= 1`.
    */
   constructor(opts: InMemoryPoolOptions = {}) {
-    const concurrency = opts.concurrency ?? DEFAULT_CONCURRENCY;
+    const concurrency = (opts ?? {}).concurrency ?? DEFAULT_CONCURRENCY;
     if (!Number.isInteger(concurrency) || concurrency < 1) {
+      const received =
+        typeof concurrency === 'string' ? JSON.stringify(concurrency) : String(concurrency);
       throw new AudioVideoError({
-        message: `InMemoryPool: concurrency must be an integer >= 1, got ${concurrency}.`,
+        message: `InMemoryPool: concurrency must be an integer >= 1, got ${received}.`,
         code: 'invalid_argument',
       });
     }
@@ -120,11 +122,17 @@ export class InMemoryPool implements PoolBackend {
 
   /** See {@link PoolBackend.queued}. */
   get queued(): number {
-    return this.#queue.length;
+    return this.#queue.length - this.#queueHead;
   }
 
   /** See {@link PoolBackend.run}. */
   async run<T>(task: () => Promise<T>): Promise<T> {
+    if (typeof task !== 'function') {
+      throw new AudioVideoError({
+        message: `InMemoryPool.run: task must be a function that starts the work and returns its promise, e.g. pool.run(() => work()). Got ${typeof task}.`,
+        code: 'invalid_argument',
+      });
+    }
     await this.#acquire();
     try {
       return await task();
@@ -135,7 +143,7 @@ export class InMemoryPool implements PoolBackend {
 
   /** See {@link PoolBackend.drain}. */
   async drain(): Promise<void> {
-    if (this.#active === 0 && this.#queue.length === 0) return;
+    if (this.#active === 0 && this.queued === 0) return;
     await new Promise<void>((resolve) => {
       this.#idleWaiters.push(resolve);
     });
@@ -169,7 +177,7 @@ export class InMemoryPool implements PoolBackend {
    */
   #release(): void {
     this.#active -= 1;
-    const next = this.#queue.shift();
+    const next = this.#dequeue();
     if (next !== undefined) {
       next();
       return;
@@ -178,5 +186,25 @@ export class InMemoryPool implements PoolBackend {
       const waiters = this.#idleWaiters.splice(0);
       for (const resolve of waiters) resolve();
     }
+  }
+
+  /**
+   * Removes and returns the earliest-queued admission closure, or
+   * `undefined` when nothing is waiting. A head index tracks how much of the
+   * backing array has already been consumed instead of shifting it off on
+   * every call, compacting the array only once the consumed head passes half
+   * its length — `Array.prototype.shift` is linear in the array's length, so
+   * a plain FIFO queue turns each admission under a long backlog quadratic
+   * overall.
+   */
+  #dequeue(): (() => void) | undefined {
+    if (this.#queueHead >= this.#queue.length) return undefined;
+    const next = this.#queue[this.#queueHead];
+    this.#queueHead += 1;
+    if (this.#queueHead > this.#queue.length / 2) {
+      this.#queue.splice(0, this.#queueHead);
+      this.#queueHead = 0;
+    }
+    return next;
   }
 }

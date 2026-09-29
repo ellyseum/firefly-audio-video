@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
 import { AudioVideoError } from '../src/core/errors.js';
-import { DEFAULT_CONCURRENCY, InMemoryPool } from '../src/core/pool.js';
+import { DEFAULT_CONCURRENCY, InMemoryPool, type InMemoryPoolOptions } from '../src/core/pool.js';
 
 /** A promise plus the function that resolves it, for controlling exactly when a pooled task settles. */
 function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
@@ -188,7 +188,7 @@ test('a rejected task rejects its own caller, releases its slot, and a subsequen
   await expect(pool.run(async () => 'ok')).resolves.toBe('ok');
 });
 
-test('one queued task rejecting does not affect its siblings or wedge the queue', async () => {
+test('an active task rejecting while others wait does not wedge the queue', async () => {
   const pool = new InMemoryPool({ concurrency: 1 });
   const boom = new Error('boom');
   const gate1 = deferred<void>();
@@ -263,7 +263,8 @@ test('drain() resolves only once every active and queued task has settled', asyn
   gates[2]!.resolve();
   gates[3]!.resolve();
   await drainPromise;
-  expect(drained).toBe(true);
+  expect(pool.active).toBe(0);
+  expect(pool.queued).toBe(0);
 
   await Promise.all(runs);
 });
@@ -293,7 +294,8 @@ test('drain() keeps waiting for a task submitted after it was called, even once 
 
   gate2.resolve();
   await drainPromise;
-  expect(drained).toBe(true);
+  expect(pool.active).toBe(0);
+  expect(pool.queued).toBe(0);
 
   await Promise.all([task1, task2]);
 });
@@ -322,7 +324,8 @@ test('drain() stays pending while a task is still active even though the queue i
 
   gate2.resolve();
   await drainPromise;
-  expect(drained).toBe(true);
+  expect(pool.active).toBe(0);
+  expect(pool.queued).toBe(0);
 
   await Promise.all([task1, task2]);
 });
@@ -346,7 +349,7 @@ test('DEFAULT_CONCURRENCY is 10, and InMemoryPool() with no options uses it', as
 });
 
 test('an invalid concurrency (not an integer >= 1) throws invalid_argument', () => {
-  const bogusValues = [0, -1, 1.5, NaN];
+  const bogusValues = [0, -1, 1.5, NaN, Infinity, '3' as unknown as number];
 
   for (const concurrency of bogusValues) {
     let caught: unknown;
@@ -358,4 +361,62 @@ test('an invalid concurrency (not an integer >= 1) throws invalid_argument', () 
     expect(caught).toBeInstanceOf(AudioVideoError);
     expect((caught as AudioVideoError).code).toBe('invalid_argument');
   }
+});
+
+test("an invalid concurrency's error message names the received value's type", () => {
+  const thrown = (concurrency: number): string => {
+    try {
+      new InMemoryPool({ concurrency });
+    } catch (err) {
+      return (err as AudioVideoError).message;
+    }
+    throw new Error('expected InMemoryPool to throw');
+  };
+
+  expect(thrown(3.5)).toContain('got 3.5');
+  expect(thrown('3' as unknown as number)).toContain('got "3"');
+});
+
+test('a null options object is treated the same as omitting it', () => {
+  const nullOpts = null as unknown as InMemoryPoolOptions;
+  expect(() => new InMemoryPool(nullOpts)).not.toThrow();
+  const pool = new InMemoryPool(nullOpts);
+  expect(pool.active).toBe(0);
+});
+
+test("run() rejects invalid_argument when task isn't a function", async () => {
+  const pool = new InMemoryPool({ concurrency: 1 });
+  const notATask = Promise.resolve('oops') as unknown as () => Promise<string>;
+
+  let caught: unknown;
+  try {
+    await pool.run(notATask);
+  } catch (err) {
+    caught = err;
+  }
+
+  expect(caught).toBeInstanceOf(AudioVideoError);
+  expect((caught as AudioVideoError).code).toBe('invalid_argument');
+  expect(pool.active).toBe(0);
+  expect(pool.queued).toBe(0);
+});
+
+test('admission stays correct across a queue backlog large enough to force compaction', async () => {
+  const pool = new InMemoryPool({ concurrency: 1 });
+  const total = 5000;
+  const startOrder: number[] = [];
+
+  const results = Promise.all(
+    Array.from({ length: total }, (_, i) =>
+      pool.run(async () => {
+        startOrder.push(i);
+        return i;
+      }),
+    ),
+  );
+
+  await expect(results).resolves.toEqual(Array.from({ length: total }, (_, i) => i));
+  expect(startOrder).toEqual(Array.from({ length: total }, (_, i) => i));
+  expect(pool.active).toBe(0);
+  expect(pool.queued).toBe(0);
 });

@@ -157,6 +157,31 @@ test('stream() piped to a writable yields the exact concatenated bytes', async (
   expect(Buffer.concat(sink.chunks).equals(Buffer.concat(chunks))).toBe(true);
 });
 
+test('stream() is a byte stream, not object mode — read(n) returns exactly n bytes', async () => {
+  const chunks = [Buffer.from('abcdefgh'), Buffer.from('ijkl')];
+  const asset = new Asset({
+    url: 'https://x/out.mov',
+    meta: sampleMeta(),
+    fetch: async () => fakeResponse(multiChunkBody(chunks)),
+  });
+
+  const stream = asset.stream();
+  expect(stream.readableObjectMode).toBe(false);
+
+  // Let both chunks land in the internal buffer before reading, so read(4)
+  // is exercised against real buffered bytes rather than a race with delivery.
+  await new Promise<void>((resolve) => stream.once('readable', resolve));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  const read = stream.read(4) as Buffer;
+  expect(read.length).toBe(4);
+  expect(read.equals(Buffer.from('abcd'))).toBe(true);
+
+  const sink = captureChunks();
+  await pipeline(stream, sink.stream);
+  expect(Buffer.concat(sink.chunks).toString('utf8')).toBe('efghijkl');
+});
+
 test('stream() is lazy — no fetch is issued until the stream is read', async () => {
   let fetchCalls = 0;
   const asset = new Asset({

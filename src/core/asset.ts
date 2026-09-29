@@ -113,20 +113,22 @@ export class Asset {
   }
 
   /**
-   * A Node `Readable` over the asset's bytes, for piping anywhere (a write
-   * stream, a transform, another request body) without holding the whole file
-   * in memory. Lazy: the underlying fetch does not start until the stream is
-   * first read — via `.pipe()`, a `'data'` listener, `.resume()`, or an
-   * explicit `.read()` — so a `stream()` call that is never consumed issues no
-   * request at all. A fetch failure — a non-2xx response, a malformed URL, a
-   * DNS failure, a reset mid-download — surfaces as an `'error'` event
-   * carrying the same {@link AudioVideoError} {@link buffer} would throw,
-   * never as an unhandled rejection.
+   * A byte-mode Node `Readable` over the asset's bytes (`readableObjectMode`
+   * is `false`, so `read(n)` returns exactly `n` bytes once that much has
+   * buffered), for piping anywhere (a write stream, a transform, another
+   * request body) without holding the whole file in memory. Lazy: the
+   * underlying fetch does not start until the stream is first read — via
+   * `.pipe()`, a `'data'` listener, `.resume()`, or an explicit `.read()` —
+   * so a `stream()` call that is never consumed issues no request at all. A
+   * fetch failure — a non-2xx response, a malformed URL, a DNS failure, a
+   * reset mid-download — surfaces as an `'error'` event carrying the same
+   * {@link AudioVideoError} {@link buffer} would throw, never as an
+   * unhandled rejection.
    *
-   * @returns A readable stream of the asset's bytes.
+   * @returns A readable byte stream over the asset's bytes.
    */
   stream(): Readable {
-    return Readable.from(this.#streamChunks());
+    return Readable.from(this.#streamChunks(), { objectMode: false });
   }
 
   /**

@@ -6,7 +6,10 @@
  * top-level client never depend on a concrete auth implementation.
  */
 
-import { ServerToServerTokenProvider } from '@adobe/firefly-services-common-apis';
+import {
+  ServerToServerTokenProvider,
+  type ServerToServerAuthDetails,
+} from '@adobe/firefly-services-common-apis';
 import { AudioVideoError } from './errors.js';
 
 /**
@@ -112,12 +115,20 @@ export interface ClientCredentialsProviderOptions {
  * once a token has been minted and later expires (the internal check
  * requires *both* "no token yet" *and* "expired", but a minted token leaves
  * the first half permanently false), so this class never uses that path.
- * Instead, {@link ClientCredentialsProvider} constructs the wrapped provider
- * with `autoRefresh: false` — its documented shape for "the user should
- * handle token refresh themselves" — and calls `authenticate()` directly
- * whenever its own cache (tracked here, from
- * {@link ClientCredentialsProviderOptions}, never from the wrapped
- * provider's internal state) decides a fresh mint is due.
+ * Instead, every mint calls `authenticate()` on a fresh instance of the
+ * wrapped provider, constructed with `autoRefresh: false` — its documented
+ * shape for "the user should handle token refresh themselves" — so no two
+ * mints ever share its state, and the cache lives here (tuned by
+ * {@link ClientCredentialsProviderOptions}, never read from the wrapped
+ * provider).
+ *
+ * **Every token is checked before it is returned or cached.** When IMS
+ * refuses the credentials, `authenticate()` does not fail: it resolves
+ * whatever the reply's `access_token` field held — `undefined` for an error
+ * reply, and possibly `null`, a number, or `""`. Anything but a non-empty
+ * string rejects `auth_failed` and never reaches the cache; the message
+ * names IMS's OAuth `error` code when the reply carried one (only a plain
+ * code that contains neither credential), and never the secret.
  *
  * **The real expiry comes from the token itself, not a guess.** IMS access
  * tokens are JWTs, so each freshly minted token is decoded (its middle
@@ -137,7 +148,7 @@ export interface ClientCredentialsProviderOptions {
  * mint (forced or cache-driven) is already in progress.
  */
 export class ClientCredentialsProvider implements TokenProvider {
-  readonly #provider: ServerToServerTokenProvider;
+  readonly #details: ServerToServerAuthDetails;
   readonly #tokenTtlMs: number;
   readonly #refreshMarginMs: number;
   #cachedToken: string | undefined;
@@ -149,14 +160,11 @@ export class ClientCredentialsProvider implements TokenProvider {
    * @param options - Cache tuning; see {@link ClientCredentialsProviderOptions}.
    */
   constructor(credentials: ClientCredentials, options: ClientCredentialsProviderOptions = {}) {
-    this.#provider = new ServerToServerTokenProvider(
-      {
-        clientId: credentials.clientId,
-        clientSecret: credentials.clientSecret,
-        scopes: credentials.scope ?? DEFAULT_SCOPE,
-      },
-      { autoRefresh: false },
-    );
+    this.#details = {
+      clientId: credentials.clientId,
+      clientSecret: credentials.clientSecret,
+      scopes: credentials.scope ?? DEFAULT_SCOPE,
+    };
     this.#tokenTtlMs = options.tokenTtlMs ?? DEFAULT_TOKEN_TTL_MS;
     this.#refreshMarginMs = options.refreshMarginMs ?? DEFAULT_REFRESH_MARGIN_MS;
   }
@@ -170,9 +178,11 @@ export class ClientCredentialsProvider implements TokenProvider {
    * every concurrent caller rather than triggering a second one.
    *
    * @param opts - See {@link GetAccessTokenOptions}.
-   * @throws {@link AudioVideoError} with `code: 'auth_failed'` if the wrapped
-   *   provider's `authenticate()` call fails. The client secret is never
-   *   included in the thrown error's message; `.cause` carries the original
+   * @throws {@link AudioVideoError} with `code: 'auth_failed'` when IMS does
+   *   not return a usable token — the message then names IMS's OAuth `error`
+   *   code when it sent one — or when the wrapped provider's `authenticate()`
+   *   call fails outright. The client secret is never included in the thrown
+   *   error's message; when the wrapped provider threw, `.cause` carries its
    *   error for programmatic inspection and is excluded from every
    *   serialized form of {@link AudioVideoError} by construction.
    */
@@ -193,20 +203,56 @@ export class ClientCredentialsProvider implements TokenProvider {
   }
 
   async #mint(): Promise<string> {
-    let token: string;
+    const vendor = new ServerToServerTokenProvider({ ...this.#details }, { autoRefresh: false });
     try {
-      token = await this.#provider.authenticate();
+      const token: unknown = await vendor.authenticate();
+      if (typeof token !== 'string' || token === '') {
+        throw refusedError(imsErrorCode(vendor, this.#details));
+      }
+      const expiresAt = decodeJwtExpiryMs(token) ?? Date.now() + this.#tokenTtlMs;
+      this.#cachedToken = token;
+      this.#expiresAt = expiresAt;
+      return token;
     } catch (cause) {
+      if (cause instanceof AudioVideoError) throw cause;
       throw new AudioVideoError({
         message: 'Failed to obtain an access token via client-credentials authentication.',
         code: 'auth_failed',
         cause,
       });
     }
-    this.#cachedToken = token;
-    this.#expiresAt = decodeJwtExpiryMs(token) ?? Date.now() + this.#tokenTtlMs;
-    return token;
   }
+}
+
+/** The shape of an OAuth 2.0 `error` code: a short run of letters and underscores. */
+const IMS_ERROR_CODE_RE = /^[A-Za-z_]{1,64}$/;
+
+/**
+ * IMS's OAuth `error` code from the reply the wrapped provider kept in its
+ * `_tokenDetails` field, or `undefined` when there is none — or when the
+ * value is not a plain code, or contains either credential, so the message
+ * built from it can never echo one.
+ */
+function imsErrorCode(
+  vendor: ServerToServerTokenProvider,
+  details: ServerToServerAuthDetails,
+): string | undefined {
+  const reply: unknown = (vendor as unknown as { _tokenDetails?: unknown })._tokenDetails;
+  const error =
+    reply !== null && typeof reply === 'object' ? (reply as { error?: unknown }).error : undefined;
+  if (typeof error !== 'string' || !IMS_ERROR_CODE_RE.test(error)) return undefined;
+  return error.includes(details.clientSecret) || error.includes(details.clientId)
+    ? undefined
+    : error;
+}
+
+/** The `auth_failed` error for an IMS reply that carried no usable access token. */
+function refusedError(imsError: string | undefined): AudioVideoError {
+  const detail = imsError === undefined ? '' : ` (IMS error: ${imsError})`;
+  return new AudioVideoError({
+    message: `IMS did not return a usable access token${detail}; the client ID or secret was most likely refused.`,
+    code: 'auth_failed',
+  });
 }
 
 /**

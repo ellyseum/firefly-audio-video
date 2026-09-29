@@ -31,6 +31,16 @@ function useFakeClock(): void {
   vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
 }
 
+/** Every surface a caller could print an error through, its cause included. */
+function surfaces(err: unknown): string[] {
+  return [
+    JSON.stringify(err),
+    String(err),
+    inspect(err),
+    inspect((err as Error).cause, { depth: null }),
+  ];
+}
+
 /** Builds an unsigned, syntactically valid JWT carrying `claims` as its payload. */
 function fakeJwt(claims: Record<string, unknown>): string {
   const header = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url');
@@ -256,13 +266,7 @@ test('an unreachable IMS rejects auth_failed, and no surface carries the secret'
   expect(err).toBeInstanceOf(AudioVideoError);
   expect((err as AudioVideoError).code).toBe('auth_failed');
   expect((err as AudioVideoError).cause).toBeInstanceOf(Error);
-  const surfaces = [
-    JSON.stringify(err),
-    String(err),
-    inspect(err),
-    inspect((err as Error).cause, { depth: null }),
-  ];
-  for (const s of surfaces) {
+  for (const s of surfaces(err)) {
     expect(s).not.toContain(SECRET);
   }
 
@@ -270,3 +274,107 @@ test('an unreachable IMS rejects auth_failed, and no surface carries the secret'
   expect(consoleError).toHaveBeenCalledWith('Error while fetching token', expect.anything());
   expect(inspect(consoleError.mock.calls, { depth: null })).not.toContain(SECRET);
 });
+
+// --- an IMS reply without a usable token -------------------------------------------
+
+const UNUSABLE_REPLIES: Array<[label: string, status: number, body: object, imsError?: string]> = [
+  [
+    '400 invalid_client',
+    400,
+    { error: 'invalid_client', error_description: 'invalid client_secret parameter' },
+    'invalid_client',
+  ],
+  [
+    '400 invalid_scope',
+    400,
+    { error: 'invalid_scope', error_description: 'invalid scope parameter' },
+    'invalid_scope',
+  ],
+  ['429 JSON', 429, { error_code: '429050', message: 'Too many requests' }],
+  ['503 JSON', 503, { message: 'Service Unavailable' }],
+  ['200 without access_token', 200, { token_type: 'bearer', expires_in: 86_399 }],
+  ['200 with a numeric access_token', 200, { access_token: 12345, token_type: 'bearer' }],
+  ['200 with a null access_token', 200, { access_token: null, token_type: 'bearer' }],
+  ['200 with an empty access_token', 200, { access_token: '', token_type: 'bearer' }],
+];
+
+test.each(UNUSABLE_REPLIES)(
+  'IMS reply %s rejects auth_failed naming the likely cause, and caches nothing',
+  async (_label, status, body, imsError) => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    ims.answer(status, body);
+    ims.token('TOKEN_2');
+    const provider = new ClientCredentialsProvider(CREDS);
+
+    const err: unknown = await provider.getAccessToken().catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(AudioVideoError);
+    const { code, message } = err as AudioVideoError;
+    expect(code).toBe('auth_failed');
+    expect(message).toContain('the client ID or secret was most likely refused');
+    if (imsError === undefined) {
+      expect(message).not.toContain('IMS error');
+    } else {
+      expect(message).toContain(`(IMS error: ${imsError})`);
+    }
+    for (const s of surfaces(err)) {
+      expect(s).not.toContain(SECRET);
+    }
+
+    // Nothing was cached: the next call asks IMS again.
+    await expect(provider.getAccessToken()).resolves.toBe('TOKEN_2');
+    expect(ims.requests).toHaveLength(2);
+    // A JSON reply never reaches the official provider's own stderr logging.
+    expect(consoleError).not.toHaveBeenCalled();
+  },
+);
+
+const THROWING_REPLIES: Array<[label: string, status: number, body: string]> = [
+  ['502 with an HTML body', 502, '<html><body>Bad Gateway</body></html>'],
+  ['200 with a JSON null body', 200, 'null'],
+];
+
+test.each(THROWING_REPLIES)(
+  'IMS reply %s rejects auth_failed with the provider error as its cause, and caches nothing',
+  async (_label, status, body) => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    ims.answer(status, body);
+    ims.token('TOKEN_2');
+    const provider = new ClientCredentialsProvider(CREDS);
+
+    const err: unknown = await provider.getAccessToken().catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(AudioVideoError);
+    expect((err as AudioVideoError).code).toBe('auth_failed');
+    expect((err as AudioVideoError).cause).toBeInstanceOf(Error);
+    for (const s of surfaces(err)) {
+      expect(s).not.toContain(SECRET);
+    }
+
+    await expect(provider.getAccessToken()).resolves.toBe('TOKEN_2');
+    expect(ims.requests).toHaveLength(2);
+    expect(consoleError).toHaveBeenCalledWith('Error while fetching token', expect.anything());
+  },
+);
+
+const UNQUOTABLE_ERRORS: Array<[label: string, clientId: string, error: string]> = [
+  ['a phrase', CLIENT_ID, 'invalid client_secret parameter'],
+  ['markup', CLIENT_ID, '<b>denied</b>'],
+  ['longer than an OAuth code', CLIENT_ID, 'x'.repeat(65)],
+  ['the client secret itself', CLIENT_ID, SECRET],
+  ['the client ID itself', 'lettersonlyclient', 'lettersonlyclient'],
+];
+
+test.each(UNQUOTABLE_ERRORS)(
+  'an IMS error field that is %s is left out of the message',
+  async (_label, clientId, error) => {
+    ims.answer(400, { error });
+    const provider = new ClientCredentialsProvider({ clientId, clientSecret: SECRET });
+
+    const err: unknown = await provider.getAccessToken().catch((e: unknown) => e);
+
+    expect((err as AudioVideoError).code).toBe('auth_failed');
+    expect((err as AudioVideoError).message).not.toContain('IMS error');
+    expect((err as AudioVideoError).message).not.toContain(error);
+  },
+);

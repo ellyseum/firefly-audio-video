@@ -77,7 +77,7 @@ function indices(path: string): number[] {
 
 test('stdoutJsonLogger: exactly one newline-terminated JSON line per record, parseable and flat', () => {
   const { stream, raw } = capture();
-  const logger = stdoutJsonLogger(stream);
+  const logger = stdoutJsonLogger({ stream });
 
   logger.log(record({ msg: 'one', jobId: 'j1', totalMs: 4600 }));
   logger.log(record({ msg: 'two', level: 'warn' }));
@@ -129,6 +129,62 @@ test('resolveLogger: true resolves to the stdout logger, false to null, a Logger
   expect(resolveLogger(custom)).toBe(custom);
 });
 
+test("resolveLogger: 'warn' drops info and writes warn/error; a custom Logger is never filtered", () => {
+  const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+  const logger = must(resolveLogger('warn'));
+
+  logger.log(record({ msg: 'dropped', level: 'info' }));
+  logger.log(record({ msg: 'kept warn', level: 'warn' }));
+  logger.log(record({ msg: 'kept error', level: 'error' }));
+
+  expect(write).toHaveBeenCalledTimes(2);
+  expect(String(write.mock.calls[0]?.[0])).toContain('"msg":"kept warn"');
+  expect(String(write.mock.calls[1]?.[0])).toContain('"msg":"kept error"');
+
+  const seenLevels: string[] = [];
+  const custom: Logger = { log: (r) => seenLevels.push(r.level) };
+  must(resolveLogger(custom)).log(record({ level: 'info' }));
+  expect(seenLevels).toEqual(['info']); // a supplied Logger is returned as-is, unfiltered
+});
+
+test("resolveLogger: 'error' writes only error records", () => {
+  const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+  const logger = must(resolveLogger('error'));
+
+  logger.log(record({ msg: 'dropped info', level: 'info' }));
+  logger.log(record({ msg: 'dropped warn', level: 'warn' }));
+  logger.log(record({ msg: 'kept', level: 'error' }));
+
+  expect(write).toHaveBeenCalledTimes(1);
+  expect(String(write.mock.calls[0]?.[0])).toContain('"msg":"kept"');
+});
+
+test("resolveLogger: 'info' drops nothing — the same behavior as the default", () => {
+  const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+  must(resolveLogger('info')).log(record({ msg: 'kept', level: 'info' }));
+
+  expect(write).toHaveBeenCalledTimes(1);
+});
+
+test('resolveLogger: an unrecognized option throws invalid_argument naming the accepted forms', () => {
+  const bogusValues: unknown[] = ['nope', 1, {}];
+
+  for (const bogus of bogusValues) {
+    let caught: unknown;
+    try {
+      resolveLogger(bogus as never);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(AudioVideoError);
+    const err = caught as AudioVideoError;
+    expect(err.code).toBe('invalid_argument');
+    expect(err.message).toContain("'info' | 'warn' | 'error'");
+    expect(err.message).toContain('Logger');
+  }
+});
+
 // --- emit -------------------------------------------------------------------------------
 
 test('emit: a SAS URL in any field is redacted before the sink sees the record; the caller record is untouched', () => {
@@ -158,7 +214,7 @@ test('emit: a SAS URL in any field is redacted before the sink sees the record; 
 test('emit + stdoutJsonLogger: the written line carries no secret', () => {
   const { stream, raw } = capture();
 
-  emit(stdoutJsonLogger(stream), record({ msg: SAS_URL, error: SAS_URL }));
+  emit(stdoutJsonLogger({ stream }), record({ msg: SAS_URL, error: SAS_URL }));
 
   expect(raw()).not.toContain('SECRET');
   expect(raw()).not.toContain('sig=');
@@ -209,6 +265,30 @@ test('emit: a sink failure is still swallowed when stderr itself throws', () => 
   };
 
   expect(() => emit(failing, record())).not.toThrow();
+});
+
+test('emit: a record whose own property access throws is swallowed too, never propagating', () => {
+  const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  const poisoned = {
+    time: NOW,
+    level: 'info',
+    get msg(): string {
+      throw new Error('accessor boom');
+    },
+  } as unknown as LogRecord;
+
+  expect(() => emit({ log: vi.fn() }, poisoned)).not.toThrow();
+  expect(stderr).toHaveBeenCalledTimes(1);
+  expect(String(stderr.mock.calls[0]?.[0])).toContain('accessor boom');
+});
+
+test('emit: a logging option that bypassed resolveLogger validation cannot make emit throw', () => {
+  const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+  expect(() => emit(1 as unknown as Logger, record())).not.toThrow();
+  expect(() => emit(1 as unknown as Logger, record())).not.toThrow();
+
+  expect(stderr).toHaveBeenCalledTimes(0); // a non-object logger is not a valid WeakSet key — nothing to report to
 });
 
 // --- buildLogRecord ---------------------------------------------------------------------
@@ -429,4 +509,25 @@ test('rotatingFileLogger: a fractional maxBytes is floored and a non-finite maxF
   for (const p of [path, `${path}.1`, `${path}.5`]) {
     expect(statSync(p).size).toBeLessThanOrEqual(200);
   }
+});
+
+test('rotatingFileLogger: minLevel filters records the same way as stdoutJsonLogger', () => {
+  const path = join(tempDir(), 'render.log');
+  const logger = rotatingFileLogger({ path, minLevel: 'warn' });
+
+  logger.log(record({ msg: 'dropped', level: 'info' }));
+  logger.log(record({ msg: 'kept warn', level: 'warn' }));
+  logger.log(record({ msg: 'kept error', level: 'error' }));
+
+  expect(readLines(path).map((l) => l.msg)).toEqual(['kept warn', 'kept error']);
+});
+
+test('rotatingFileLogger: a logger that never sees a qualifying record never creates its file', () => {
+  const path = join(tempDir(), 'nested', 'render.log');
+  const logger = rotatingFileLogger({ path, minLevel: 'error' });
+
+  logger.log(record({ msg: 'dropped', level: 'info' }));
+  logger.log(record({ msg: 'also dropped', level: 'warn' }));
+
+  expect(existsSync(path)).toBe(false);
 });

@@ -24,4 +24,5 @@ export type {
   LogRecord,
   LoggingOption,
   RotatingFileLoggerOptions,
+  StdoutJsonLoggerOptions,
 } from './core/logging.js';

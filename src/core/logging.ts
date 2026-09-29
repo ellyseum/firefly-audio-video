@@ -78,13 +78,39 @@ export interface Logger {
 }
 
 /**
+ * Ordinal severity of each {@link LogLevel} — `info` < `warn` < `error` — the one
+ * table both {@link meetsMinLevel} and {@link isLogLevel} read, so a sink's level
+ * filter and its validation can never disagree about which strings are levels.
+ */
+const LOG_LEVEL_ORDER: Readonly<Record<LogLevel, number>> = { info: 0, warn: 1, error: 2 };
+
+/** True for one of the three {@link LogLevel} strings. */
+function isLogLevel(value: unknown): value is LogLevel {
+  return typeof value === 'string' && Object.hasOwn(LOG_LEVEL_ORDER, value);
+}
+
+/** True when `level` is at or above `minLevel` in severity. */
+function meetsMinLevel(level: LogLevel, minLevel: LogLevel): boolean {
+  return LOG_LEVEL_ORDER[level] >= LOG_LEVEL_ORDER[minLevel];
+}
+
+/** Options for {@link stdoutJsonLogger}. */
+export interface StdoutJsonLoggerOptions {
+  /** The destination; any writable stream. Defaults to `process.stdout`. */
+  stream?: NodeJS.WritableStream;
+  /** Only records at or above this severity are written. Defaults to `'info'` — every record. */
+  minLevel?: LogLevel;
+}
+
+/**
  * A {@link Logger} that writes one NDJSON line per record —
- * `JSON.stringify(record) + '\n'` — to `stream`, `process.stdout` by default.
- * The line is handed to the stream synchronously; there is no buffer, queue, or
- * worker thread of its own in between.
+ * `JSON.stringify(record) + '\n'` — to `opts.stream`, `process.stdout` by
+ * default. The line is handed to the stream synchronously; there is no buffer,
+ * queue, or worker thread of its own in between. A record below `opts.minLevel`
+ * is dropped before the stream is touched at all.
  *
- * @param stream - The destination; any writable stream.
- * @returns A logger bound to `stream`.
+ * @param opts - See {@link StdoutJsonLoggerOptions}.
+ * @returns A logger bound to `opts.stream`.
  *
  * @example
  * ```ts
@@ -93,9 +119,11 @@ export interface Logger {
  * // stdout: {"time":"2026-09-29T12:00:00.000Z","level":"info","msg":"hello"}
  * ```
  */
-export function stdoutJsonLogger(stream: NodeJS.WritableStream = process.stdout): Logger {
+export function stdoutJsonLogger(opts: StdoutJsonLoggerOptions = {}): Logger {
+  const { stream = process.stdout, minLevel = 'info' } = opts;
   return {
     log(record) {
+      if (!meetsMinLevel(record.level, minLevel)) return;
       stream.write(`${JSON.stringify(record)}\n`);
     },
   };
@@ -121,6 +149,8 @@ export interface RotatingFileLoggerOptions {
    * current file is deleted instead of renamed. Defaults to 5.
    */
   maxFiles?: number;
+  /** Only records at or above this severity are written. Defaults to `'info'` — every record. */
+  minLevel?: LogLevel;
 }
 
 /**
@@ -134,7 +164,9 @@ export interface RotatingFileLoggerOptions {
  *
  * Never throws: a failed append or rotation step is swallowed and the logger
  * keeps accepting records. The file's size is read once, on the first write, and
- * tracked in memory afterwards, so this logger must be the file's only writer.
+ * tracked in memory afterwards, so this logger must be the file's only writer. A
+ * record below `opts.minLevel` is dropped before the file is touched at all — a
+ * logger that never sees a qualifying record never creates its file.
  *
  * @param opts - See {@link RotatingFileLoggerOptions}.
  * @returns A logger bound to `opts.path`.
@@ -152,10 +184,12 @@ export function rotatingFileLogger(opts: RotatingFileLoggerOptions): Logger {
   const { path } = opts;
   const maxBytes = integerOption(opts.maxBytes, DEFAULT_MAX_BYTES, 1);
   const maxFiles = integerOption(opts.maxFiles, DEFAULT_MAX_FILES, 0);
+  const minLevel = opts.minLevel ?? 'info';
   let size = -1; // unknown until the first write reads it
 
   return {
     log(record) {
+      if (!meetsMinLevel(record.level, minLevel)) return;
       try {
         const line = `${JSON.stringify(record)}\n`;
         const bytes = Buffer.byteLength(line);
@@ -221,29 +255,56 @@ function attempt(fn: () => void): void {
 
 /**
  * A caller's `logging` option: omit it (or pass `true`) for the default stdout
- * NDJSON logger, `false` to log nothing, or a {@link Logger} to route records
- * elsewhere.
+ * NDJSON logger, `false` to log nothing, a {@link LogLevel} for the stdout
+ * logger filtered to that severity and above, or a {@link Logger} to route
+ * records elsewhere — a supplied `Logger` is never filtered, whatever its
+ * caller's own minimum severity might be.
  */
-export type LoggingOption = boolean | Logger | undefined;
+export type LoggingOption = boolean | LogLevel | Logger | undefined;
+
+/** True for a non-null object or a function — the value shapes a `WeakSet` accepts as a member. */
+function isObjectOrFunction(value: unknown): value is object {
+  return (typeof value === 'object' && value !== null) || typeof value === 'function';
+}
+
+/** True for anything {@link emit} can call `.log()` on: an object or function exposing a callable `log`. */
+function isLoggerLike(value: unknown): value is Logger {
+  return isObjectOrFunction(value) && typeof (value as { log?: unknown }).log === 'function';
+}
 
 /**
  * Resolves a {@link LoggingOption} to the sink {@link emit} writes to:
- * `undefined` and `true` give a {@link stdoutJsonLogger}; `false` gives `null`
- * (nothing is logged); a {@link Logger} is returned as-is. Logging is opt-out —
- * an omitted option means on. Keep it that way: a silent default collects
- * nothing.
+ * `undefined` and `true` give a {@link stdoutJsonLogger}; a {@link LogLevel}
+ * gives one filtered to that severity and above; `false` gives `null` (nothing
+ * is logged); a {@link Logger} is returned as-is, unfiltered. Logging is
+ * opt-out — an omitted option means on. Keep it that way: a silent default
+ * collects nothing.
+ *
+ * Anything else — not `true`, not a {@link LogLevel} string, and not an object
+ * or function exposing a callable `log` — is a misconfiguration and throws
+ * immediately, rather than failing silently the first time a call tries to log.
  *
  * @example
  * ```ts
  * resolveLogger(undefined); // stdout NDJSON logger — the default
+ * resolveLogger('warn'); // stdout NDJSON logger, info records dropped
  * resolveLogger(false); // null — logging disabled
  * resolveLogger({ log: (record) => pino.info(record) }); // that same object
  * ```
+ *
+ * @throws {@link AudioVideoError} `code: 'invalid_argument'` for an unrecognized option.
  */
 export function resolveLogger(opt: LoggingOption): Logger | null {
   if (opt === false) return null;
   if (opt === undefined || opt === true) return stdoutJsonLogger();
-  return opt;
+  if (isLogLevel(opt)) return stdoutJsonLogger({ minLevel: opt });
+  if (isLoggerLike(opt)) return opt;
+  throw new AudioVideoError({
+    message:
+      "Invalid logging option: expected a boolean, a log level ('info' | 'warn' | 'error'), " +
+      'a Logger ({ log(record) {...} }), or undefined.',
+    code: 'invalid_argument',
+  });
 }
 
 /**
@@ -359,21 +420,24 @@ function renderError(error: unknown): string {
 }
 
 /**
- * The single dispatch path for every record the SDK logs. Redacts `record`
- * through {@link redactValue} into a new object (`record` itself is not
- * modified), hands that to `logger.log`, and swallows anything `log` throws —
- * so a sink only ever receives a redacted record, and a failing sink never
- * breaks the call being logged. A sink's first failure is reported once on
- * `process.stderr`; later failures of the same sink are silent. A `null`
- * `logger` (logging disabled) is a no-op.
+ * The single dispatch path for every record the SDK logs. Never throws: record
+ * redaction, the sink call, and the failure report it triggers all sit inside
+ * one `try`, so nothing between "logging was asked for" and "the sink saw a
+ * safe record" can surface as a throw to the caller whose render is settling.
+ * Redacts `record` through {@link redactValue} into a new object (`record`
+ * itself is not modified), hands that to `logger.log`, and swallows anything
+ * either step throws — so a sink only ever receives a redacted record, and a
+ * failing sink never breaks the call being logged. A sink's first failure is
+ * reported once on `process.stderr`; later failures of the same sink are
+ * silent. A `null` `logger` (logging disabled) is a no-op.
  *
  * @param logger - The sink from {@link resolveLogger}, or `null` when logging is off.
  * @param record - The record to write; see {@link buildLogRecord}.
  */
 export function emit(logger: Logger | null, record: LogRecord): void {
   if (!logger) return;
-  const safe = redactValue(record) as LogRecord;
   try {
+    const safe = redactValue(record) as LogRecord;
     logger.log(safe);
   } catch (err) {
     reportSinkFailure(logger, err);
@@ -383,15 +447,24 @@ export function emit(logger: Logger | null, record: LogRecord): void {
 /** Sinks whose first failure has already been reported on stderr. */
 const reportedSinks = new WeakSet<Logger>();
 
-/** Writes one stderr line the first time a given sink's `log` throws. Never throws itself. */
+/**
+ * Writes one stderr line the first time a given sink's `log` throws. Never
+ * throws itself: the `WeakSet` bookkeeping only ever runs on a value
+ * {@link isObjectOrFunction} accepts (a primitive `logger` — reachable only if
+ * a caller bypassed {@link resolveLogger}'s validation — is skipped rather than
+ * handed to the `WeakSet`, which would throw on it), and a failure anywhere in
+ * this function, `process.stderr.write` included, is swallowed rather than
+ * reaching {@link emit}'s own caller.
+ */
 function reportSinkFailure(logger: Logger, err: unknown): void {
-  if (reportedSinks.has(logger)) return;
-  reportedSinks.add(logger);
   try {
+    if (!isObjectOrFunction(logger) || reportedSinks.has(logger)) return;
+    reportedSinks.add(logger);
     process.stderr.write(
       `firefly-audio-video: logger sink threw (${renderError(err)}); further failures from this sink are not reported\n`,
     );
   } catch {
-    // stderr is unavailable too; there is nowhere left to report to.
+    // The sink was not a valid WeakSet key, or stderr is unavailable too —
+    // either way there is nowhere left to report to.
   }
 }

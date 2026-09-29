@@ -6,7 +6,7 @@ import type { TokenProvider } from '../src/core/auth.js';
 import { AudioVideoError } from '../src/core/errors.js';
 import { DEFAULT_HOST, HttpClient } from '../src/core/http.js';
 import { AsyncJob, DEFAULT_MAX_POLL_FAILURES, parseTimings, runJob } from '../src/core/job.js';
-import type { JobStatusLike } from '../src/core/job.js';
+import type { JobStatusLike, JobSubmission } from '../src/core/job.js';
 import type { JobStatusResponse } from '../src/dgr/types.js';
 
 const originalDispatcher = getGlobalDispatcher();
@@ -190,14 +190,9 @@ test('202 submit → running → completed resolves mapResult with the terminal 
 
   const client = http();
   const job = runJob(client, {
-    submit: (signal) =>
+    submit: () =>
       client
-        .request<{ jobId: string; statusUrl: string }>(
-          'POST',
-          '/v1/templates/render',
-          { source: { url: 'https://x/y' } },
-          { signal },
-        )
+        .request<JobSubmission>('POST', '/v1/templates/render', { source: { url: 'https://x/y' } })
         .then((res) => res.body),
     mapResult: (terminal, meta) => ({ status: terminal.status, meta }),
     pollIntervalMs: 0,
@@ -513,16 +508,15 @@ test('cancel() on a settled job is a no-op — no cancel request is issued', asy
   expect(inspect(job)).toBe("{ jobId: 'j1', state: 'fulfilled' }");
 });
 
-test('cancel() before the submit response waits for the job ID, then issues the cancel request', async () => {
+test('cancel() while the submit is in flight rejects cancelled at once, lets the submit finish, then issues exactly one cancel request', async () => {
   const polls = runningForever();
   const cancels = cancelEndpoint();
   let releaseSubmit!: () => void;
   const gate = new Promise<void>((resolve) => {
     releaseSubmit = resolve;
   });
-  const submit = vi.fn(async (signal: AbortSignal) => {
+  const submit = vi.fn(async () => {
     await gate;
-    expect(signal.aborted).toBe(true);
     return { jobId: 'j1', statusUrl: STATUS_URL };
   });
   const job = runJob(http(), { submit, mapResult: () => 'unreached', pollIntervalMs: 0 });
@@ -532,6 +526,10 @@ test('cancel() before the submit response waits for the job ID, then issues the 
   void cancelled.then(() => {
     cancelSettled = true;
   });
+  expect(await isPending(job)).toBe(false);
+  const err = await rejectionOf(job);
+  expect(err?.code).toBe('cancelled');
+  expect(job.jobId).toBeUndefined();
   await flush();
   expect(cancelSettled).toBe(false);
   expect(cancels()).toBe(0);
@@ -540,10 +538,67 @@ test('cancel() before the submit response waits for the job ID, then issues the 
   await cancelled;
 
   expect(cancels()).toBe(1);
+  expect(job.jobId).toBe('j1');
+  expect(submit).toHaveBeenCalledTimes(1);
+  expect(polls()).toBe(0);
+  expect(inspect(job)).toBe("{ jobId: 'j1', state: 'cancelled' }");
+});
+
+test('cancel() during a real submit request leaves that request to complete and cancels the job it accepted', async () => {
+  vi.useFakeTimers();
+  pool()
+    .intercept({ path: '/v1/templates/render', method: 'POST' })
+    .reply(202, { jobId: 'j1', statusUrl: STATUS_URL })
+    .delay(300);
+  const polls = runningForever();
+  const cancels = cancelEndpoint();
+  const client = http();
+  const job = runJob(client, {
+    submit: () =>
+      client
+        .request<JobSubmission>('POST', '/v1/templates/render', { source: { url: 'https://x/y' } })
+        .then((res) => res.body),
+    mapResult: () => 'unreached',
+  });
+
+  await vi.advanceTimersByTimeAsync(20);
+  const cancelled = job.cancel();
   const err = await rejectionOf(job);
   expect(err?.code).toBe('cancelled');
-  expect(err?.jobId).toBe('j1');
+  expect(job.jobId).toBeUndefined();
+  expect(cancels()).toBe(0);
+
+  await vi.advanceTimersByTimeAsync(280); // the delayed 202 lands
+  await cancelled;
+  expect(job.jobId).toBe('j1');
+  expect(cancels()).toBe(1);
   expect(polls()).toBe(0);
+  expect(agent.pendingInterceptors().filter((i) => i.method === 'POST')).toHaveLength(0);
+});
+
+test('a submit that fails while a cancel is waiting on it resolves the cancel with no cancel request', async () => {
+  const cancels = cancelEndpoint();
+  const failure = new AudioVideoError({
+    message: 'Request failed with status 400.',
+    code: 'http_400',
+  });
+  let failSubmit!: () => void;
+  const submit = vi.fn(
+    () =>
+      new Promise<JobSubmission>((_, reject) => {
+        failSubmit = () => reject(failure);
+      }),
+  );
+  const job = runJob(http(), { submit, mapResult: () => 'unreached' });
+
+  const cancelled = job.cancel();
+  expect((await rejectionOf(job))?.code).toBe('cancelled');
+  failSubmit();
+  await cancelled;
+
+  expect(cancels()).toBe(0);
+  expect(job.jobId).toBeUndefined();
+  expect(inspect(job)).toBe("{ jobId: undefined, state: 'cancelled' }");
 });
 
 test('an external signal abort cancels the job the same way, with the abort reason as cause', async () => {
@@ -692,10 +747,39 @@ test('timeoutMs → rejects job_timeout, stops polling, and issues no cancel req
   expect(err?.code).toBe('job_timeout');
   expect(err?.jobId).toBe('j1');
   expect(err?.message).toContain('2500 ms');
+  expect(err?.message).toContain('not asked to stop');
 
   await vi.advanceTimersByTimeAsync(60_000);
   expect(polls()).toBe(3);
   expect(cancels()).toBe(0);
+  expect(inspect(job)).toBe("{ jobId: 'j1', state: 'rejected' }");
+});
+
+test('cancelOnTimeout: true → timeoutMs still rejects job_timeout, and the cancel request is issued', async () => {
+  vi.useFakeTimers();
+  const polls = runningForever();
+  const cancels = cancelEndpoint();
+  const { onProgress, first } = progressGate();
+  const job = runJob(http(), {
+    submit: submitJ1,
+    mapResult: () => 'unreached',
+    timeoutMs: 2_500,
+    cancelOnTimeout: true,
+    onProgress,
+  });
+  await first;
+  const settled = rejectionOf(job);
+
+  await vi.advanceTimersByTimeAsync(2_500);
+  const err = await settled;
+  expect(err?.code).toBe('job_timeout');
+  expect(err?.jobId).toBe('j1');
+  expect(err?.message).toContain('cancel request');
+  await vi.waitFor(() => expect(cancels()).toBe(1));
+
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(polls()).toBe(3);
+  expect(cancels()).toBe(1);
   expect(inspect(job)).toBe("{ jobId: 'j1', state: 'rejected' }");
 });
 

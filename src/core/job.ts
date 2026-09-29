@@ -99,11 +99,12 @@ export type PollInterval = number | ((elapsedMs: number) => number);
 export interface RunJobOptions<T> {
   /**
    * Issues the capability's request and returns the accepted job's ID and status
-   * URL. Receives the job's abort signal so a cancel during submission can abort
-   * the request itself. Never retried: a failing submit rejects the job with the
-   * error it threw.
+   * URL. It is not handed the job's abort signal: a cancel during submission lets
+   * the request complete, so the job the service accepted is known by ID and is
+   * sent the cancel request — aborting the request would leave that job running
+   * unseen. Never retried: a failing submit rejects the job with the error it threw.
    */
-  submit: (signal: AbortSignal) => Promise<JobSubmission>;
+  submit: () => Promise<JobSubmission>;
   /** Builds the job's result from a successful terminal status body and its derived timing. */
   mapResult: (terminal: JobStatusLike, meta: JobMeta) => T;
   /**
@@ -136,10 +137,20 @@ export interface RunJobOptions<T> {
   maxPollFailures?: number;
   /**
    * Overall budget, in milliseconds from the moment the job is started, for the
-   * job to reach a terminal state; exceeding it rejects with `job_timeout`.
-   * Unbounded when omitted.
+   * job to reach a terminal state; exceeding it rejects with `job_timeout`. This
+   * bounds the wait, not the job: the service is NOT asked to stop unless
+   * {@link RunJobOptions.cancelOnTimeout} is set, so the job may still complete on
+   * the service — its ID is on the error for a later status read. Aborting
+   * `signal` instead (e.g. `AbortSignal.timeout(ms)`) cancels the job: it rejects
+   * `cancelled` and the service is asked to stop. Unbounded when omitted.
    */
   timeoutMs?: number;
+  /**
+   * When `true`, a `timeoutMs` expiry also asks the service to stop the job, with
+   * the same best-effort cancel request {@link AsyncJob.cancel} issues; the job
+   * still rejects `job_timeout`. Defaults to `false`.
+   */
+  cancelOnTimeout?: boolean;
   /** Builds the service path of the cancel endpoint for a job ID. Defaults to `/v1/cancel/{jobId}`. */
   cancelPath?: (jobId: string) => string;
 }
@@ -151,8 +162,12 @@ type JobState = 'pending' | 'fulfilled' | 'rejected' | 'cancelled';
 interface JobContext {
   /** Aborted when the job is cancelled or times out; every request and delay must honor it. */
   readonly signal: AbortSignal;
-  /** Records the job ID as soon as the submit response carries it. */
-  setJobId(jobId: string): void;
+  /**
+   * Follows the capability's submit request: records the job ID from its
+   * settlement and resolves with the submission, or rejects with the abort reason
+   * as soon as the job is aborted — the request itself is left to settle on its own.
+   */
+  trackSubmission(submission: Promise<JobSubmission>): Promise<JobSubmission>;
   /** Records the derived timing once a terminal status body has been read. */
   setMeta(meta: JobMeta): void;
 }
@@ -165,6 +180,7 @@ interface JobDriver<T> {
   cancelRemote(jobId: string): Promise<void>;
   signal?: AbortSignal;
   timeoutMs?: number;
+  cancelOnTimeout?: boolean;
 }
 
 /** Abort reason set by {@link AsyncJob.cancel}. Any other non-timeout reason came from the caller's own signal. */
@@ -227,6 +243,8 @@ export class AsyncJob<T> implements PromiseLike<T> {
   readonly #cancelRemote: (jobId: string) => Promise<void>;
   readonly #jobIdKnown = deferred<string | undefined>();
   readonly #timeoutMs: number | undefined;
+  readonly #cancelOnTimeout: boolean;
+  #submissionTracked = false;
   #state: JobState = 'pending';
   #jobId: string | undefined;
   #meta: JobMeta | undefined;
@@ -237,6 +255,7 @@ export class AsyncJob<T> implements PromiseLike<T> {
   constructor(driver: JobDriver<T>) {
     this.#cancelRemote = driver.cancelRemote;
     this.#timeoutMs = driver.timeoutMs;
+    this.#cancelOnTimeout = driver.cancelOnTimeout ?? false;
 
     const external = driver.signal;
     if (external?.aborted) this.#controller.abort(external.reason);
@@ -244,10 +263,7 @@ export class AsyncJob<T> implements PromiseLike<T> {
     this.#promise = driver
       .run({
         signal: this.#controller.signal,
-        setJobId: (jobId) => {
-          this.#jobId = jobId;
-          this.#jobIdKnown.resolve(jobId);
-        },
+        trackSubmission: (submission) => this.#trackSubmission(submission),
         setMeta: (meta) => {
           this.#meta = meta;
         },
@@ -278,7 +294,10 @@ export class AsyncJob<T> implements PromiseLike<T> {
 
     if (driver.timeoutMs !== undefined && Number.isFinite(driver.timeoutMs)) {
       this.#timeoutTimer = setTimeout(
-        () => this.#controller.abort(ABORT_TIMEOUT),
+        () => {
+          this.#controller.abort(ABORT_TIMEOUT);
+          if (this.#cancelOnTimeout) this.#remoteCancel ??= this.#issueRemoteCancel();
+        },
         Math.min(Math.max(0, driver.timeoutMs), MAX_TIMER_MS),
       );
     }
@@ -315,15 +334,16 @@ export class AsyncJob<T> implements PromiseLike<T> {
   }
 
   /**
-   * Cancels the job: stops polling, aborts any in-flight request, and asks the
-   * service to stop the job (a `PUT` to the cancel path) on a best-effort basis —
-   * a failing cancel request is swallowed. The job itself then rejects with an
+   * Cancels the job: stops polling, aborts any in-flight status request, and asks
+   * the service to stop the job (a `PUT` to the cancel path) on a best-effort basis
+   * — a failing cancel request is swallowed. The job itself rejects at once with an
    * {@link AudioVideoError} of `code: 'cancelled'`.
    *
-   * Resolves once the cancel request has been attempted; if the submit is still in
-   * flight it waits for the job ID first, so a cancel issued during submission
-   * still reaches the service. Calling this on an already-settled job, or a
-   * second time, is a no-op.
+   * A submit request still in flight is left to complete rather than aborted, so
+   * the job the service accepted is known by ID and the cancel request reaches it;
+   * this promise resolves once that request has been attempted (or once a failed
+   * submit has shown there is nothing to cancel). Calling this on an
+   * already-settled job, or a second time, is a no-op.
    */
   cancel(): Promise<void> {
     return this.#cancelWith(ABORT_CANCELLED);
@@ -357,11 +377,30 @@ export class AsyncJob<T> implements PromiseLike<T> {
     }
   }
 
+  /**
+   * Follows the submit request to its own settlement so the job ID is recorded —
+   * and the cancel request can be sent — even when the job is aborted while the
+   * request is in flight. The returned promise rejects with the abort reason as
+   * soon as the job is aborted.
+   */
+  #trackSubmission(submission: Promise<JobSubmission>): Promise<JobSubmission> {
+    this.#submissionTracked = true;
+    void submission.then(
+      ({ jobId }) => {
+        this.#jobId = jobId;
+        this.#jobIdKnown.resolve(jobId);
+      },
+      () => this.#jobIdKnown.resolve(undefined),
+    );
+    return untilAborted(submission, this.#controller.signal);
+  }
+
   #settle(state: JobState): void {
     this.#state = state;
     if (this.#timeoutTimer !== undefined) clearTimeout(this.#timeoutTimer);
     this.#detachExternalSignal?.();
-    this.#jobIdKnown.resolve(this.#jobId);
+    // With a submit in flight, its own settlement reports the ID (or its absence).
+    if (!this.#submissionTracked) this.#jobIdKnown.resolve(undefined);
   }
 
   /**
@@ -375,7 +414,11 @@ export class AsyncJob<T> implements PromiseLike<T> {
     if (!signal.aborted || err instanceof AudioVideoError) return err;
     if (signal.reason === ABORT_TIMEOUT) {
       return new AudioVideoError({
-        message: `${describeJob(this.#jobId)} did not reach a terminal state within ${this.#timeoutMs} ms.`,
+        message:
+          `${describeJob(this.#jobId)} did not reach a terminal state within ${this.#timeoutMs} ms; ` +
+          (this.#cancelOnTimeout
+            ? 'a cancel request is being sent to the service.'
+            : 'the service was not asked to stop it and it may still complete.'),
         code: 'job_timeout',
         jobId: this.#jobId,
       });
@@ -404,7 +447,8 @@ export class AsyncJob<T> implements PromiseLike<T> {
  *   errors) in `.items`, redacted;
  * - rejects `cancelled` when the service reports the job cancelled, when
  *   {@link AsyncJob.cancel} is called, or when `opts.signal` aborts;
- * - rejects `job_timeout` when `opts.timeoutMs` elapses first;
+ * - rejects `job_timeout` when `opts.timeoutMs` elapses first — the service is
+ *   not asked to stop unless `opts.cancelOnTimeout` is set;
  * - rejects `job_poll_failed`, with the last failure as `cause`, once
  *   `opts.maxPollFailures` status polls in a row have failed transiently (a
  *   transport error, or a `408` / `425` / `429` / `500` / `502` / `503` / `504`
@@ -426,10 +470,8 @@ export class AsyncJob<T> implements PromiseLike<T> {
  * @example
  * ```ts
  * const job = runJob(http, {
- *   submit: (signal) =>
- *     http
- *       .request<JobSubmission>('POST', '/v1/templates/render', body, { signal })
- *       .then((res) => res.body),
+ *   submit: () =>
+ *     http.request<JobSubmission>('POST', '/v1/templates/render', body).then((res) => res.body),
  *   mapResult: (terminal, meta) => ({ outputs: terminal.outputs, meta }),
  *   onProgress: (status) => console.log(status.status),
  * });
@@ -445,6 +487,7 @@ export function runJob<T>(http: HttpClient, opts: RunJobOptions<T>): AsyncJob<T>
     },
     signal: opts.signal,
     timeoutMs: opts.timeoutMs,
+    cancelOnTimeout: opts.cancelOnTimeout,
   });
 }
 
@@ -503,8 +546,7 @@ async function pollUntilTerminal<T>(
   const startedAt = Date.now();
 
   signal.throwIfAborted();
-  const { jobId, statusUrl } = await opts.submit(signal);
-  ctx.setJobId(jobId);
+  const { jobId, statusUrl } = await ctx.trackSubmission(opts.submit());
 
   let failedPolls = 0;
   for (;;) {
@@ -745,7 +787,7 @@ function isCancellation(err: unknown): boolean {
 }
 
 function describeJob(jobId: string | undefined): string {
-  return jobId === undefined ? 'The job (not yet submitted)' : `Job ${jobId}`;
+  return jobId === undefined ? 'The job (ID not yet known)' : `Job ${jobId}`;
 }
 
 /** `setTimeout`-backed delay that rejects with `signal.reason` the moment `signal` aborts. */
@@ -761,6 +803,22 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
       resolve();
     }, ms);
     signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/**
+ * Settles as `promise` does, unless `signal` aborts first — then rejects with
+ * `signal.reason` at once and leaves `promise` to settle on its own.
+ */
+function untilAborted<V>(promise: Promise<V>, signal: AbortSignal): Promise<V> {
+  if (signal.aborted) {
+    void promise.catch(noop);
+    return Promise.reject(signal.reason);
+  }
+  return new Promise<V>((resolve, reject) => {
+    const onAbort = (): void => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    void promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
   });
 }
 

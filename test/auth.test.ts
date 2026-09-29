@@ -1,15 +1,17 @@
 import { inspect } from 'node:util';
+import { ServerToServerTokenProvider } from '@adobe/firefly-services-common-apis';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import {
   ClientCredentialsProvider,
   DEFAULT_SCOPE,
   DEFAULT_TOKEN_TTL_MS,
+  MINT_TIMEOUT_MS,
   MIN_TOKEN_REUSE_MS,
   resolveTokenProvider,
 } from '../src/core/auth.js';
 import { AudioVideoError } from '../src/core/errors.js';
 import { FakeIms, deferred } from './support/fake-ims.js';
-import { until } from './support/mock-api.js';
+import { flush, until } from './support/mock-api.js';
 
 const CLIENT_ID = 'client-id';
 const SECRET = 'TOP_SECRET_VALUE';
@@ -30,6 +32,28 @@ afterEach(async () => {
 /** Fakes the clock and `setTimeout` only, so real macrotasks keep draining the fetch path. */
 function useFakeClock(): void {
   vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+}
+
+/** A promise's settled state, readable synchronously. */
+interface Tracked<T> {
+  state: 'pending' | 'fulfilled' | 'rejected';
+  value?: T;
+  error?: unknown;
+}
+
+function track<T>(promise: Promise<T>): Tracked<T> {
+  const tracked: Tracked<T> = { state: 'pending' };
+  promise.then(
+    (value) => {
+      tracked.state = 'fulfilled';
+      tracked.value = value;
+    },
+    (error: unknown) => {
+      tracked.state = 'rejected';
+      tracked.error = error;
+    },
+  );
+  return tracked;
 }
 
 /** Every surface a caller could print an error through, its cause included. */
@@ -387,6 +411,66 @@ test('a non-JWT opaque token falls back to DEFAULT_TOKEN_TTL_MS when no tokenTtl
   await vi.advanceTimersByTimeAsync(2_000);
   await expect(provider.getAccessToken()).resolves.toBe('TOKEN_2');
   expect(ims.requests).toHaveLength(2);
+});
+
+// --- the mint time-box -------------------------------------------------------------
+
+test('a mint IMS has not answered within MINT_TIMEOUT_MS rejects every waiter auth_failed, and its late answer is dropped', async () => {
+  useFakeClock();
+  const authenticate = vi.spyOn(ServerToServerTokenProvider.prototype, 'authenticate');
+  const held = deferred();
+  ims.token('LATE_TOKEN', { hold: held.promise });
+  ims.token('TOKEN_2');
+  const provider = new ClientCredentialsProvider(CREDS);
+
+  try {
+    const waiters = [
+      track(provider.getAccessToken()),
+      track(provider.getAccessToken({ forceRefresh: true })),
+    ];
+    await until(() => ims.requests.length === 1);
+
+    // One millisecond short of the bound: still waiting.
+    await vi.advanceTimersByTimeAsync(MINT_TIMEOUT_MS - 1);
+    await flush();
+    expect(waiters.map((waiter) => waiter.state)).toEqual(['pending', 'pending']);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await until(() => waiters.every((waiter) => waiter.state !== 'pending'));
+    for (const waiter of waiters) {
+      expect(waiter.state).toBe('rejected');
+      expect(waiter.error).toBeInstanceOf(AudioVideoError);
+      expect((waiter.error as AudioVideoError).code).toBe('auth_failed');
+      expect((waiter.error as AudioVideoError).message).toBe(
+        'IMS did not answer the token request within 30 seconds.',
+      );
+    }
+
+    // IMS answers only now: the abandoned mint's token is dropped, not cached.
+    held.resolve();
+    await expect(authenticate.mock.results[0]?.value).resolves.toBe('LATE_TOKEN');
+    await flush();
+    await expect(provider.getAccessToken()).resolves.toBe('TOKEN_2');
+    expect(ims.requests).toHaveLength(2);
+  } finally {
+    held.resolve();
+  }
+});
+
+test('a mint that settles inside the bound, resolved or rejected, leaves no timer running', async () => {
+  useFakeClock();
+  vi.spyOn(console, 'error').mockImplementation(() => undefined);
+  ims.token('TOKEN_1');
+  ims.answer(502, '<html><body>Bad Gateway</body></html>');
+  const provider = new ClientCredentialsProvider(CREDS);
+
+  await expect(provider.getAccessToken()).resolves.toBe('TOKEN_1');
+  expect(vi.getTimerCount()).toBe(0);
+
+  await expect(provider.getAccessToken({ forceRefresh: true })).rejects.toMatchObject({
+    code: 'auth_failed',
+  });
+  expect(vi.getTimerCount()).toBe(0);
 });
 
 // --- failure -------------------------------------------------------------------

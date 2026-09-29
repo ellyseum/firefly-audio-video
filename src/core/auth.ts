@@ -98,6 +98,16 @@ const DEFAULT_REFRESH_MARGIN_MS = 60_000;
 export const MIN_TOKEN_REUSE_MS = 5_000;
 
 /**
+ * How long a mint waits for IMS before every caller waiting on it rejects
+ * `auth_failed`. The wrapped provider's request carries no timeout or abort
+ * signal of its own, so this bound is what stops a stalled IMS connection
+ * from stalling every caller.
+ *
+ * @internal
+ */
+export const MINT_TIMEOUT_MS = 30_000;
+
+/**
  * Tuning knobs for {@link ClientCredentialsProvider}'s own token cache.
  */
 export interface ClientCredentialsProviderOptions {
@@ -164,6 +174,12 @@ export interface ClientCredentialsProviderOptions {
  * request rather than each triggering their own — including a
  * {@link GetAccessTokenOptions.forceRefresh} call that arrives while another
  * mint (forced or cache-driven) is already in progress.
+ *
+ * **A mint is time-boxed to 30 seconds.** The wrapped provider's request has
+ * no timeout of its own and cannot be aborted, so a mint IMS has not
+ * answered within 30 seconds rejects every caller waiting on it with
+ * `auth_failed`, and the next call starts a fresh mint. The abandoned
+ * request runs on; its eventual answer is dropped, never cached.
  */
 export class ClientCredentialsProvider implements TokenProvider {
   readonly #details: ServerToServerAuthDetails;
@@ -199,11 +215,12 @@ export class ClientCredentialsProvider implements TokenProvider {
    * @param opts - See {@link GetAccessTokenOptions}.
    * @throws {@link AudioVideoError} with `code: 'auth_failed'` when IMS does
    *   not return a usable token — the message then names IMS's OAuth `error`
-   *   code when it sent one — or when the wrapped provider's `authenticate()`
-   *   call fails outright. The client secret is never included in the thrown
-   *   error's message; when the wrapped provider threw, `.cause` carries its
-   *   error for programmatic inspection and is excluded from every
-   *   serialized form of {@link AudioVideoError} by construction.
+   *   code when it sent one — when the wrapped provider's `authenticate()`
+   *   call fails outright, or when IMS has not answered within 30 seconds.
+   *   The client secret is never included in the thrown error's message;
+   *   when the wrapped provider threw, `.cause` carries its error for
+   *   programmatic inspection and is excluded from every serialized form of
+   *   {@link AudioVideoError} by construction.
    */
   async getAccessToken(opts: GetAccessTokenOptions = {}): Promise<string> {
     if (!opts.forceRefresh && this.#cachedToken !== undefined && Date.now() < this.#refreshAt) {
@@ -217,7 +234,40 @@ export class ClientCredentialsProvider implements TokenProvider {
     return this.#inflight;
   }
 
-  async #mint(): Promise<string> {
+  /**
+   * One exchange, time-boxed to {@link MINT_TIMEOUT_MS}: the cache is written
+   * only when IMS answers inside the bound. Past it, the promise rejects
+   * `auth_failed`; the exchange itself cannot be stopped, so it runs on and
+   * its eventual result is dropped.
+   */
+  #mint(): Promise<string> {
+    return new Promise<string>((resolve, reject) => {
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        reject(mintTimeoutError());
+      }, MINT_TIMEOUT_MS);
+      this.#exchange().then(
+        ({ token, refreshAt }) => {
+          clearTimeout(timer);
+          if (timedOut) return;
+          this.#cachedToken = token;
+          this.#refreshAt = refreshAt;
+          resolve(token);
+        },
+        (error: unknown) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
+  }
+
+  /**
+   * One IMS exchange on a fresh instance of the wrapped provider: the token
+   * is checked, and its refresh point computed, without touching the cache.
+   */
+  async #exchange(): Promise<{ token: string; refreshAt: number }> {
     const vendor = new ServerToServerTokenProvider({ ...this.#details }, { autoRefresh: false });
     try {
       const token: unknown = await vendor.authenticate();
@@ -226,9 +276,8 @@ export class ClientCredentialsProvider implements TokenProvider {
       }
       const arrivedAt = Date.now();
       const expiresAt = claimedExpiryMs(token) ?? arrivedAt + this.#tokenTtlMs;
-      this.#cachedToken = token;
-      this.#refreshAt = Math.max(expiresAt - this.#refreshMarginMs, arrivedAt + MIN_TOKEN_REUSE_MS);
-      return token;
+      const refreshAt = Math.max(expiresAt - this.#refreshMarginMs, arrivedAt + MIN_TOKEN_REUSE_MS);
+      return { token, refreshAt };
     } catch (cause) {
       if (cause instanceof AudioVideoError) throw cause;
       throw new AudioVideoError({
@@ -260,6 +309,14 @@ function imsErrorCode(
   return error.includes(details.clientSecret) || error.includes(details.clientId)
     ? undefined
     : error;
+}
+
+/** The `auth_failed` error every waiter on a mint receives once it outlives {@link MINT_TIMEOUT_MS}. */
+function mintTimeoutError(): AudioVideoError {
+  return new AudioVideoError({
+    message: `IMS did not answer the token request within ${MINT_TIMEOUT_MS / 1_000} seconds.`,
+    code: 'auth_failed',
+  });
 }
 
 /** The `auth_failed` error for an IMS reply that carried no usable access token. */

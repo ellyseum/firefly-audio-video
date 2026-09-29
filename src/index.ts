@@ -10,3 +10,6 @@ export type {
 
 export { AudioVideoError } from './core/errors.js';
 export type { AudioVideoErrorOptions, AudioVideoErrorJSON } from './core/errors.js';
+
+export { ClientCredentialsProvider } from './core/auth.js';
+export type { TokenProvider, ClientCredentials } from './core/auth.js';

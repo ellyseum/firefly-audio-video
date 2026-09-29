@@ -287,6 +287,47 @@ describe('what a codec cannot produce', () => {
   });
 });
 
+describe('the H.264 rejection message', () => {
+  const deviations: [string, EncodeConfig, RegExp][] = [
+    [
+      'a bitrate',
+      { codec: 'h264', resolution: '1920x1080', mode: 'hq', bitrate: '12M' },
+      /bitrate is not settable for H\.264/,
+    ],
+    [
+      'alpha',
+      { codec: 'h264', resolution: '1920x1080', mode: 'hq', alpha: true },
+      /alpha is not available for H\.264/,
+    ],
+    [
+      'no mode',
+      { codec: 'h264', resolution: '1920x1080' },
+      /mode is required: 'hq' \| 'lq' \| '2pass'/,
+    ],
+    [
+      'a non-native size',
+      { codec: 'h264', resolution: '1234x567', mode: 'hq' },
+      /size 1234x567 is not a native H\.264 size/,
+    ],
+  ];
+
+  test.each(deviations)(
+    'names %s and lists the native ladder, under 500 characters',
+    (_label, config, fragment) => {
+      const message = presetError(() => toEpr(config)).message;
+      expect(message).toMatch(fragment);
+      expect(message).toContain('native presets');
+      expect(message).toContain("'hq', 'lq', '2pass'");
+      expect(message.length).toBeLessThan(500);
+    },
+  );
+
+  test('each deviation gets its own message', () => {
+    const messages = deviations.map(([, config]) => presetError(() => toEpr(config)).message);
+    expect(new Set(messages).size).toBe(messages.length);
+  });
+});
+
 describe('parseEprHeadline', () => {
   test("reads the embedded AME presets' headline fields", () => {
     expect(parseEprHeadline(HEVC_BASE_EPR)).toEqual({

@@ -8,7 +8,8 @@
 
 import { createHash } from 'node:crypto';
 import { AudioVideoError } from '../core/errors.js';
-import { EncodeConfigSchema, type BitDepth, type EncodeConfig } from '../dgr/schemas.js';
+import { EncodeConfigSchema, MODES, type BitDepth, type EncodeConfig } from '../dgr/schemas.js';
+import { ASPECT_RESOLUTIONS } from './catalog.js';
 import {
   CODEC_TRAITS,
   bitrateBps,
@@ -162,14 +163,54 @@ export function toEpr(config: EncodeConfig): string {
   return xml.replace(/\n/g, '\r\n');
 }
 
+/** DGR's native H.264 frame sizes — the same ladder `resize()` maps aspect ratios onto. */
+const H264_SIZES: readonly string[] = Object.values(ASPECT_RESOLUTIONS);
+
+/** Names what H.264 supports, then its native ladder — kept well under 500 characters. */
+const H264_LADDER = `H.264 renders only through DGR's native presets: resolution one of ${H264_SIZES.join(', ')}; mode one of ${MODES.map((mode) => `'${mode}'`).join(', ')}; always 8-bit 4:2:0 with no bitrate, frameRate, alpha or color.`;
+
+/** Why `config` matches no native H.264 preset, then the native ladder. */
+function h264Mismatch(config: EncodeConfig, traits: CodecTraits): string {
+  return `${h264Deviation(config, traits)} ${H264_LADDER}`;
+}
+
+/** The one field that stops `config` matching a native H.264 preset. */
+function h264Deviation(config: EncodeConfig, traits: CodecTraits): string {
+  if (config.alpha === true) return 'alpha is not available for H.264.';
+  if (config.bitrate !== undefined) {
+    return "bitrate is not settable for H.264; remove .bitrate() or choose codec 'hevc'.";
+  }
+  if (config.frameRate !== undefined) {
+    return "frameRate is not settable for H.264; remove .with({ frameRate }) or choose codec 'hevc'.";
+  }
+  if (config.color !== undefined) {
+    return "color is not settable for H.264; remove .with({ color }) or choose codec 'hevc'.";
+  }
+  if (config.chroma !== undefined && config.chroma !== traits.chroma) {
+    return `H.264 encodes chroma '${traits.chroma}' only; got '${config.chroma}'.`;
+  }
+  if (config.bitDepth !== undefined && config.bitDepth !== traits.bitDepths[0]) {
+    return `H.264 encodes bitDepth ${traits.bitDepths[0]} only; got ${config.bitDepth}.`;
+  }
+  if (config.matchSource !== undefined) {
+    return 'matchSource is not settable for H.264; set resolution instead.';
+  }
+  if (config.resolution === undefined) {
+    return `resolution is required: one of ${H264_SIZES.join(', ')}.`;
+  }
+  const { width, height } = frameSizeOf(config.resolution);
+  const size = `${width}x${height}`;
+  if (!H264_SIZES.includes(size)) return `size ${size} is not a native H.264 size.`;
+  if (config.mode === undefined) return "mode is required: 'hq' | 'lq' | '2pass'.";
+  return 'this config already matches a native H.264 preset; call resolvePreset(), not toEpr(), for H.264.';
+}
+
 /** Validates `config` against what its codec can produce and derives the {@link EprPlan}. */
 function planEpr(config: EncodeConfig): EprPlan {
   const traits = CODEC_TRAITS[config.codec];
   const { family, fourcc } = traits;
   if (family === undefined || fourcc === undefined) {
-    throw invalidPreset(
-      `codec '${config.codec}' renders only through DGR's native presets (a named ${config.codec} preset, or a config equal to one); generated .epr presets cover 'hevc', 'prores4444' and 'prores4444xq'.`,
-    );
+    throw invalidPreset(h264Mismatch(config, traits));
   }
   const codec = `codec '${config.codec}'`;
 

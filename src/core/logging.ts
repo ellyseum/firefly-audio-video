@@ -1,14 +1,14 @@
-/**
+/*
  * Zero-dependency structured logging: one flat NDJSON record per settled call,
  * redacted before any sink sees it. Logging is on unless a caller disables it —
- * {@link resolveLogger} turns an omitted option into the stdout logger. Every
- * record the SDK writes goes through {@link emit}, the single dispatch path that
- * runs {@link redactValue} and never lets a sink failure surface as a throw. Two
- * sinks ship with the package, {@link stdoutJsonLogger} and
- * {@link rotatingFileLogger}, and any object with a `log(record)` method is a
- * {@link Logger}, so a consumer can route records into pino, winston, or a
- * pipeline of their own. Capability-neutral: nothing here knows what a record's
- * `endpoint` does, and nothing here is imported from a capability module.
+ * resolveLogger turns an omitted option into the stdout logger. Every record
+ * the SDK writes goes through emit, the single dispatch path that runs
+ * redactValue and never lets a sink failure surface as a throw. Two sinks ship
+ * with the package, stdoutJsonLogger and rotatingFileLogger, and any object
+ * with a `log(record)` method is a Logger, so a consumer can route records
+ * into pino, winston, or a pipeline of their own. Capability-neutral: nothing
+ * here knows what a record's `endpoint` does, and nothing here is imported
+ * from a capability module.
  */
 
 import { appendFileSync, mkdirSync, renameSync, statSync, unlinkSync } from 'node:fs';
@@ -109,6 +109,11 @@ export interface StdoutJsonLoggerOptions {
  * queue, or worker thread of its own in between. A record below `opts.minLevel`
  * is dropped before the stream is touched at all.
  *
+ * Writes the record exactly as given — this sink does not redact. The SDK's
+ * own calls always reach it through {@link emit}, which redacts first; a
+ * consumer calling `.log()` directly with its own record is responsible for
+ * not putting a secret in one.
+ *
  * @param opts - See {@link StdoutJsonLoggerOptions}.
  * @returns A logger bound to `opts.stream`.
  *
@@ -158,15 +163,22 @@ export interface RotatingFileLoggerOptions {
  * it by size: when a line would push the file past `maxBytes`, `<path>` becomes
  * `<path>.1`, each existing `<path>.N` becomes `<path>.N+1`, `<path>.<maxFiles>`
  * is dropped, and the line starts a fresh `<path>`. No kept file exceeds
- * `maxBytes` unless a single line does — an empty file is never rotated, so
- * every record is written. Appends are synchronous, so lines land in the order
- * they were logged. The parent directory is created on the first write.
+ * `maxBytes` unless a single line does, or a rotation step failed (e.g. a
+ * locked file on Windows) and the next line landed in the unrotated file — an
+ * empty file is never rotated, so every record is written. Appends are
+ * synchronous, so lines land in the order they were logged. The parent
+ * directory is created on the first write.
  *
  * Never throws: a failed append or rotation step is swallowed and the logger
  * keeps accepting records. The file's size is read once, on the first write, and
  * tracked in memory afterwards, so this logger must be the file's only writer. A
  * record below `opts.minLevel` is dropped before the file is touched at all — a
  * logger that never sees a qualifying record never creates its file.
+ *
+ * Writes the record exactly as given — this sink does not redact. The SDK's
+ * own calls always reach it through {@link emit}, which redacts first; a
+ * consumer calling `.log()` directly with its own record is responsible for
+ * not putting a secret in one.
  *
  * @param opts - See {@link RotatingFileLoggerOptions}.
  * @returns A logger bound to `opts.path`.

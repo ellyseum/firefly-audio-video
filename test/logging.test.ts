@@ -505,7 +505,7 @@ test('rotatingFileLogger: never throws when the path cannot be written', () => {
   expect(existsSync(join(blocker, 'render.log'))).toBe(false);
 });
 
-test('rotatingFileLogger: a fractional maxBytes is floored and a non-finite maxFiles falls back to the default', () => {
+test('rotatingFileLogger: a non-finite maxFiles falls back to the default, and a fractional maxBytes does not break rotation', () => {
   const path = join(tempDir(), 'render.log');
   const logger = rotatingFileLogger({ path, maxBytes: 200.9, maxFiles: Number.NaN });
 

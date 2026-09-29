@@ -58,10 +58,12 @@ export interface RenderBodyWire {
  * this array rather than trusting `status` alone.
  *
  * `startedDate` and `completedDate` are raw wire timestamps, deliberately typed as
- * `string` rather than parsed: `completedDate` has been observed at
- * nanosecond precision while `createdDate` (on {@link JobStatusResponse}) is
- * millisecond precision, so a naive `Date.parse` on the nanosecond form yields
- * `NaN` — the tolerant parse belongs to whatever computes render timing, not here.
+ * `string` rather than parsed: they may carry more than millisecond precision
+ * (`completedDate` at nanosecond precision, while `createdDate` on
+ * {@link JobStatusResponse} is millisecond precision), so a consumer should
+ * truncate the fraction to three digits before parsing for a result that does not
+ * depend on the host engine's date parser — that parse belongs to whatever
+ * computes timing, not here.
  */
 export interface JobItem {
   startedDate?: string;

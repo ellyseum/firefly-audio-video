@@ -73,7 +73,7 @@ export interface JobMeta {
   perItem: Array<{ index: number; queueMs?: number; renderMs?: number; totalMs?: number }>;
 }
 
-/** What a capability's submit call returns: the accepted job and where to poll it. */
+/** @internal What a capability's submit call returns: the accepted job and where to poll it. */
 export interface JobSubmission {
   jobId: string;
   /** Absolute or host-relative URL that answers a {@link JobStatusLike} body on `GET`. */
@@ -95,6 +95,8 @@ export type PollInterval = number | ((elapsedMs: number) => number);
 
 /**
  * What {@link runJob} needs from a capability to drive one job.
+ *
+ * @internal
  */
 export interface RunJobOptions<T> {
   /**
@@ -165,7 +167,7 @@ export interface RunJobOptions<T> {
 /** The lifecycle position `util.inspect` reports for an {@link AsyncJob}. */
 type JobState = 'pending' | 'fulfilled' | 'rejected' | 'cancelled';
 
-/** What {@link AsyncJob} exposes to the function that drives it. */
+/** @internal What {@link AsyncJob} exposes to the function that drives it. */
 interface JobContext {
   /** Aborted when the job is cancelled or times out; every request and delay must honor it. */
   readonly signal: AbortSignal;
@@ -179,7 +181,7 @@ interface JobContext {
   setMeta(meta: JobMeta): void;
 }
 
-/** Everything {@link AsyncJob} needs to run and cancel one job. */
+/** @internal Everything {@link AsyncJob} needs to run and cancel one job. */
 interface JobDriver<T> {
   /** Runs the job to completion, resolving with its result; rejects on any failure or abort. */
   run(ctx: JobContext): Promise<T>;
@@ -202,6 +204,8 @@ const MAX_TIMER_MS = 2_147_483_647;
 /**
  * How many status polls may fail in a row before a job rejects `job_poll_failed`,
  * unless {@link RunJobOptions.maxPollFailures} says otherwise.
+ *
+ * @internal
  */
 export const DEFAULT_MAX_POLL_FAILURES = 5;
 
@@ -266,6 +270,7 @@ export class AsyncJob<T> implements PromiseLike<T> {
   #detachExternalSignal: (() => void) | undefined;
   #remoteCancel: Promise<void> | undefined;
 
+  /** @internal */
   constructor(driver: JobDriver<T>) {
     this.#cancelRemote = driver.cancelRemote;
     this.#timeoutMs = driver.timeoutMs;
@@ -494,6 +499,8 @@ export class AsyncJob<T> implements PromiseLike<T> {
  * });
  * const { meta } = await job;
  * ```
+ *
+ * @internal
  */
 export function runJob<T>(http: HttpClient, opts: RunJobOptions<T>): AsyncJob<T> {
   const cancelPath = opts.cancelPath ?? defaultCancelPath;
@@ -515,6 +522,8 @@ export function runJob<T>(http: HttpClient, opts: RunJobOptions<T>): AsyncJob<T>
  *
  * @param status - A status body, normally the terminal one.
  * @param jobId - The job the timing describes; defaults to the body's own `jobId`.
+ *
+ * @internal
  */
 export function parseTimings(status: JobStatusLike, jobId: string = status.jobId ?? ''): JobMeta {
   const createdAt = parseWireDate(status.createdDate);

@@ -51,8 +51,8 @@ export interface ClientCredentials {
   /**
    * A single comma-joined scope string, e.g. `'openid,AdobeID,firefly_api,ff_apis'`
    * — `ServerToServerTokenProvider` (and the `ims/token/v3` endpoint it calls)
-   * takes scopes this way, not as an array. Defaults to {@link DEFAULT_SCOPE}
-   * when omitted.
+   * takes scopes this way, not as an array. Defaults to
+   * `openid,AdobeID,firefly_api,ff_apis` when omitted.
    */
   scope?: string;
 }
@@ -60,6 +60,8 @@ export interface ClientCredentials {
 /**
  * The default IMS scope set this SDK's audio/video (DGR) endpoints require,
  * as one comma-joined string.
+ *
+ * @internal
  */
 export const DEFAULT_SCOPE = 'openid,AdobeID,firefly_api,ff_apis';
 
@@ -74,6 +76,8 @@ export const DEFAULT_SCOPE = 'openid,AdobeID,firefly_api,ff_apis';
  * {@link ClientCredentialsProviderOptions.tokenTtlMs} if a given
  * integration's actual token lifetime differs and its tokens are not
  * decodable JWTs.
+ *
+ * @internal
  */
 export const DEFAULT_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -86,7 +90,7 @@ const DEFAULT_REFRESH_MARGIN_MS = 60_000;
 export interface ClientCredentialsProviderOptions {
   /**
    * How long a minted token is assumed valid, in milliseconds, before this
-   * provider re-mints. Defaults to {@link DEFAULT_TOKEN_TTL_MS}.
+   * provider re-mints. Defaults to 24 hours.
    */
   tokenTtlMs?: number;
   /**
@@ -121,7 +125,7 @@ export interface ClientCredentialsProviderOptions {
  * used as the assumed expiry when present and numeric — the wrapped
  * provider's silence about `expires_in` (above) turns out not to matter,
  * because this class reads the same fact directly off the wire format. The
- * configured TTL ({@link DEFAULT_TOKEN_TTL_MS} unless overridden via
+ * configured TTL (24 hours unless overridden via
  * {@link ClientCredentialsProviderOptions.tokenTtlMs}) is only a fallback for
  * a token that is not a decodable JWT, or has no `exp` claim; the decode
  * never throws, so a malformed or opaque token degrades to that fallback
@@ -248,6 +252,8 @@ function decodeJwtExpiryMs(token: string): number | undefined {
  * @param input - A {@link TokenProvider} or {@link ClientCredentials}.
  * @returns `input` unchanged if it is already a {@link TokenProvider},
  *   otherwise a new {@link ClientCredentialsProvider} built from it.
+ *
+ * @internal
  */
 export function resolveTokenProvider(input: TokenProvider | ClientCredentials): TokenProvider {
   return isTokenProvider(input) ? input : new ClientCredentialsProvider(input);

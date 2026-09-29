@@ -12,10 +12,10 @@ import type { TokenProvider } from './auth.js';
 import { AudioVideoError } from './errors.js';
 import { redactUrl } from './redact.js';
 
-/** The default host every {@link HttpClient} targets unless {@link HttpClientOptions.host} overrides it. */
+/** @internal The default host every {@link HttpClient} targets unless {@link HttpClientOptions.host} overrides it. */
 export const DEFAULT_HOST = 'https://audio-video-api.adobe.io';
 
-/** The default {@link HttpClientOptions.maxRetries} — how many 429 backoff retries a request gets. */
+/** @internal The default {@link HttpClientOptions.maxRetries} — how many 429 backoff retries a request gets. */
 export const DEFAULT_MAX_RETRIES = 5;
 
 /** Per-attempt request budget, enforced via `AbortSignal.timeout`. Not currently configurable. */
@@ -27,11 +27,11 @@ const BASE_BACKOFF_MS = 1_000;
 /** The hard ceiling on any computed backoff delay, honored or exponential. */
 const MAX_BACKOFF_MS = 60_000;
 
-/** The HTTP verbs this SDK's capabilities issue. Generic across every audio-video endpoint family. */
+/** @internal The HTTP verbs this SDK's capabilities issue. Generic across every audio-video endpoint family. */
 export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 
 /**
- * Construction options for {@link HttpClient}.
+ * @internal Construction options for {@link HttpClient}.
  */
 export interface HttpClientOptions {
   /** Base host relative paths resolve against. Defaults to {@link DEFAULT_HOST}. */
@@ -45,7 +45,7 @@ export interface HttpClientOptions {
 }
 
 /**
- * Per-call options for {@link HttpClient.request}.
+ * @internal Per-call options for {@link HttpClient.request}.
  */
 export interface HttpRequestInit {
   /**
@@ -64,7 +64,7 @@ export interface HttpRequestInit {
 }
 
 /**
- * The shape every successful {@link HttpClient.request} call resolves with.
+ * @internal The shape every successful {@link HttpClient.request} call resolves with.
  */
 export interface HttpResponse<T> {
   /** The HTTP status code of the (eventually) successful response. */
@@ -87,6 +87,8 @@ export interface HttpResponse<T> {
  * for them, not logged or thrown, so nothing has "left" the SDK in the sense
  * {@link redactUrl}/`redactValue` guard against. A thrown {@link AudioVideoError}
  * IS always redacted (see {@link HttpClient.request}'s `@throws`).
+ *
+ * @internal
  */
 export class HttpClient {
   readonly #host: string;

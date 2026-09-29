@@ -1,7 +1,7 @@
 /**
  * The SDK's single typed error, {@link AudioVideoError} — every rejection or throw
  * this package produces is one of these. Every field a caller might observe is
- * redacted at construction time via {@link redactValue} (./redact.ts): there is
+ * redacted at construction time by the SDK's single redaction pass: there is
  * no unredacted form of this error to accidentally log or display.
  */
 
@@ -63,7 +63,7 @@ export interface AudioVideoErrorJSON {
  * `.cause` is the one field kept exactly as given, for programmatic inspection
  * (`err.cause`), and it is deliberately excluded from all three serialized forms
  * above rather than redacted — an arbitrary third-party cause object cannot be
- * walked and reconstructed by {@link redactValue} without risking corrupting a
+ * walked and reconstructed by the redaction pass without risking corrupting a
  * shape (a real `Error`, a platform exception) this SDK does not own.
  *
  * @example
@@ -131,7 +131,7 @@ export class AudioVideoError extends Error {
   /**
    * Backs `util.inspect(err)` / `console.log(err)` — `Symbol.for('nodejs.util.inspect.custom')`
    * is the same well-known symbol Node exposes as `util.inspect.custom`. Returns
-   * the same redacted shape as {@link toJSON} rather than letting the default
+   * the same redacted shape as {@link AudioVideoError.toJSON} rather than letting the default
    * `Error` inspection run, which would print the redacted `.message` alongside
    * the raw stack, cause, and every other own-enumerable property, unredacted.
    */

@@ -61,8 +61,8 @@ export interface LogRecord {
 }
 
 /**
- * A log sink. The SDK calls `log` once per record with a record that has already
- * passed through {@link redactValue}, and catches anything `log` throws, so a
+ * A log sink. The SDK calls `log` once per record with a record its single
+ * redaction pass has already scrubbed, and catches anything `log` throws, so a
  * sink neither sees a secret nor breaks the call being logged. Any object with
  * this shape works: the built-in {@link stdoutJsonLogger} and
  * {@link rotatingFileLogger}, or an adapter over pino, winston, or a custom
@@ -109,10 +109,10 @@ export interface StdoutJsonLoggerOptions {
  * queue, or worker thread of its own in between. A record below `opts.minLevel`
  * is dropped before the stream is touched at all.
  *
- * Writes the record exactly as given — this sink does not redact. The SDK's
- * own calls always reach it through {@link emit}, which redacts first; a
- * consumer calling `.log()` directly with its own record is responsible for
- * not putting a secret in one.
+ * Writes the record exactly as given — this sink does not redact. Every record
+ * the SDK itself logs is redacted before it reaches a sink; a consumer calling
+ * `.log()` directly with its own record is responsible for not putting a
+ * secret in one.
  *
  * @param opts - See {@link StdoutJsonLoggerOptions}.
  * @returns A logger bound to `opts.stream`.
@@ -175,10 +175,10 @@ export interface RotatingFileLoggerOptions {
  * record below `opts.minLevel` is dropped before the file is touched at all — a
  * logger that never sees a qualifying record never creates its file.
  *
- * Writes the record exactly as given — this sink does not redact. The SDK's
- * own calls always reach it through {@link emit}, which redacts first; a
- * consumer calling `.log()` directly with its own record is responsible for
- * not putting a secret in one.
+ * Writes the record exactly as given — this sink does not redact. Every record
+ * the SDK itself logs is redacted before it reaches a sink; a consumer calling
+ * `.log()` directly with its own record is responsible for not putting a
+ * secret in one.
  *
  * @param opts - See {@link RotatingFileLoggerOptions}.
  * @returns A logger bound to `opts.path`.
@@ -305,6 +305,8 @@ function isLoggerLike(value: unknown): value is Logger {
  * ```
  *
  * @throws {@link AudioVideoError} `code: 'invalid_argument'` for an unrecognized option.
+ *
+ * @internal
  */
 export function resolveLogger(opt: LoggingOption): Logger | null {
   if (opt === false) return null;
@@ -320,7 +322,7 @@ export function resolveLogger(opt: LoggingOption): Logger | null {
 }
 
 /**
- * What a capability knows when a call settles — the input to {@link buildLogRecord}.
+ * @internal What a capability knows when a call settles — the input to {@link buildLogRecord}.
  */
 export interface BuildLogRecordInput {
   /** Defaults to `'error'` when `error` is set, else `'info'`. */
@@ -370,6 +372,8 @@ export interface BuildLogRecordInput {
  *   }),
  * );
  * ```
+ *
+ * @internal
  */
 export function buildLogRecord(input: BuildLogRecordInput): LogRecord {
   const record: LogRecord = {
@@ -445,6 +449,8 @@ function renderError(error: unknown): string {
  *
  * @param logger - The sink from {@link resolveLogger}, or `null` when logging is off.
  * @param record - The record to write; see {@link buildLogRecord}.
+ *
+ * @internal
  */
 export function emit(logger: Logger | null, record: LogRecord): void {
   if (!logger) return;

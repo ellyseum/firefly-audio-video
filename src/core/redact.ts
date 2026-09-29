@@ -94,6 +94,8 @@ function stripSecretParamsFromRawString(u: string): string {
  * redactUrl('https://x.blob.core.windows.net/f?sv=2021&sig=SECRET&se=2026&rest=keep');
  * // -> 'https://x.blob.core.windows.net/f?rest=keep'
  * ```
+ *
+ * @internal
  */
 export function redactUrl(u: string): string {
   try {
@@ -131,6 +133,8 @@ const HEADER_SECRET_KEY_RE = /authorization|x-api-key|api-key|cookie|token|secre
  * redactHeaders({ Authorization: 'Bearer T', 'content-type': 'application/json' });
  * // -> { Authorization: 'REDACTED', 'content-type': 'application/json' }
  * ```
+ *
+ * @internal
  */
 export function redactHeaders(headers: Record<string, string>): Record<string, string> {
   const out: Record<string, string> = {};
@@ -198,9 +202,13 @@ function redactValueInner(value: unknown, seen: WeakSet<object>): unknown {
  * redactValue({ statusUrl: 'https://x/s?sig=SECRET', n: 1 });
  * // -> { statusUrl: 'https://x/s', n: 1 }
  * ```
+ *
+ * @internal
  */
 export function redactValue(value: string): string;
+/** @internal */
 export function redactValue(value: unknown[]): unknown[];
+/** @internal */
 export function redactValue(value: unknown): unknown;
 export function redactValue(value: unknown): unknown {
   return redactValueInner(value, new WeakSet());

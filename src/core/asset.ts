@@ -1,9 +1,8 @@
 /**
- * The capability-neutral handle every audio-video output resolves to: today a
- * finished DGR render, later any other capability's finished asset. Wraps a
- * presigned read URL with the ways of consuming it — free URL access, an
- * in-memory buffer, a pipeable stream, or a direct-to-disk save — plus the
- * timing derived from the job that produced it.
+ * The capability-neutral handle every audio-video output resolves to, whatever
+ * capability produced it. Wraps a presigned read URL with the ways of
+ * consuming it — free URL access, an in-memory buffer, a pipeable stream, or a
+ * direct-to-disk save — plus the timing derived from the job that produced it.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -58,19 +57,19 @@ export interface AssetJSON {
 
 /**
  * A finished audio-video output: a presigned read URL plus every way of
- * consuming it. `.url` is free — nothing is fetched until {@link buffer},
- * {@link stream}, or {@link save} is called, and each of those issues its own
+ * consuming it. `.url` is free — nothing is fetched until {@link Asset.buffer},
+ * {@link Asset.stream}, or {@link Asset.save} is called, and each of those issues its own
  * request rather than sharing one response across calls.
  *
  * `.url` is deliberately unredacted — it is the working handle a caller passes
  * to `fetch`, a download manager, or another service, and redacting it would
  * make it useless for that. Redaction applies everywhere this asset might
- * instead be *logged or displayed*: {@link toJSON}, {@link toString}, and
+ * instead be *logged or displayed*: {@link Asset.toJSON}, {@link Asset.toString}, and
  * `console.log` (via the `util.inspect` custom hook) all report a scrubbed URL.
  *
  * @example
  * ```ts
- * const asset = await av.render(spec);
+ * const asset = await render(spec);
  * asset.url;                      // presigned read URL — free, nothing downloaded
  * await asset.buffer();           // in memory (small files)
  * asset.stream();                 // Node Readable, pipe anywhere
@@ -106,8 +105,8 @@ export class Asset {
 
   /**
    * Fetches the whole asset into memory. Fine for small files; a large render
-   * (a multi-gigabyte ProRes master, say) should use {@link stream} or
-   * {@link save} instead, neither of which buffers the full body.
+   * (a multi-gigabyte ProRes master, say) should use {@link Asset.stream} or
+   * {@link Asset.save} instead, neither of which buffers the full body.
    *
    * @param options - See {@link AssetReadOptions}.
    * @returns The asset's bytes.
@@ -136,7 +135,7 @@ export class Asset {
    * so a `stream()` call that is never consumed issues no request at all. A
    * fetch failure — a non-2xx response, a malformed URL, a DNS failure, a
    * reset mid-download, an abort — surfaces as an `'error'` event carrying
-   * the same {@link AudioVideoError} {@link buffer} would throw, never as an
+   * the same {@link AudioVideoError} {@link Asset.buffer} would throw, never as an
    * unhandled rejection.
    *
    * @param options - See {@link AssetReadOptions}.
@@ -152,7 +151,7 @@ export class Asset {
    * disk as they arrive over the network, not after the response completes. A
    * fetch failure — a non-2xx response, a malformed URL, a DNS failure, a
    * reset mid-download, an abort — rejects with the same
-   * {@link AudioVideoError} {@link buffer} would throw. The download lands
+   * {@link AudioVideoError} {@link Asset.buffer} would throw. The download lands
    * in a temporary file beside `path` first and is moved into place with a
    * single rename once it completes; on any failure — the response status,
    * a transport error, an abort, or a write/rename error — the temp file is
@@ -182,7 +181,7 @@ export class Asset {
     return { url: redactUrl(this.#url), meta: this.meta };
   }
 
-  /** The same redacted shape as {@link toJSON}, serialized. */
+  /** The same redacted shape as {@link Asset.toJSON}, serialized. */
   toString(): string {
     return JSON.stringify(this.toJSON());
   }
@@ -191,7 +190,7 @@ export class Asset {
    * Backs `util.inspect(asset)` / `console.log(asset)` —
    * `Symbol.for('nodejs.util.inspect.custom')` is the same well-known symbol
    * Node exposes as `util.inspect.custom`. Returns the same redacted shape as
-   * {@link toJSON} rather than letting the default object inspection run,
+   * {@link Asset.toJSON} rather than letting the default object inspection run,
    * which would print `.url` — and any SAS/SigV4 signature it carries — in full.
    */
   [Symbol.for('nodejs.util.inspect.custom')](): AssetJSON {
@@ -229,16 +228,16 @@ export class Asset {
   }
 
   /**
-   * The async generator {@link stream} wraps in `Readable.from`, and
-   * {@link buffer} drains directly. Its body does not run until the
-   * returned iterator's first pull, which is what makes {@link stream} lazy:
+   * The async generator {@link Asset.stream} wraps in `Readable.from`, and
+   * {@link Asset.buffer} drains directly. Its body does not run until the
+   * returned iterator's first pull, which is what makes {@link Asset.stream} lazy:
    * fetching and status-checking happen here, on first read, rather than
    * when `stream()` is called. `signal` destroys the body the moment it
    * fires, releasing the connection instead of waiting for the caller to
    * notice. A rejection thrown from here — the fetch itself failing, the
    * non-2xx check inside {@link #fetchOk}, or a failure (including an abort)
    * reading the body below — is turned by `Readable.from` into an `'error'`
-   * event on the stream {@link stream} returns, never an unhandled rejection.
+   * event on the stream {@link Asset.stream} returns, never an unhandled rejection.
    */
   async *#streamChunks(signal?: AbortSignal): AsyncGenerator<Buffer> {
     const res = await this.#fetchOk(signal);
@@ -326,13 +325,14 @@ function sanitizeTransportError(err: unknown, rawUrl: string): Error {
 }
 
 /**
- * The way {@link resolveAsset} should hand back a render's finished output:
- * the {@link Asset} handle itself (`undefined`), its presigned URL, an
- * in-memory buffer, a pipeable stream, or the path it was saved to on disk.
+ * How `render()` hands back a finished output in place of its {@link Asset}
+ * (its `resolveAs` option): `'url'` the presigned read URL, `'buffer'` the
+ * bytes in memory, `'stream'` a pipeable byte stream, `'file'` the path the
+ * output was saved to on disk.
  */
 export type ResolveAs = 'url' | 'buffer' | 'stream' | 'file';
 
-/** Options for {@link resolveAsset}. */
+/** @internal Options for {@link resolveAsset}. */
 export interface ResolveAssetOptions {
   /** See {@link ResolveAs}; `undefined` returns the {@link Asset} itself. */
   resolveAs?: ResolveAs;
@@ -366,32 +366,34 @@ export interface ResolveAssetOptions {
  * ```ts
  * const path = await resolveAsset(asset, { resolveAs: 'file', savePath: './out.mov' }); // -> './out.mov'
  * ```
+ *
+ * @internal
  */
 export function resolveAsset(
   asset: Asset,
   options?: ResolveAssetOptions & { resolveAs?: undefined },
 ): Promise<Asset>;
-/** Resolves with the asset's presigned read URL; nothing is downloaded. */
+/** @internal Resolves with the asset's presigned read URL; nothing is downloaded. */
 export function resolveAsset(
   asset: Asset,
   options: ResolveAssetOptions & { resolveAs: 'url' },
 ): Promise<string>;
-/** Reads the whole asset into memory. */
+/** @internal Reads the whole asset into memory. */
 export function resolveAsset(
   asset: Asset,
   options: ResolveAssetOptions & { resolveAs: 'buffer' },
 ): Promise<Buffer>;
-/** Resolves with a lazy byte stream over the asset. */
+/** @internal Resolves with a lazy byte stream over the asset. */
 export function resolveAsset(
   asset: Asset,
   options: ResolveAssetOptions & { resolveAs: 'stream' },
 ): Promise<Readable>;
-/** Saves the asset to `options.savePath` and resolves with that path. */
+/** @internal Saves the asset to `options.savePath` and resolves with that path. */
 export function resolveAsset(
   asset: Asset,
   options: ResolveAssetOptions & { resolveAs: 'file' },
 ): Promise<string>;
-/** With a `resolveAs` known only at run time, resolves with whichever form it names. */
+/** @internal With a `resolveAs` known only at run time, resolves with whichever form it names. */
 export function resolveAsset(
   asset: Asset,
   options?: ResolveAssetOptions,

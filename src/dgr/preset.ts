@@ -50,7 +50,7 @@ export type ResizeTarget = AspectRatio | ResolutionString;
  */
 export type PresetInput = Preset | EncodeConfig | PresetName | (string & NonNullable<unknown>);
 
-/** Hooks {@link resolvePreset} calls at render time. */
+/** @internal Hooks {@link resolvePreset} calls at render time. */
 export interface ResolvePresetContext {
   /** Uploads `.epr` XML and resolves with a URL DGR can read it from. */
   stage: (xml: string) => Promise<string>;
@@ -206,7 +206,7 @@ export class Preset extends NamedAccessorBase {
     return presetFrom({ kind: 'config', config: freezeConfig(merged as Partial<EncodeConfig>) });
   }
 
-  /** The same as {@link with}. */
+  /** The same as {@link Preset.with}. */
   extend(overrides: Partial<EncodeConfig>): Preset {
     return this.with(overrides);
   }
@@ -252,14 +252,14 @@ export class Preset extends NamedAccessorBase {
     };
   }
 
-  /** {@link toJSON}, serialized. */
+  /** {@link Preset.toJSON}, serialized. */
   toString(): string {
     return JSON.stringify(this.toJSON());
   }
 
   /**
    * Backs `util.inspect(preset)` / `console.log(preset)` — the same shape as
-   * {@link toJSON}. `Symbol.for('nodejs.util.inspect.custom')` is the symbol
+   * {@link Preset.toJSON}. `Symbol.for('nodejs.util.inspect.custom')` is the symbol
    * Node exposes as `util.inspect.custom`.
    */
   [Symbol.for('nodejs.util.inspect.custom')](): PresetJSON {
@@ -458,6 +458,8 @@ async function stageXml(ctx: ResolvePresetContext, xml: string): Promise<string>
  *   has no codec or asks for something its codec cannot produce;
  *   `code: 'invalid_argument'` when `preset` is not a `Preset` or `stage`
  *   resolves with something other than a URL string.
+ *
+ * @internal
  */
 export async function resolvePreset(preset: Preset, ctx: ResolvePresetContext): Promise<PresetRef> {
   if (!(preset instanceof Preset)) {

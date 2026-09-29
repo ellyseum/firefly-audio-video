@@ -450,9 +450,9 @@ function refusedError(imsError: string | undefined): AudioVideoError {
  * payload segment does not decode to a JSON object, or whose claims give no
  * expiry by either rule. Never throws: an opaque, non-JWT access token — or
  * a malformed one — is a legitimate shape this SDK must tolerate, not an
- * error; `ClientCredentialsProvider`'s `#mint` falls back to its configured
- * TTL ({@link DEFAULT_TOKEN_TTL_MS} by default) whenever this returns
- * `undefined`.
+ * error; `ClientCredentialsProvider`'s `#exchange` falls back to its
+ * configured TTL ({@link DEFAULT_TOKEN_TTL_MS} by default) whenever this
+ * returns `undefined`.
  *
  * @param token - The raw access token, as returned by `authenticate()`.
  * @returns The claimed expiry in epoch milliseconds, or `undefined`.

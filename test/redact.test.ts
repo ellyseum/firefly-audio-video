@@ -435,6 +435,21 @@ test('AudioVideoError: util.inspect prints neither a secret-bearing cause nor th
   expect(printed).toContain('request_failed');
 });
 
+test('AudioVideoError: a subclass instance is instanceof the subclass, AudioVideoError and Error', () => {
+  class RenderQuotaError extends AudioVideoError {
+    retryLater(): boolean {
+      return this.code === 'render_quota';
+    }
+  }
+
+  const err = new RenderQuotaError({ message: 'quota reached', code: 'render_quota' });
+
+  expect(err).toBeInstanceOf(RenderQuotaError);
+  expect(err).toBeInstanceOf(AudioVideoError);
+  expect(err).toBeInstanceOf(Error);
+  expect(err.retryLater()).toBe(true);
+});
+
 test('AudioVideoError: .code defaults to a stable value when omitted', () => {
   const err = new AudioVideoError({ message: 'boom' });
   expect(err.code).toBe('audio_video_error');

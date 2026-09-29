@@ -92,11 +92,10 @@ export class AudioVideoError extends Error {
   constructor(options: AudioVideoErrorOptions) {
     super(redactValue(options.message), { cause: options.cause });
 
-    // TypeScript/tsup compile a class extending a built-in to native ES2022 `class`
-    // syntax today, which keeps the prototype chain intact on its own — this line
-    // is a defensive no-op under that target, and the fix if a future build target
-    // ever downlevels `class` (e.g. to ES5) and silently breaks `instanceof` again.
-    Object.setPrototypeOf(this, AudioVideoError.prototype);
+    // The prototype of the class actually being constructed — this one or a
+    // subclass — so `instanceof` holds for both even under a build target that
+    // downlevels `class` syntax, where the built-in `Error` constructor resets it.
+    Object.setPrototypeOf(this, new.target.prototype);
 
     this.name = 'AudioVideoError';
     this.code = options.code ?? 'audio_video_error';

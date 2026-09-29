@@ -78,6 +78,20 @@ function resettingBody(chunks: readonly Uint8Array[], error: Error): ReadableStr
   });
 }
 
+/** A `ReadableStream` that never closes on its own, for enqueuing chunks and aborting mid-read in a test. */
+function controllableBody(): {
+  body: ReadableStream<Uint8Array>;
+  controller: ReadableStreamDefaultController<Uint8Array>;
+} {
+  let controller!: ReadableStreamDefaultController<Uint8Array>;
+  const body = new ReadableStream<Uint8Array>({
+    start(c) {
+      controller = c;
+    },
+  });
+  return { body, controller };
+}
+
 /** The single `*.partial` temp file `save()` is currently writing beside `destPath`, if any. */
 function findTempFile(dir: string, destBaseName: string): string | undefined {
   return readdirSync(dir).find(
@@ -491,6 +505,191 @@ test('a malformed URL makes stream() emit asset_fetch_failed, with the secret ab
   }
 });
 
+// --- cancellation via AbortSignal ------------------------------------------------------
+
+test('a pre-aborted signal makes buffer() reject cancelled without calling fetch', async () => {
+  let fetchCalls = 0;
+  const asset = new Asset({
+    url: 'https://x/out.mov',
+    meta: sampleMeta(),
+    fetch: async () => {
+      fetchCalls += 1;
+      return fakeResponse('data');
+    },
+  });
+  const controller = new AbortController();
+  controller.abort(new Error('pre-aborted'));
+
+  const err = await asset.buffer({ signal: controller.signal }).catch((e: unknown) => e);
+
+  expect(err).toBeInstanceOf(AudioVideoError);
+  expect((err as AudioVideoError).code).toBe('cancelled');
+  expect(fetchCalls).toBe(0);
+});
+
+test('a pre-aborted signal makes stream() emit cancelled without calling fetch', async () => {
+  let fetchCalls = 0;
+  const asset = new Asset({
+    url: 'https://x/out.mov',
+    meta: sampleMeta(),
+    fetch: async () => {
+      fetchCalls += 1;
+      return fakeResponse('data');
+    },
+  });
+  const controller = new AbortController();
+  controller.abort(new Error('pre-aborted'));
+
+  const stream = asset.stream({ signal: controller.signal });
+  const errorEvent = new Promise<AudioVideoError>((resolve) => {
+    stream.once('error', (err: AudioVideoError) => resolve(err));
+  });
+  stream.resume();
+
+  const err = await errorEvent;
+  expect(err).toBeInstanceOf(AudioVideoError);
+  expect(err.code).toBe('cancelled');
+  expect(fetchCalls).toBe(0);
+});
+
+test('a pre-aborted signal makes save() reject cancelled without calling fetch, leaving the destination absent', async () => {
+  let fetchCalls = 0;
+  const asset = new Asset({
+    url: 'https://x/out.bin',
+    meta: sampleMeta(),
+    fetch: async () => {
+      fetchCalls += 1;
+      return fakeResponse('data');
+    },
+  });
+  const controller = new AbortController();
+  controller.abort(new Error('pre-aborted'));
+  const dir = tempDir();
+  const path = join(dir, 'out.bin');
+
+  const err = await asset.save(path, { signal: controller.signal }).catch((e: unknown) => e);
+
+  expect(err).toBeInstanceOf(AudioVideoError);
+  expect((err as AudioVideoError).code).toBe('cancelled');
+  expect(fetchCalls).toBe(0);
+  expect(existsSync(path)).toBe(false);
+  expect(readdirSync(dir)).toEqual([]);
+});
+
+test('an abort mid-download makes buffer() reject cancelled', async () => {
+  const { body, controller } = controllableBody();
+  const asset = new Asset({
+    url: 'https://x/out.mov',
+    meta: sampleMeta(),
+    fetch: async () => fakeResponse(body),
+  });
+  const ac = new AbortController();
+
+  const bufferPromise = asset.buffer({ signal: ac.signal });
+  controller.enqueue(Buffer.from('partial'));
+  setTimeout(() => ac.abort(new Error('mid-download abort')), 20);
+
+  const err = await bufferPromise.catch((e: unknown) => e);
+  expect(err).toBeInstanceOf(AudioVideoError);
+  expect((err as AudioVideoError).code).toBe('cancelled');
+});
+
+test('an abort mid-download makes stream() emit cancelled', async () => {
+  const { body, controller } = controllableBody();
+  const asset = new Asset({
+    url: 'https://x/out.mov',
+    meta: sampleMeta(),
+    fetch: async () => fakeResponse(body),
+  });
+  const ac = new AbortController();
+
+  const stream = asset.stream({ signal: ac.signal });
+  const errorEvent = new Promise<AudioVideoError>((resolve) => {
+    stream.once('error', (err: AudioVideoError) => resolve(err));
+  });
+  stream.resume();
+  controller.enqueue(Buffer.from('partial'));
+  setTimeout(() => ac.abort(new Error('mid-download abort')), 20);
+
+  const err = await errorEvent;
+  expect(err).toBeInstanceOf(AudioVideoError);
+  expect(err.code).toBe('cancelled');
+});
+
+test('an abort mid-download makes save() reject cancelled, leaving the destination absent with no temp file left behind', async () => {
+  const { body, controller } = controllableBody();
+  const asset = new Asset({
+    url: 'https://x/out.bin',
+    meta: sampleMeta(),
+    fetch: async () => fakeResponse(body),
+  });
+  const ac = new AbortController();
+  const dir = tempDir();
+  const path = join(dir, 'out.bin');
+
+  const savePromise = asset.save(path, { signal: ac.signal });
+  controller.enqueue(Buffer.from('partial'));
+  setTimeout(() => ac.abort(new Error('mid-download abort')), 20);
+
+  const err = await savePromise.catch((e: unknown) => e);
+  expect(err).toBeInstanceOf(AudioVideoError);
+  expect((err as AudioVideoError).code).toBe('cancelled');
+  expect(existsSync(path)).toBe(false);
+  expect(readdirSync(dir)).toEqual([]);
+});
+
+test('a non-2xx response cancels the unread body before rejecting, releasing the connection', async () => {
+  let cancelCalls = 0;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(Buffer.from('forbidden body'));
+      // Deliberately never closes: if this response's body were drained
+      // rather than cancelled, awaiting it here would hang.
+    },
+    cancel() {
+      cancelCalls += 1;
+    },
+  });
+  const asset = new Asset({
+    url: 'https://x/out.mov',
+    meta: sampleMeta(),
+    fetch: async () => fakeResponse(body, 403),
+  });
+
+  const err = await asset.buffer().catch((e: unknown) => e);
+
+  expect(err).toBeInstanceOf(AudioVideoError);
+  expect((err as AudioVideoError).code).toBe('asset_fetch_failed');
+  expect(cancelCalls).toBe(1);
+});
+
+test('the signal reaches the underlying fetch call, so an abort while the fetch itself is still pending is honoured', async () => {
+  const asset = new Asset({
+    url: 'https://x/out.mov',
+    meta: sampleMeta(),
+    fetch: (_url, init) =>
+      new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (signal === undefined) {
+          reject(new Error('fetch was called without a signal'));
+          return;
+        }
+        // Never settles on its own — only reacting to the signal, so this
+        // proves the signal genuinely reached the fetch call rather than
+        // stopping at some earlier point.
+        signal.addEventListener('abort', () => reject(signal.reason as Error), { once: true });
+      }),
+  });
+  const controller = new AbortController();
+
+  const bufferPromise = asset.buffer({ signal: controller.signal });
+  setTimeout(() => controller.abort(new Error('abort while fetch is pending')), 20);
+
+  const err = await bufferPromise.catch((e: unknown) => e);
+  expect(err).toBeInstanceOf(AudioVideoError);
+  expect((err as AudioVideoError).code).toBe('cancelled');
+});
+
 // --- resolveAsset ----------------------------------------------------------------------
 
 test('resolveAsset(asset) with no mode returns the Asset itself', async () => {
@@ -498,35 +697,35 @@ test('resolveAsset(asset) with no mode returns the Asset itself', async () => {
   await expect(resolveAsset(asset)).resolves.toBe(asset);
 });
 
-test("resolveAsset(asset, 'url') returns the raw url", async () => {
+test("resolveAsset(asset, { resolveAs: 'url' }) returns the raw url", async () => {
   const asset = new Asset({ url: SAS_URL, meta: sampleMeta() });
-  await expect(resolveAsset(asset, 'url')).resolves.toBe(SAS_URL);
+  await expect(resolveAsset(asset, { resolveAs: 'url' })).resolves.toBe(SAS_URL);
 });
 
-test("resolveAsset(asset, 'buffer') returns the asset's bytes", async () => {
+test("resolveAsset(asset, { resolveAs: 'buffer' }) returns the asset's bytes", async () => {
   const asset = new Asset({
     url: 'https://x/out.mov',
     meta: sampleMeta(),
     fetch: async () => fakeResponse('payload'),
   });
-  const result = await resolveAsset(asset, 'buffer');
+  const result = await resolveAsset(asset, { resolveAs: 'buffer' });
   expect(Buffer.isBuffer(result)).toBe(true);
   expect((result as Buffer).equals(Buffer.from('payload'))).toBe(true);
 });
 
-test("resolveAsset(asset, 'stream') returns a Readable over the asset's bytes", async () => {
+test("resolveAsset(asset, { resolveAs: 'stream' }) returns a Readable over the asset's bytes", async () => {
   const asset = new Asset({
     url: 'https://x/out.mov',
     meta: sampleMeta(),
     fetch: async () => fakeResponse('payload'),
   });
-  const result = await resolveAsset(asset, 'stream');
+  const result = await resolveAsset(asset, { resolveAs: 'stream' });
   const sink = captureChunks();
   await pipeline(result as import('node:stream').Readable, sink.stream);
   expect(Buffer.concat(sink.chunks).toString()).toBe('payload');
 });
 
-test("resolveAsset(asset, 'file', path) saves and returns the path", async () => {
+test("resolveAsset(asset, { resolveAs: 'file', savePath }) saves and returns the path", async () => {
   const asset = new Asset({
     url: 'https://x/out.bin',
     meta: sampleMeta(),
@@ -535,20 +734,38 @@ test("resolveAsset(asset, 'file', path) saves and returns the path", async () =>
   const dir = tempDir();
   const path = join(dir, 'out.bin');
 
-  await expect(resolveAsset(asset, 'file', path)).resolves.toBe(path);
+  await expect(resolveAsset(asset, { resolveAs: 'file', savePath: path })).resolves.toBe(path);
   expect(readFileSync(path, 'utf8')).toBe('payload');
 });
 
-test("resolveAsset(asset, 'file') without a savePath throws a clear invalid_argument error", async () => {
+test("resolveAsset(asset, { resolveAs: 'file' }) without a savePath throws a clear invalid_argument error", async () => {
   const asset = new Asset({ url: 'https://x/out.mov', meta: sampleMeta() });
-  await expect(resolveAsset(asset, 'file')).rejects.toMatchObject({
+  await expect(resolveAsset(asset, { resolveAs: 'file' })).rejects.toMatchObject({
     code: 'invalid_argument',
   });
 });
 
 test('resolveAsset rejects an unrecognized resolveAs with invalid_argument', async () => {
   const asset = new Asset({ url: 'https://x/out.mov', meta: sampleMeta() });
-  await expect(resolveAsset(asset, 'bogus' as unknown as ResolveAs)).rejects.toMatchObject({
+  await expect(
+    resolveAsset(asset, { resolveAs: 'bogus' as unknown as ResolveAs }),
+  ).rejects.toMatchObject({
     code: 'invalid_argument',
   });
+});
+
+test("resolveAsset(asset, { resolveAs: 'buffer', signal }) forwards the signal to buffer()", async () => {
+  const asset = new Asset({
+    url: 'https://x/out.mov',
+    meta: sampleMeta(),
+    fetch: async () => fakeResponse('payload'),
+  });
+  const controller = new AbortController();
+  controller.abort(new Error('pre-aborted'));
+
+  const err = await resolveAsset(asset, { resolveAs: 'buffer', signal: controller.signal }).catch(
+    (e: unknown) => e,
+  );
+  expect(err).toBeInstanceOf(AudioVideoError);
+  expect((err as AudioVideoError).code).toBe('cancelled');
 });

@@ -4,6 +4,7 @@ import {
   ClientCredentialsProvider,
   DEFAULT_SCOPE,
   DEFAULT_TOKEN_TTL_MS,
+  MIN_TOKEN_REUSE_MS,
   resolveTokenProvider,
 } from '../src/core/auth.js';
 import { AudioVideoError } from '../src/core/errors.js';
@@ -248,6 +249,49 @@ test('exp, when present, decides the expiry over created_at and expires_in', asy
   // Past exp minus the default 60s margin, far inside created_at + expires_in (1h): re-mints.
   await vi.advanceTimersByTimeAsync(61_000);
   await expect(provider.getAccessToken()).resolves.toBe('TOKEN_2');
+  expect(ims.requests).toHaveLength(2);
+});
+
+test.each<[label: string, claims: (now: number) => Record<string, unknown>]>([
+  ['exp an hour in the past', (now) => ({ exp: Math.floor(now / 1000) - 3_600 })],
+  [
+    'created_at + expires_in an hour in the past',
+    (now) => imsClaims(String(now - 2 * HOUR_MS), String(HOUR_MS)),
+  ],
+  ['exp inside the refresh margin', (now) => ({ exp: Math.floor(now / 1000) + 30 })],
+])(
+  'a token with %s is reused for MIN_TOKEN_REUSE_MS, not re-minted on every call',
+  async (_label, claims) => {
+    useFakeClock();
+    const jwt = fakeJwt(claims(Date.now()));
+    ims.token(jwt);
+    ims.token('TOKEN_2');
+    const provider = new ClientCredentialsProvider(CREDS);
+
+    for (let call = 0; call < 5; call += 1) {
+      await expect(provider.getAccessToken()).resolves.toBe(jwt);
+    }
+    expect(ims.requests).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(MIN_TOKEN_REUSE_MS - 1);
+    await expect(provider.getAccessToken()).resolves.toBe(jwt);
+    expect(ims.requests).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(provider.getAccessToken()).resolves.toBe('TOKEN_2');
+    expect(ims.requests).toHaveLength(2);
+  },
+);
+
+test('forceRefresh mints at once even inside the minimum reuse window', async () => {
+  useFakeClock();
+  const expired = fakeJwt({ exp: Math.floor(Date.now() / 1000) - 3_600 });
+  ims.token(expired);
+  ims.token('TOKEN_2');
+  const provider = new ClientCredentialsProvider(CREDS);
+
+  await expect(provider.getAccessToken()).resolves.toBe(expired);
+  await expect(provider.getAccessToken({ forceRefresh: true })).resolves.toBe('TOKEN_2');
   expect(ims.requests).toHaveLength(2);
 });
 

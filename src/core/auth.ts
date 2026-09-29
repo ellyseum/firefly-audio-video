@@ -88,6 +88,16 @@ export const DEFAULT_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_REFRESH_MARGIN_MS = 60_000;
 
 /**
+ * The shortest time a freshly minted token is served from the cache,
+ * whatever its claims or the configured TTL say — so a token that arrives
+ * already expired, or inside the refresh margin, costs one IMS request per
+ * window rather than one per call.
+ *
+ * @internal
+ */
+export const MIN_TOKEN_REUSE_MS = 5_000;
+
+/**
  * Tuning knobs for {@link ClientCredentialsProvider}'s own token cache.
  */
 export interface ClientCredentialsProviderOptions {
@@ -99,6 +109,7 @@ export interface ClientCredentialsProviderOptions {
   /**
    * How long before the assumed expiry {@link ClientCredentialsProvider.getAccessToken}
    * re-mints rather than returning the cached token. Defaults to 60 seconds.
+   * A token is still served for at least 5 seconds after it arrives.
    */
   refreshMarginMs?: number;
 }
@@ -143,7 +154,11 @@ export interface ClientCredentialsProviderOptions {
  * malformed or opaque token degrades to that fallback rather than breaking
  * authentication. A token is re-minted
  * {@link ClientCredentialsProviderOptions.refreshMarginMs} (60 seconds by
- * default) before its expiry.
+ * default) before its expiry, but never sooner than 5 seconds after it
+ * arrived: a token that arrives already expired — a skewed clock, or a
+ * lifetime shorter than the margin — costs one IMS request per 5 seconds,
+ * not one per call. {@link GetAccessTokenOptions.forceRefresh} (which the
+ * HTTP client sends after a `401`) still mints at once.
  *
  * Concurrent calls while a mint is in flight share the same underlying
  * request rather than each triggering their own — including a
@@ -155,7 +170,7 @@ export class ClientCredentialsProvider implements TokenProvider {
   readonly #tokenTtlMs: number;
   readonly #refreshMarginMs: number;
   #cachedToken: string | undefined;
-  #expiresAt = 0;
+  #refreshAt = 0;
   #inflight: Promise<string> | undefined;
 
   /**
@@ -176,7 +191,8 @@ export class ClientCredentialsProvider implements TokenProvider {
    * Returns the cached access token, re-minting through the wrapped provider
    * only once the cache is within
    * {@link ClientCredentialsProviderOptions.refreshMarginMs} of its assumed
-   * expiry — or immediately, when {@link GetAccessTokenOptions.forceRefresh}
+   * expiry (and at least 5 seconds after the token arrived) — or
+   * immediately, when {@link GetAccessTokenOptions.forceRefresh}
    * is set. A mint already in flight (cache-driven or forced) is shared by
    * every concurrent caller rather than triggering a second one.
    *
@@ -190,11 +206,7 @@ export class ClientCredentialsProvider implements TokenProvider {
    *   serialized form of {@link AudioVideoError} by construction.
    */
   async getAccessToken(opts: GetAccessTokenOptions = {}): Promise<string> {
-    if (
-      !opts.forceRefresh &&
-      this.#cachedToken !== undefined &&
-      Date.now() < this.#expiresAt - this.#refreshMarginMs
-    ) {
+    if (!opts.forceRefresh && this.#cachedToken !== undefined && Date.now() < this.#refreshAt) {
       return this.#cachedToken;
     }
     if (!this.#inflight) {
@@ -212,9 +224,10 @@ export class ClientCredentialsProvider implements TokenProvider {
       if (typeof token !== 'string' || token === '') {
         throw refusedError(imsErrorCode(vendor, this.#details));
       }
-      const expiresAt = claimedExpiryMs(token) ?? Date.now() + this.#tokenTtlMs;
+      const arrivedAt = Date.now();
+      const expiresAt = claimedExpiryMs(token) ?? arrivedAt + this.#tokenTtlMs;
       this.#cachedToken = token;
-      this.#expiresAt = expiresAt;
+      this.#refreshAt = Math.max(expiresAt - this.#refreshMarginMs, arrivedAt + MIN_TOKEN_REUSE_MS);
       return token;
     } catch (cause) {
       if (cause instanceof AudioVideoError) throw cause;

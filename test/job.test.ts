@@ -5,7 +5,7 @@ import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import type { TokenProvider } from '../src/core/auth.js';
 import { AudioVideoError } from '../src/core/errors.js';
 import { DEFAULT_HOST, HttpClient } from '../src/core/http.js';
-import { AsyncJob, parseTimings, runJob } from '../src/core/job.js';
+import { AsyncJob, DEFAULT_MAX_POLL_FAILURES, parseTimings, runJob } from '../src/core/job.js';
 import type { JobStatusLike } from '../src/core/job.js';
 import type { JobStatusResponse } from '../src/dgr/types.js';
 
@@ -78,6 +78,45 @@ function cancelEndpoint(status = 200): () => number {
   return () => calls;
 }
 
+/** A status endpoint that always answers `status` with an error body; returns the poll count and the clock time of each poll. */
+function failingForever(status: number): { polls: () => number; times: number[] } {
+  const times: number[] = [];
+  pool()
+    .intercept({ path: STATUS_PATH, method: 'GET' })
+    .reply(status, () => {
+      times.push(Date.now());
+      return { error: `status ${status}` };
+    })
+    .persist();
+  return { polls: () => times.length, times };
+}
+
+/**
+ * A status endpoint answering a script in order — a number is that HTTP status with an error body,
+ * an object is a 200 body; a poll past the end of the script answers 500. Returns the poll count.
+ */
+function scriptedStatus(...script: Array<number | object>): () => number {
+  let polls = 0;
+  pool()
+    .intercept({ path: STATUS_PATH, method: 'GET' })
+    .reply(() => {
+      const step = script[polls] ?? 500;
+      polls += 1;
+      return typeof step === 'number'
+        ? { statusCode: step, data: { error: `status ${step}` } }
+        : { statusCode: 200, data: step };
+    })
+    .persist();
+  return () => polls;
+}
+
+/** A client whose GET calls are counted, whatever each one's outcome. */
+function countingHttp(): { client: HttpClient; gets: () => number } {
+  const client = http();
+  const request = vi.spyOn(client, 'request');
+  return { client, gets: () => request.mock.calls.filter(([method]) => method === 'GET').length };
+}
+
 /** An `onProgress` recorder whose `first` resolves on the first poll — a deterministic "the job is now polling" signal. */
 function progressGate(): {
   onProgress: (status: JobStatusLike) => void;
@@ -107,14 +146,19 @@ function rejectionOf(job: PromiseLike<unknown>): Promise<AudioVideoError | undef
   );
 }
 
-/** True iff `p` has NOT settled by the current microtask tick. */
+/** True iff `p` has NOT settled once its settlement handlers have had a few microtask turns to run. */
 async function isPending(p: PromiseLike<unknown>): Promise<boolean> {
-  const sentinel = Symbol('still-pending');
-  const settled = p.then(
-    () => 'settled',
-    () => 'settled',
+  let pending = true;
+  void p.then(
+    () => {
+      pending = false;
+    },
+    () => {
+      pending = false;
+    },
   );
-  return (await Promise.race([settled, Promise.resolve(sentinel)])) === sentinel;
+  for (let i = 0; i < 10; i += 1) await Promise.resolve();
+  return pending;
 }
 
 /** One real macrotask turn — for tests running on real timers only. */
@@ -657,32 +701,243 @@ test('timeoutMs → rejects job_timeout, stops polling, and issues no cancel req
 
 // --- request failures ----------------------------------------------------------------
 
-test('a rejected submit rejects the job with that same error; jobId and meta stay undefined', async () => {
+test('a rejected submit rejects the job with that same error, without a second submit; jobId and meta stay undefined', async () => {
   const failure = new AudioVideoError({
     message: 'Request failed with status 400.',
     code: 'http_400',
     status: 400,
   });
-  const job = runJob(http(), {
-    submit: () => Promise.reject(failure),
-    mapResult: () => 'unreached',
-  });
+  const submit = vi.fn(() => Promise.reject(failure));
+  const job = runJob(http(), { submit, mapResult: () => 'unreached' });
 
   expect(await rejectionOf(job)).toBe(failure);
+  expect(submit).toHaveBeenCalledTimes(1);
   expect(job.jobId).toBeUndefined();
   expect(job.meta).toBeUndefined();
   expect(inspect(job)).toBe("{ jobId: undefined, state: 'rejected' }");
 });
 
-test('a failing status poll rejects the job with the HTTP error', async () => {
-  pool().intercept({ path: STATUS_PATH, method: 'GET' }).reply(500, { error: 'boom' });
-  const job = runJob(http(), { submit: submitJ1, mapResult: () => 'unreached', pollIntervalMs: 0 });
+// --- transient status-poll failures ------------------------------------------------------
+
+test('a 503 on a poll is retried after 1 s, reporting no progress, and the job resolves once the next polls answer', async () => {
+  vi.useFakeTimers();
+  pool().intercept({ path: STATUS_PATH, method: 'GET' }).reply(503, { error: 'unavailable' });
+  statusReplies({ status: 'running' }, { status: 'completed' });
+  const { client, gets } = countingHttp();
+  const { onProgress, calls } = progressGate();
+  const job = runJob(client, { submit: submitJ1, mapResult: () => 'done', onProgress });
+
+  await vi.advanceTimersByTimeAsync(999);
+  expect(gets()).toBe(1);
+  expect(calls).toEqual([]);
+  expect(inspect(job)).toBe("{ jobId: 'j1', state: 'pending' }");
+
+  await vi.advanceTimersByTimeAsync(1); // the retry, at t = 1 s
+  expect(gets()).toBe(2);
+  expect(calls).toEqual([{ status: 'running' }]);
+
+  await vi.advanceTimersByTimeAsync(1_000); // the regular 1 s tier resumes
+  expect(await job).toBe('done');
+  expect(gets()).toBe(3);
+  expect(calls).toEqual([{ status: 'running' }, { status: 'completed' }]);
+  expect(agent.pendingInterceptors()).toHaveLength(0);
+});
+
+test('a transport error on a poll is retried and the job resolves once the next poll answers', async () => {
+  vi.useFakeTimers();
+  pool().intercept({ path: STATUS_PATH, method: 'GET' }).replyWithError(new Error('ECONNRESET'));
+  statusReplies({ status: 'completed' });
+  const { client, gets } = countingHttp();
+  const job = runJob(client, { submit: submitJ1, mapResult: () => 'done', pollIntervalMs: 0 });
+
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(await job).toBe('done');
+  expect(gets()).toBe(2);
+  expect(agent.pendingInterceptors()).toHaveLength(0);
+});
+
+test('five consecutive 503s exhaust the default budget → job_poll_failed carrying the last failure, with no cancel request', async () => {
+  vi.useFakeTimers();
+  const { polls } = failingForever(503);
+  const cancels = cancelEndpoint();
+  const job = runJob(http(), { submit: submitJ1, mapResult: () => 'unreached' });
+  const settled = rejectionOf(job);
+
+  await vi.advanceTimersByTimeAsync(15_000); // 1 + 2 + 4 + 8 s of backoff
+  expect(polls()).toBe(5);
+  expect(await isPending(job)).toBe(false);
+  const err = await settled;
+  expect(err).toBeInstanceOf(AudioVideoError);
+  expect(err?.code).toBe('job_poll_failed');
+  expect(err?.jobId).toBe('j1');
+  expect(err?.status).toBe(503);
+  expect(err?.items).toEqual([{ error: 'status 503' }]);
+  expect(err?.cause).toBeInstanceOf(AudioVideoError);
+  expect((err?.cause as AudioVideoError).code).toBe('http_503');
+  expect(err?.message).toContain('after 5 failed polls');
+  expect(err?.message).toContain('HTTP 503');
+  expect(err?.message).toContain('may still complete');
+  expect(inspect(job)).toBe("{ jobId: 'j1', state: 'rejected' }");
+
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(polls()).toBe(5);
+  expect(cancels()).toBe(0);
+});
+
+test.each([403, 404])(
+  'a %i on a poll is final: the job rejects with that HTTP error after exactly one request',
+  async (status) => {
+    const { polls } = failingForever(status);
+    const cancels = cancelEndpoint();
+    const job = runJob(http(), {
+      submit: submitJ1,
+      mapResult: () => 'unreached',
+      pollIntervalMs: 0,
+    });
+
+    const err = await rejectionOf(job);
+
+    expect(err).toBeInstanceOf(AudioVideoError);
+    expect(err?.code).toBe(`http_${status}`);
+    expect(err?.status).toBe(status);
+    expect(polls()).toBe(1);
+    expect(cancels()).toBe(0);
+    expect(inspect(job)).toBe("{ jobId: 'j1', state: 'rejected' }");
+  },
+);
+
+test('cancel() during a retry backoff rejects cancelled at once, issues the cancel request, and polls no further', async () => {
+  vi.useFakeTimers();
+  const { polls } = failingForever(503);
+  const cancels = cancelEndpoint();
+  const job = runJob(http(), { submit: submitJ1, mapResult: () => 'unreached' });
+
+  await vi.advanceTimersByTimeAsync(500);
+  expect(polls()).toBe(1);
+  expect(await isPending(job)).toBe(true);
+
+  await job.cancel();
+  const err = await rejectionOf(job);
+  expect(err?.code).toBe('cancelled');
+  expect(err?.jobId).toBe('j1');
+  expect(cancels()).toBe(1);
+
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(polls()).toBe(1);
+});
+
+test('timeoutMs elapsing during a retry backoff rejects job_timeout and polls no further', async () => {
+  vi.useFakeTimers();
+  const { polls } = failingForever(503);
+  const cancels = cancelEndpoint();
+  const job = runJob(http(), { submit: submitJ1, mapResult: () => 'unreached', timeoutMs: 500 });
+  const settled = rejectionOf(job);
+
+  await vi.advanceTimersByTimeAsync(499);
+  expect(polls()).toBe(1);
+  expect(await isPending(job)).toBe(true);
+
+  await vi.advanceTimersByTimeAsync(1);
+  const err = await settled;
+  expect(err?.code).toBe('job_timeout');
+  expect(err?.jobId).toBe('j1');
+
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(polls()).toBe(1);
+  expect(cancels()).toBe(0);
+});
+
+test('the failure budget counts consecutive failures only: six 503s each followed by a good poll still resolve', async () => {
+  vi.useFakeTimers();
+  const script: Array<number | object> = [];
+  for (let i = 0; i < 6; i += 1) script.push(503, { status: 'running' });
+  script.push({ status: 'completed' });
+  const polls = scriptedStatus(...script);
+  const job = runJob(http(), { submit: submitJ1, mapResult: () => 'done' });
+
+  await vi.advanceTimersByTimeAsync(12_000); // every wait is 1 s: the retry floor equals the 1 s tier
+  expect(await job).toBe('done');
+  expect(polls()).toBe(13);
+});
+
+test('retries wait 1 s, 2 s, 4 s, then 8 s between consecutive failed polls', async () => {
+  vi.useFakeTimers();
+  const { polls, times } = failingForever(503);
+  const job = runJob(http(), { submit: submitJ1, mapResult: () => 'unreached' });
+  const settled = rejectionOf(job);
+
+  await vi.advanceTimersByTimeAsync(15_000);
+  expect((await settled)?.code).toBe('job_poll_failed');
+  const start = times[0] ?? 0;
+  expect(times.map((t) => t - start)).toEqual([0, 1_000, 3_000, 7_000, 15_000]);
+  expect(polls()).toBe(5);
+});
+
+test('a retry never waits less than the poll interval due at that moment', async () => {
+  vi.useFakeTimers();
+  const { times } = failingForever(503);
+  const job = runJob(http(), {
+    submit: submitJ1,
+    mapResult: () => 'unreached',
+    pollIntervalMs: 3_000,
+  });
+  const settled = rejectionOf(job);
+
+  await vi.advanceTimersByTimeAsync(18_000);
+  expect((await settled)?.code).toBe('job_poll_failed');
+  const start = times[0] ?? 0;
+  expect(times.map((t) => t - start)).toEqual([0, 3_000, 6_000, 10_000, 18_000]);
+});
+
+test('a retry never waits more than 30 s', async () => {
+  vi.useFakeTimers();
+  const { times } = failingForever(503);
+  const job = runJob(http(), {
+    submit: submitJ1,
+    mapResult: () => 'unreached',
+    pollIntervalMs: 45_000,
+    maxPollFailures: 2,
+  });
+  const settled = rejectionOf(job);
+
+  await vi.advanceTimersByTimeAsync(30_000);
+  expect((await settled)?.code).toBe('job_poll_failed');
+  const start = times[0] ?? 0;
+  expect(times.map((t) => t - start)).toEqual([0, 30_000]);
+});
+
+test('maxPollFailures: 1 rejects job_poll_failed on the first failed poll, carrying that HTTP error', async () => {
+  const { polls } = failingForever(500);
+  const job = runJob(http(), {
+    submit: submitJ1,
+    mapResult: () => 'unreached',
+    pollIntervalMs: 0,
+    maxPollFailures: 1,
+  });
 
   const err = await rejectionOf(job);
 
-  expect(err?.code).toBe('http_500');
+  expect(err?.code).toBe('job_poll_failed');
   expect(err?.status).toBe(500);
+  expect(err?.jobId).toBe('j1');
+  expect((err?.cause as AudioVideoError).code).toBe('http_500');
+  expect(err?.message).toContain('after 1 failed poll (last failure: HTTP 500)');
+  expect(polls()).toBe(1);
 });
+
+test.each([0, -3, 2.5, Number.NaN])(
+  'maxPollFailures %p is not an integer of at least 1, so the default applies',
+  async (maxPollFailures) => {
+    vi.useFakeTimers();
+    const { polls } = failingForever(503);
+    const job = runJob(http(), { submit: submitJ1, mapResult: () => 'unreached', maxPollFailures });
+    const settled = rejectionOf(job);
+
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect((await settled)?.code).toBe('job_poll_failed');
+    expect(polls()).toBe(DEFAULT_MAX_POLL_FAILURES);
+  },
+);
 
 // --- inspectability + neutrality -------------------------------------------------------
 

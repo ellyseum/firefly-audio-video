@@ -2,16 +2,17 @@
  * The capability-neutral async job engine. A capability supplies a `submit` call
  * that answers `{ jobId, statusUrl }` and a `mapResult` for the terminal status
  * body; this module owns everything in between — polling the status URL on a
- * tiered interval, deciding when the job is terminal (including item-level
- * errors reported while `status` still reads `running`), deriving queue / render
- * / total timing, and cancellation — and hands the caller one {@link AsyncJob}
- * that is both awaitable and a handle. Nothing here knows what is being rendered,
- * transcribed, or generated: `core/` never imports from a capability module, and
- * every status body is read structurally through {@link JobStatusLike}.
+ * tiered interval, retrying transient poll failures, deciding when the job is
+ * terminal (including item-level errors reported while `status` still reads
+ * `running`), deriving queue / render / total timing, and cancellation — and
+ * hands the caller one {@link AsyncJob} that is both awaitable and a handle.
+ * Nothing here knows what is being rendered, transcribed, or generated: `core/`
+ * never imports from a capability module, and every status body is read
+ * structurally through {@link JobStatusLike}.
  */
 
 import { AudioVideoError } from './errors.js';
-import type { HttpClient } from './http.js';
+import type { HttpClient, HttpResponse } from './http.js';
 
 /** One `outputs[]` entry of a status body, reduced to the fields the engine reads. */
 export interface JobItemLike {
@@ -99,7 +100,8 @@ export interface RunJobOptions<T> {
   /**
    * Issues the capability's request and returns the accepted job's ID and status
    * URL. Receives the job's abort signal so a cancel during submission can abort
-   * the request itself.
+   * the request itself. Never retried: a failing submit rejects the job with the
+   * error it threw.
    */
   submit: (signal: AbortSignal) => Promise<JobSubmission>;
   /** Builds the job's result from a successful terminal status body and its derived timing. */
@@ -118,6 +120,20 @@ export interface RunJobOptions<T> {
    * produce a zero-delay poll loop.
    */
   pollIntervalMs?: PollInterval;
+  /**
+   * How many status polls may fail in a row before the job rejects
+   * `job_poll_failed`. A poll failure counts when the request fails in transit — a
+   * connection reset, a DNS failure, the per-attempt timeout — or answers `408`,
+   * `425`, `429`, `500`, `502`, `503` or `504`; a poll failing any other way (a
+   * `404`, say) rejects the job at once with that error, since repeating the
+   * request cannot change it. Every successful poll resets the count, and each
+   * retry waits 1 s, 2 s, 4 s, 8 s, … — never less than the poll interval due at
+   * that moment, never more than 30 s. Exhausting the budget does not ask the
+   * service to stop the job: it may still complete, and its ID is on the error.
+   * Defaults to {@link DEFAULT_MAX_POLL_FAILURES}; `1` gives up on the first failed
+   * poll. A value that is not an integer of at least 1 uses the default.
+   */
+  maxPollFailures?: number;
   /**
    * Overall budget, in milliseconds from the moment the job is started, for the
    * job to reach a terminal state; exceeding it rejects with `job_timeout`.
@@ -161,12 +177,31 @@ const ABORT_TIMEOUT: unique symbol = Symbol('AsyncJob.timeout');
 const MAX_TIMER_MS = 2_147_483_647;
 
 /**
+ * How many status polls may fail in a row before a job rejects `job_poll_failed`,
+ * unless {@link RunJobOptions.maxPollFailures} says otherwise.
+ */
+export const DEFAULT_MAX_POLL_FAILURES = 5;
+
+/**
+ * Response statuses a failed status poll is retried on. A failed response with
+ * any other status is final.
+ */
+const TRANSIENT_POLL_STATUSES: ReadonlySet<number> = new Set([408, 425, 429, 500, 502, 503, 504]);
+
+/** The wait before retrying a status poll that failed once; it doubles with each consecutive failure. */
+const POLL_RETRY_BASE_MS = 1_000;
+
+/** The longest wait before a retried status poll. */
+const POLL_RETRY_MAX_MS = 30_000;
+
+/**
  * A running asynchronous job: awaitable like a promise (`await job`, `job.then()`,
  * `Promise.all([job])`) and holdable as a handle (`job.jobId`, `job.meta`,
  * `job.cancel()`). It settles exactly once — with the capability's mapped result
  * when the job reaches a successful terminal state, or with an
- * {@link AudioVideoError} whose `code` is `job_failed`, `cancelled` or
- * `job_timeout` (or with the error a failing submit or status request threw).
+ * {@link AudioVideoError} whose `code` is `job_failed`, `job_poll_failed`,
+ * `cancelled` or `job_timeout` (or with the error a failing submit threw, or the
+ * error of a status poll whose failure is final — a `404`, say).
  *
  * `util.inspect` / `console.log` print only `{ jobId, state }` — never a URL or a
  * status body — so a job can be logged freely.
@@ -370,7 +405,14 @@ export class AsyncJob<T> implements PromiseLike<T> {
  * - rejects `cancelled` when the service reports the job cancelled, when
  *   {@link AsyncJob.cancel} is called, or when `opts.signal` aborts;
  * - rejects `job_timeout` when `opts.timeoutMs` elapses first;
- * - rejects with the submit or status request's own error if one of those fails.
+ * - rejects `job_poll_failed`, with the last failure as `cause`, once
+ *   `opts.maxPollFailures` status polls in a row have failed transiently (a
+ *   transport error, or a `408` / `425` / `429` / `500` / `502` / `503` / `504`
+ *   response) — each such failure is retried after a growing delay, and a
+ *   successful poll resets the count;
+ * - rejects at once with the request's own error when a status poll fails in any
+ *   other way (a `404`, say — the job is gone) or when the submit fails. The
+ *   submit is never retried.
  *
  * `job.meta` is populated from any terminal body, failed ones included. A status
  * body that is not a JSON object is treated as "not yet terminal" and polling
@@ -444,7 +486,12 @@ export function parseTimings(status: JobStatusLike, jobId: string = status.jobId
   };
 }
 
-/** Submits, then polls until terminal, throwing for every non-success outcome. */
+/**
+ * Submits, then polls until terminal, throwing for every non-success outcome. A
+ * status poll that fails transiently is retried after {@link pollRetryDelayMs},
+ * until `maxPollFailures` such failures occur in a row; any other poll failure,
+ * and a failed submit, is thrown as-is.
+ */
 async function pollUntilTerminal<T>(
   http: HttpClient,
   opts: RunJobOptions<T>,
@@ -452,16 +499,29 @@ async function pollUntilTerminal<T>(
 ): Promise<T> {
   const { signal } = ctx;
   const intervalFor = resolvePollInterval(opts.pollIntervalMs);
+  const maxPollFailures = resolveMaxPollFailures(opts.maxPollFailures);
   const startedAt = Date.now();
 
   signal.throwIfAborted();
   const { jobId, statusUrl } = await opts.submit(signal);
   ctx.setJobId(jobId);
 
+  let failedPolls = 0;
   for (;;) {
     signal.throwIfAborted();
-    const { body } = await http.request<unknown>('GET', statusUrl, undefined, { signal });
-    const status = asStatusBody(body);
+    let response: HttpResponse<unknown>;
+    try {
+      response = await http.request<unknown>('GET', statusUrl, undefined, { signal });
+    } catch (err) {
+      if (signal.aborted || !isTransientPollFailure(err)) throw err;
+      failedPolls += 1;
+      if (failedPolls >= maxPollFailures) throw pollFailedError(jobId, failedPolls, err);
+      await sleep(pollRetryDelayMs(failedPolls, intervalFor(Date.now() - startedAt)), signal);
+      continue;
+    }
+    failedPolls = 0;
+
+    const status = asStatusBody(response.body);
     opts.onProgress?.(status);
 
     if (isTerminal(status)) {
@@ -572,6 +632,66 @@ function resolvePollInterval(interval: PollInterval | undefined): (elapsedMs: nu
     const ms = chosen(elapsedMs);
     return Number.isFinite(ms) && ms >= 0 ? ms : defaultPollInterval(elapsedMs);
   };
+}
+
+/** The caller's `maxPollFailures` when it is an integer of at least 1, else {@link DEFAULT_MAX_POLL_FAILURES}. */
+function resolveMaxPollFailures(value: number | undefined): number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 1
+    ? value
+    : DEFAULT_MAX_POLL_FAILURES;
+}
+
+/**
+ * True for a status-poll failure worth retrying: a transport error (no response
+ * at all — a connection reset, a DNS failure, the per-attempt timeout), or a
+ * response whose status is in {@link TRANSIENT_POLL_STATUSES}. Any other failed
+ * response, and an error carrying no status, is final: repeating the request
+ * cannot change it.
+ */
+function isTransientPollFailure(err: unknown): boolean {
+  if (!(err instanceof AudioVideoError)) return true;
+  return err.status !== undefined && TRANSIENT_POLL_STATUSES.has(err.status);
+}
+
+/**
+ * The wait before retrying a failed status poll: {@link POLL_RETRY_BASE_MS}
+ * doubled per consecutive failure (1 s, 2 s, 4 s, 8 s, …), never shorter than the
+ * poll interval due at that moment and never longer than {@link POLL_RETRY_MAX_MS}.
+ */
+function pollRetryDelayMs(consecutiveFailures: number, pollIntervalMs: number): number {
+  const backoff = POLL_RETRY_BASE_MS * 2 ** (consecutiveFailures - 1);
+  return Math.min(POLL_RETRY_MAX_MS, Math.max(pollIntervalMs, backoff));
+}
+
+/**
+ * The error a job rejects with once `maxPollFailures` status polls in a row have
+ * failed. Carries the last failure as `cause` and, when that failure was an HTTP
+ * response, its status, request ID and body. The service is not asked to stop.
+ */
+function pollFailedError(jobId: string, failedPolls: number, last: unknown): AudioVideoError {
+  const response = last instanceof AudioVideoError ? last : undefined;
+  const polls = `${failedPolls} failed poll${failedPolls === 1 ? '' : 's'}`;
+  const failure = describeFailure(last);
+  return new AudioVideoError({
+    message:
+      `Job ${jobId} status could not be read after ${polls} (last failure: ${failure}); ` +
+      'the service was not asked to stop the job and it may still complete.',
+    code: 'job_poll_failed',
+    jobId,
+    status: response?.status,
+    requestId: response?.requestId,
+    items: response?.items,
+    cause: last,
+  });
+}
+
+/** Names a failed poll for a message: its HTTP status, or the error's name or message. */
+function describeFailure(err: unknown): string {
+  if (err instanceof AudioVideoError)
+    return err.status === undefined ? err.code : `HTTP ${err.status}`;
+  if (err instanceof DOMException) return err.name;
+  if (err instanceof Error) return err.message.length > 0 ? err.message : err.name;
+  return String(err);
 }
 
 /** The service's cancel endpoint for a job. */

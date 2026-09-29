@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, test } from 'vitest';
 import { AudioVideoError } from '../src/core/errors.js';
 import type { EncodeConfig } from '../src/dgr/schemas.js';
@@ -370,6 +372,102 @@ describe('parseEprHeadline', () => {
     expect(parseEprHeadline('<?xml version="1.0"?><other/>')).toEqual({});
     expect(() => parseEprHeadline(HEVC_BASE_EPR.slice(0, 5000))).not.toThrow();
     expect(parseEprHeadline(42 as unknown as string)).toEqual({});
+  });
+});
+
+/** Every proven `.epr` sample and the headline `parseEprHeadline` reads from it. */
+const FIXTURES_DIR = join(import.meta.dirname, 'fixtures', 'epr');
+
+const SAMPLES: readonly [file: string, expected: Partial<EncodeConfig>][] = [
+  [
+    '01 - Match Source - High Bitrate.epr',
+    { codec: 'hevc', matchSource: true, chroma: '420', bitrate: '7M' },
+  ],
+  [
+    '02 - Match Source - 2020.epr',
+    {
+      codec: 'hevc',
+      matchSource: true,
+      chroma: '420',
+      bitDepth: 10,
+      bitrate: '35M',
+      color: 'rec2020',
+    },
+  ],
+  [
+    '02 - Match Source - HLG.epr',
+    { codec: 'hevc', matchSource: true, chroma: '420', bitDepth: 10, bitrate: '35M', color: 'hlg' },
+  ],
+  [
+    '02 - Match Source - PQ.epr',
+    { codec: 'hevc', matchSource: true, chroma: '420', bitDepth: 10, bitrate: '35M', color: 'pq' },
+  ],
+  [
+    '4K UHD.epr',
+    { codec: 'hevc', resolution: '3840x2160', chroma: '420', bitDepth: 8, bitrate: '35M' },
+  ],
+  [
+    '8K UHD.epr',
+    {
+      codec: 'hevc',
+      resolution: '7680x4320',
+      frameRate: 29.97,
+      chroma: '420',
+      bitDepth: 8,
+      bitrate: '120M',
+    },
+  ],
+  [
+    'Apple ProRes 4444 XQ with alpha.epr',
+    { codec: 'prores4444xq', matchSource: true, chroma: '444', bitDepth: 12, alpha: true },
+  ],
+  [
+    'Apple ProRes 4444 XQ.epr',
+    { codec: 'prores4444xq', matchSource: true, chroma: '444', bitDepth: 12, alpha: false },
+  ],
+  [
+    'HD 1080p.epr',
+    { codec: 'hevc', resolution: '1920x1080', chroma: '420', bitDepth: 8, bitrate: '16M' },
+  ],
+  [
+    'HD 720p.epr',
+    { codec: 'hevc', resolution: '1280x720', chroma: '420', bitDepth: 8, bitrate: '4M' },
+  ],
+  [
+    'SD 480p Wide.epr',
+    { codec: 'hevc', resolution: '854x480', chroma: '420', bitDepth: 8, bitrate: '1.3M' },
+  ],
+  [
+    'SD 480p.epr',
+    { codec: 'hevc', resolution: '640x480', chroma: '420', bitDepth: 8, bitrate: '1.3M' },
+  ],
+];
+
+/** The fixture's own content, read fresh per test (no shared mutable state). */
+function sampleXml(file: string): string {
+  return readFileSync(join(FIXTURES_DIR, file), 'utf8');
+}
+
+describe('parseEprHeadline against every proven sample', () => {
+  test.each(SAMPLES)('%s', (file, expected) => {
+    expect(parseEprHeadline(sampleXml(file))).toEqual(expected);
+  });
+
+  test('the HEVC color map: 2020, HLG and PQ each read their own ADBEExportColorSpace value', () => {
+    for (const file of [
+      '02 - Match Source - 2020.epr',
+      '02 - Match Source - HLG.epr',
+      '02 - Match Source - PQ.epr',
+    ]) {
+      const expected = SAMPLES.find(([name]) => name === file)![1];
+      expect(parseEprHeadline(sampleXml(file)).color, file).toBe(expected.color);
+    }
+  });
+
+  test('a source-driven HEVC profile reports matchSource but no bitDepth', () => {
+    const headline = parseEprHeadline(sampleXml('01 - Match Source - High Bitrate.epr'));
+    expect(headline.matchSource).toBe(true);
+    expect(headline.bitDepth).toBeUndefined();
   });
 });
 

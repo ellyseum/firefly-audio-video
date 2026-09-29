@@ -11,6 +11,7 @@
 import * as z from 'zod';
 import { quoted } from '../presets/codecs.js';
 import { PRESET_NAMES } from '../presets/names.js';
+import type { PresetInput } from './preset.js';
 
 /** Quotes and joins allowed values for an error message: `'a', 'b' or 'c'`. */
 function oneOf(values: readonly (string | number)[]): string {
@@ -278,5 +279,53 @@ export const RenderSpecSchema = z.strictObject({
   outputs: z.array(RenderOutputSchema).min(1, 'at least one output is required'),
 });
 
-/** A friendly {@link RenderSpecSchema} input — the argument to `buildRenderBody` and `client.render()`. */
+/** A friendly {@link RenderSpecSchema} input — the argument to `buildRenderBody`, and a valid spec for `render()`. */
 export type RenderSpec = z.infer<typeof RenderSpecSchema>;
+
+/**
+ * One deliverable of a {@link RenderRequest}: a {@link RenderOutput} plus an
+ * optional `readUrl`, the URL the finished file is read back from. DGR writes
+ * to `destination`, and a presigned write URL usually cannot be read, so pass
+ * the read URL of the same object here. Without one, the asset's URL is
+ * `destination` itself, which works only when that URL also grants read access.
+ */
+export const RenderRequestOutputSchema = RenderOutputSchema.extend({
+  readUrl: z.string().min(1, 'readUrl must not be empty when provided').optional(),
+});
+
+/** A friendly {@link RenderRequestOutputSchema} input. */
+export type RenderRequestOutput = z.infer<typeof RenderRequestOutputSchema>;
+
+/**
+ * The spec `render()` takes: a {@link RenderSpec} whose `presets[]` entries may
+ * be any preset input — a `Preset`, an `EncodeConfig`, a catalog name, a DGR
+ * `presetId`, an `.epr` file path, raw `.epr` XML, an http(s) URL to a staged
+ * `.epr`, or a `{ presetId }` / `{ url }` reference — and whose outputs may
+ * carry a `readUrl`. Every preset is resolved, and every generated `.epr`
+ * staged through the client's storage, before the wire body is built.
+ *
+ * @example
+ * ```ts
+ * const spec: RenderRequest = {
+ *   source: 'https://example.com/capsule.mogrt?sig=…',
+ *   presets: [presets.hevc1080p10bit, 'h264Land1080pHq'],
+ *   outputs: [
+ *     { presetIndex: 0, destination: hevcWriteUrl, readUrl: hevcReadUrl },
+ *     { presetIndex: 1, destination: h264WriteUrl, readUrl: h264ReadUrl },
+ *   ],
+ * };
+ * ```
+ */
+export const RenderRequestSchema = RenderSpecSchema.extend({
+  presets: z
+    .array(
+      z.custom<PresetInput | PresetRef>((value) => value !== undefined && value !== null, {
+        error: 'a preset must not be null or undefined',
+      }),
+    )
+    .min(1, 'at least one preset is required'),
+  outputs: z.array(RenderRequestOutputSchema).min(1, 'at least one output is required'),
+});
+
+/** A friendly {@link RenderRequestSchema} input — the spec `render()` takes. */
+export type RenderRequest = z.infer<typeof RenderRequestSchema>;

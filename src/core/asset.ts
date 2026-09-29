@@ -348,7 +348,10 @@ export interface ResolveAssetOptions {
 /**
  * Applies a `resolveAs` shorthand to a finished {@link Asset} — the mechanism
  * behind a capability method's own `resolveAs` option (e.g.
- * `av.render(spec, { resolveAs: 'file', savePath, signal })`).
+ * `render(spec, { resolveAs: 'file', savePath, signal })`). Each mode has its
+ * own overload, so the result is typed precisely: no `resolveAs` gives the
+ * `Asset`, `'url'` its URL string, `'buffer'` a `Buffer`, `'stream'` a
+ * `Readable`, and `'file'` the path it was saved to.
  *
  * @param asset - The asset to resolve.
  * @param options - See {@link ResolveAssetOptions}.
@@ -364,6 +367,35 @@ export interface ResolveAssetOptions {
  * const path = await resolveAsset(asset, { resolveAs: 'file', savePath: './out.mov' }); // -> './out.mov'
  * ```
  */
+export function resolveAsset(
+  asset: Asset,
+  options?: ResolveAssetOptions & { resolveAs?: undefined },
+): Promise<Asset>;
+/** Resolves with the asset's presigned read URL; nothing is downloaded. */
+export function resolveAsset(
+  asset: Asset,
+  options: ResolveAssetOptions & { resolveAs: 'url' },
+): Promise<string>;
+/** Reads the whole asset into memory. */
+export function resolveAsset(
+  asset: Asset,
+  options: ResolveAssetOptions & { resolveAs: 'buffer' },
+): Promise<Buffer>;
+/** Resolves with a lazy byte stream over the asset. */
+export function resolveAsset(
+  asset: Asset,
+  options: ResolveAssetOptions & { resolveAs: 'stream' },
+): Promise<Readable>;
+/** Saves the asset to `options.savePath` and resolves with that path. */
+export function resolveAsset(
+  asset: Asset,
+  options: ResolveAssetOptions & { resolveAs: 'file' },
+): Promise<string>;
+/** With a `resolveAs` known only at run time, resolves with whichever form it names. */
+export function resolveAsset(
+  asset: Asset,
+  options?: ResolveAssetOptions,
+): Promise<Asset | string | Buffer | Readable>;
 export async function resolveAsset(
   asset: Asset,
   options: ResolveAssetOptions = {},

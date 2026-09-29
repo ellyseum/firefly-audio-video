@@ -4,6 +4,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, expect, expectTypeOf, test 
 import { Asset } from '../src/core/asset.js';
 import { AudioVideoError } from '../src/core/errors.js';
 import { InMemoryPool } from '../src/core/pool.js';
+import type { RenderBuilder } from '../src/dgr/builder.js';
 import {
   createClient,
   type Client,
@@ -349,6 +350,7 @@ test('resolveAs return types follow the mode', () => {
   expectTypeOf(c.render(spec, { resolveAs: 'file', savePath: './out.mov', signal })).toEqualTypeOf<
     RenderJob<string>
   >();
+  expectTypeOf(c.render(CAPSULE)).toEqualTypeOf<RenderBuilder>();
 });
 
 test('resolveAs on a multi-output spec rejects invalid_argument before any request', async () => {

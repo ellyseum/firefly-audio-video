@@ -70,6 +70,13 @@ export interface MaterializedOutput {
   readonly readUrl: string;
 }
 
+/** @internal The input a fluent render prepares from. */
+export interface FluentRenderInput {
+  readonly source: TemplateSource;
+  readonly preset: PresetInput | undefined;
+  readonly fileName?: string;
+}
+
 /**
  * @internal Validates a `render()` spec, checks every output's indices against
  * its presets and variations, and resolves every preset — leaving the staging
@@ -102,6 +109,49 @@ export async function prepareRequest(
     ...(spec.assets !== undefined ? { assets: spec.assets } : {}),
     ...(spec.variations !== undefined ? { variations: spec.variations } : {}),
     outputs,
+  };
+}
+
+/**
+ * @internal Validates a fluent render: one source, one preset, one output
+ * whose location storage allocates in {@link materializeRender}. Performs no
+ * remote call.
+ *
+ * @throws {@link AudioVideoError} `invalid_argument` when no preset is chosen,
+ *   no storage is configured, or the source is not a template URL;
+ *   `invalid_preset` for a preset that cannot resolve.
+ */
+export async function prepareFluent(
+  input: FluentRenderInput,
+  storage: StorageProvider | undefined,
+): Promise<PreparedRender> {
+  const source = templateUrl(input.source, 'The render source');
+  if (input.preset === undefined) {
+    throw invalidArgument(
+      'No preset is chosen: pick one on the builder — render(url).prores, ' +
+        '.hevc1080p10bit or .h264Land1080pHq — or pass { preset }.',
+    );
+  }
+  if (storage === undefined) {
+    throw invalidArgument(
+      'A fluent render allocates its output through storage, and no storage is configured: ' +
+        'pass a StorageProvider as the storage option of configure() or createClient(), or ' +
+        'call render() with a spec whose output names its destination.',
+    );
+  }
+  if (input.fileName !== undefined && (typeof input.fileName !== 'string' || !input.fileName)) {
+    throw invalidArgument('fileName must be a non-empty string when provided.');
+  }
+  return {
+    source,
+    presets: [await preparePreset(input.preset, 'The preset')],
+    outputs: [
+      {
+        variationIndex: 0,
+        presetIndex: 0,
+        ...(input.fileName ? { fileName: input.fileName } : {}),
+      },
+    ],
   };
 }
 
@@ -178,6 +228,12 @@ export function presetLogFields(presets: readonly PreparedPreset[]): {
     codec: joinDistinct(presets.map((preset) => preset.codec)),
     resolution: joinDistinct(presets.map((preset) => preset.resolution)),
   });
+}
+
+/** @internal True for a value `render()` reads as a template source rather than a spec object. */
+export function isTemplateSource(value: unknown): value is TemplateSource {
+  if (typeof value === 'string' || value instanceof URL) return true;
+  return isRecord(value) && 'url' in value && !('source' in value);
 }
 
 /**

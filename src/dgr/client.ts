@@ -37,6 +37,12 @@ import {
 } from '../core/pooled-job.js';
 import type { StageInput, StorageProvider } from '../core/storage.js';
 import {
+  createRenderBuilder,
+  type FluentRenderer,
+  type RenderBuilder,
+  type RenderBuilderOptions,
+} from './builder.js';
+import {
   describeBody,
   describeResult,
   type DescribeInput,
@@ -45,12 +51,16 @@ import {
 import { encode, presets, resize } from './preset.js';
 import {
   invalidArgument,
+  isTemplateSource,
   materializeRender,
+  prepareFluent,
   prepareRequest,
   presetLogFields,
   renderAssets,
   storageFailure,
+  type FluentRenderInput,
   type PreparedRender,
+  type TemplateSource,
 } from './render.js';
 import type { RenderRequest, RenderRequestOutput } from './schemas.js';
 
@@ -110,8 +120,9 @@ export interface ClientConfig {
    */
   logging?: LoggingOption;
   /**
-   * Stages what DGR must read from a URL: generated `.epr` presets and
-   * `stage()` inputs. Without it, either rejects `invalid_argument`.
+   * Stages what DGR must read from a URL and allocates the outputs a fluent
+   * render writes: generated `.epr` presets, `stage()` inputs, fluent-render
+   * outputs. Without it, any of those rejects `invalid_argument`.
    */
   storage?: StorageProvider;
   /**
@@ -228,9 +239,21 @@ export interface PresetSummary {
  * ```ts
  * const tenant = createClient({ clientId: t.id, clientSecret: t.secret, storage });
  * const asset = await tenant.render(spec);
+ * await tenant.render(templateUrl).prores4444xq.save('./out.mov');
  * ```
  */
 export interface Client {
+  /**
+   * Starts a fluent render of the template at `source` — see
+   * {@link RenderBuilder}. Nothing is submitted until the builder is awaited
+   * or one of its terminals (`buffer()`, `stream()`, `save()`) is called.
+   *
+   * @example
+   * ```ts
+   * await client.render(templateUrl).prores4444xq.alpha().save('./out.mov');
+   * ```
+   */
+  render(source: TemplateSource, options?: RenderBuilderOptions): RenderBuilder;
   /** Renders `spec` and resolves with its one output's read URL. See the spec overloads for the render itself. */
   render(spec: RenderRequest, options: RenderOptions & { resolveAs: 'url' }): RenderJob<string>;
   /** Renders `spec` and resolves with its one output's bytes. */
@@ -448,7 +471,7 @@ const RESOLVE_AS: readonly unknown[] = ['url', 'buffer', 'stream', 'file'] satis
  * @internal The client behind {@link createClient} and the default client.
  * Application code holds it only as a {@link Client}.
  */
-export class AudioVideoClient implements Omit<Client, 'render'> {
+export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer {
   readonly presets = presets;
   readonly encode = encode;
   readonly resize = resize;
@@ -496,7 +519,14 @@ export class AudioVideoClient implements Omit<Client, 'render'> {
   }
 
   /** See {@link Client.render}. */
-  render(input: RenderRequest, options: RenderOptions = {}): RenderJob<unknown> {
+  render(
+    input: RenderRequest | TemplateSource,
+    options: RenderOptions | RenderBuilderOptions = {},
+  ): RenderJob<unknown> | RenderBuilder {
+    if (isTemplateSource(input)) {
+      const builderOptions = options as RenderBuilderOptions;
+      return createRenderBuilder(input, builderOptions, () => this.#target(builderOptions));
+    }
     let target: AudioVideoClient;
     try {
       target = this.#target(options);
@@ -504,7 +534,7 @@ export class AudioVideoClient implements Omit<Client, 'render'> {
       return rejectedJob(error);
     }
     if (target !== this) return target.render(input, options);
-    return this.#renderSpec(input, options);
+    return this.#renderSpec(input, options as RenderOptions);
   }
 
   /** See {@link Client.describe}. */
@@ -640,6 +670,22 @@ export class AudioVideoClient implements Omit<Client, 'render'> {
     });
   }
 
+  /** @internal Starts a fluent render; see {@link FluentRenderer}. */
+  startFluentRender(input: FluentRenderInput, options: RenderBuilderOptions): RenderJob<Asset> {
+    let prepared: PreparedRender | undefined;
+    const progress = trackStatus(options.onProgress);
+    return runPooledJob<Asset[], Asset>({
+      pool: this.#pool,
+      ...(options.signal !== undefined ? { signal: options.signal } : {}),
+      prepare: async () => {
+        prepared = await prepareFluent(input, this.#storage);
+        return this.#renderStarter(prepared, options, progress);
+      },
+      finish: (assets) => onlyAsset(assets),
+      onSettle: (outcome, job) => this.#logRender(outcome, job, prepared, progress.last),
+    });
+  }
+
   #renderSpec(request: RenderRequest, options: RenderOptions): RenderJob<unknown> {
     let prepared: PreparedRender | undefined;
     const progress = trackStatus(options.onProgress);
@@ -679,7 +725,7 @@ export class AudioVideoClient implements Omit<Client, 'render'> {
    */
   async #renderStarter(
     prepared: PreparedRender,
-    options: RenderOptions,
+    options: RenderOptions | RenderBuilderOptions,
     progress: StatusTracker,
   ): Promise<() => AsyncJob<Asset[]>> {
     const { body, outputs } = await materializeRender(prepared, this.#storage);

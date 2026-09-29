@@ -14,6 +14,9 @@ export type { AudioVideoErrorOptions, AudioVideoErrorJSON } from './core/errors.
 export { AsyncJob } from './core/job.js';
 export type { JobMeta } from './core/job.js';
 
+export { Asset } from './core/asset.js';
+export type { ResolveAs } from './core/asset.js';
+
 export { ClientCredentialsProvider } from './core/auth.js';
 export type { TokenProvider, ClientCredentials } from './core/auth.js';
 

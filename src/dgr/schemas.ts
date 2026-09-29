@@ -9,6 +9,14 @@
  */
 
 import * as z from 'zod';
+import { PRESET_NAMES } from '../presets/names.js';
+
+/** Quotes and joins allowed values for an error message: `'a', 'b' or 'c'`. */
+function oneOf(values: readonly (string | number)[]): string {
+  const quoted = values.map((value) => (typeof value === 'string' ? `'${value}'` : String(value)));
+  const last = quoted.pop() ?? '';
+  return quoted.length > 0 ? `${quoted.join(', ')} or ${last}` : last;
+}
 
 /**
  * A reference to a render preset, in either of its two friendly forms: a presigned
@@ -88,37 +96,162 @@ export const RenderOutputSchema = z.strictObject({
 /** A friendly {@link RenderOutputSchema} input. */
 export type RenderOutput = z.infer<typeof RenderOutputSchema>;
 
+/** The codecs a preset can target. */
+export const CODECS = ['h264', 'hevc', 'prores4444', 'prores4444xq'] as const;
+
 /**
- * The full JSON config for a codec, taken in one shot (the `Preset` JSON constructor
- * / `Preset.encode({...})`). `codec` + `bitDepth` + `chroma` + `bitrate`
- * are the four knobs that move output; `bitrate` and `mode` are alternative ways to
- * express rate control, and `resolution` and `matchSource` are alternative ways to
- * express target frame size — the spec presents each pair as alternatives without
- * defining a cross-field precedence rule, so both fields stay independently
- * optional here rather than mutually exclusive by construction. Only `codec` is
- * required; everything else is a knob a caller may omit.
+ * A preset's codec: `'h264'` (DGR's native presets only), `'hevc'` (H.265),
+ * `'prores4444'` (Apple ProRes 4444) or `'prores4444xq'` (Apple ProRes 4444 XQ).
+ */
+export const CodecSchema = z.enum(CODECS, {
+  error: (issue) =>
+    issue.input === undefined
+      ? `codec is required: one of ${oneOf(CODECS)}`
+      : `codec must be one of ${oneOf(CODECS)}; got ${JSON.stringify(issue.input)}`,
+});
+
+/** A {@link CodecSchema} value. */
+export type Codec = z.infer<typeof CodecSchema>;
+
+/** The chroma subsamplings a config can name. */
+export const CHROMAS = ['420', '422', '444'] as const;
+
+/** Chroma subsampling: `'420'` (4:2:0), `'422'` (4:2:2) or `'444'` (4:4:4). */
+export const ChromaSchema = z.enum(CHROMAS, { error: `chroma must be ${oneOf(CHROMAS)}` });
+
+/** A {@link ChromaSchema} value. */
+export type Chroma = z.infer<typeof ChromaSchema>;
+
+/** The bit depths a config can name. */
+export const BIT_DEPTHS = [8, 10, 12] as const;
+
+/** Bits per sample: `8`, `10` or `12`. */
+export const BitDepthSchema = z.literal(BIT_DEPTHS, {
+  error: `bitDepth must be ${oneOf(BIT_DEPTHS)}`,
+});
+
+/** A {@link BitDepthSchema} value. */
+export type BitDepth = z.infer<typeof BitDepthSchema>;
+
+const BITRATE_MESSAGE =
+  "bitrate must be a positive number of bits per second, or a string such as '120M' or '2500k'";
+
+/**
+ * A target bitrate: a number of bits per second, or a string with an optional
+ * `k` (kilobits) or `M` (megabits) suffix in either case — `'120M'`, `'2500k'`,
+ * `'8000000'`.
+ */
+export const BitrateSchema = z.union(
+  [
+    z.string().regex(/^(?:\d+(?:\.\d+)?|\.\d+)[kKmM]?$/, { error: BITRATE_MESSAGE }),
+    z.number().positive({ error: BITRATE_MESSAGE }),
+  ],
+  { error: BITRATE_MESSAGE },
+);
+
+/** A {@link BitrateSchema} value. */
+export type Bitrate = z.infer<typeof BitrateSchema>;
+
+/** The rate tiers of DGR's native H.264 presets. */
+export const MODES = ['hq', 'lq', '2pass'] as const;
+
+/**
+ * One of DGR's native H.264 rate tiers: `'hq'`, `'lq'` or `'2pass'` (two-pass
+ * VBR) — the suffixes of the `ffs_video_api_*` preset ids.
+ */
+export const ModeSchema = z.enum(MODES, { error: `mode must be ${oneOf(MODES)}` });
+
+/** A {@link ModeSchema} value. */
+export type Mode = z.infer<typeof ModeSchema>;
+
+/** A frame size written as `'<width>x<height>'`, e.g. `'1920x1080'`. */
+export type ResolutionString = `${number}x${number}`;
+
+const RESOLUTION_PATTERN = /^[1-9]\d*x[1-9]\d*$/;
+const RESOLUTION_MESSAGE =
+  "resolution must be a 'WxH' string such as '1920x1080', or { width, height } in whole pixels";
+
+/** An output frame size: `'1920x1080'`, or `{ width: 1920, height: 1080 }`. */
+export const ResolutionSchema = z.union(
+  [
+    z.custom<ResolutionString>(
+      (value) => typeof value === 'string' && RESOLUTION_PATTERN.test(value),
+      { error: RESOLUTION_MESSAGE },
+    ),
+    z.strictObject(
+      {
+        width: z.int({ error: RESOLUTION_MESSAGE }).positive({ error: RESOLUTION_MESSAGE }),
+        height: z.int({ error: RESOLUTION_MESSAGE }).positive({ error: RESOLUTION_MESSAGE }),
+      },
+      { error: RESOLUTION_MESSAGE },
+    ),
+  ],
+  { error: RESOLUTION_MESSAGE },
+);
+
+/** A {@link ResolutionSchema} value. */
+export type Resolution = z.infer<typeof ResolutionSchema>;
+
+/**
+ * The full encode config for a preset, taken in one shot (`new Preset({...})`,
+ * `Preset.encode({...})`, `encode({...})`). Only `codec` is required.
+ *
+ * - **Frame size:** `resolution` fixes it; without one the output matches the
+ *   source's frame size. When both `resolution` and `matchSource: true` are
+ *   present, `resolution` wins.
+ * - **Frame rate:** `frameRate` fixes it and needs a `resolution`; otherwise the
+ *   frame rate follows the source.
+ * - **Rate control:** `bitrate` sets HEVC's target; `mode` picks one of DGR's
+ *   native H.264 tiers. ProRes has a fixed data rate per frame size and takes
+ *   neither.
+ *
+ * This schema checks each field's type. Whether a codec can produce a
+ * combination — 4:4:4 HEVC, 10-bit ProRes 4444 — is checked when the preset
+ * resolves at render time, with an error naming what the codec supports.
  *
  * @example
  * ```ts
- * const config: EncodeConfig = { codec: 'ap4x', bitDepth: 10, chroma: '444', bitrate: '120M' };
+ * const config: EncodeConfig = { codec: 'hevc', bitDepth: 10, resolution: '3840x2160', bitrate: '40M' };
  * ```
  */
 export const EncodeConfigSchema = z.strictObject({
-  codec: z.string().min(1, 'codec must not be empty'),
-  bitDepth: z.number().int().positive('bitDepth must be a positive integer').optional(),
-  /** 4:2:2 and 4:4:4 are the two chroma subsamplings proven for the custom `.epr` path. */
-  chroma: z.enum(['422', '444'], { error: "chroma must be '422' or '444'" }).optional(),
-  bitrate: z.string().min(1, 'bitrate must not be empty when provided').optional(),
-  mode: z.string().min(1, 'mode must not be empty when provided').optional(),
+  /** The target codec. */
+  codec: CodecSchema,
+  /** Bits per sample: HEVC encodes 8 (Main) or 10 (Main10); ProRes 4444 and 4444 XQ are 12-bit. */
+  bitDepth: BitDepthSchema.optional(),
+  /** Chroma subsampling: HEVC and H.264 are `'420'`; ProRes 4444 and 4444 XQ are `'444'`. */
+  chroma: ChromaSchema.optional(),
+  /** HEVC target bitrate — bits per second, or `'120M'` / `'2500k'`. */
+  bitrate: BitrateSchema.optional(),
+  /** One of DGR's native H.264 rate tiers; see {@link ModeSchema}. */
+  mode: ModeSchema.optional(),
+  /** Encode an alpha channel (ProRes 4444 and 4444 XQ). */
   alpha: z.boolean().optional(),
-  resolution: z.string().min(1, 'resolution must not be empty when provided').optional(),
+  /** Output frame size; see {@link ResolutionSchema}. */
+  resolution: ResolutionSchema.optional(),
+  /** Match the source's frame size — the default whenever `resolution` is absent. */
   matchSource: z.boolean().optional(),
-  frameRate: z.number().positive('frameRate must be a positive number').optional(),
+  /** Output frame rate in frames per second (e.g. `29.97`); needs a `resolution`. */
+  frameRate: z.number().positive({ error: 'frameRate must be a positive number' }).optional(),
+  /** Color space; generated `.epr` files cover Rec. 709 (`'rec709'`). */
   color: z.string().min(1, 'color must not be empty when provided').optional(),
 });
 
 /** A friendly {@link EncodeConfigSchema} input. */
 export type EncodeConfig = z.infer<typeof EncodeConfigSchema>;
+
+/**
+ * A preset name from the catalog — `'prores'`, `'prores4444xq'`,
+ * `'hevc1080p10bit'`, `'h264Land1080pHq'`, … — the typed string form of a named
+ * preset.
+ */
+export const PresetNameSchema = z.enum(PRESET_NAMES, {
+  error: (issue) =>
+    `unknown preset name ${JSON.stringify(issue.input)}; expected one of ${PRESET_NAMES.join(', ')}`,
+});
+
+/** A {@link PresetNameSchema} value. */
+export type PresetName = z.infer<typeof PresetNameSchema>;
 
 /**
  * The friendly, top-level input to a DGR render: one `.mogrt` capsule, the preset(s)

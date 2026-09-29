@@ -6,7 +6,15 @@ export type {
   RenderVariable,
   PresetRef,
   EncodeConfig,
+  PresetName,
+  Codec,
+  Chroma,
+  BitDepth,
+  Bitrate,
 } from './dgr/schemas.js';
+
+export { Preset, presets, encode, resize, toPreset } from './dgr/preset.js';
+export type { PresetInput, PresetJSON, PresetKind, ResizeTarget } from './dgr/preset.js';
 
 export { AudioVideoError } from './core/errors.js';
 export type { AudioVideoErrorOptions, AudioVideoErrorJSON } from './core/errors.js';

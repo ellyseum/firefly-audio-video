@@ -58,14 +58,22 @@ function track<T>(promise: Promise<T>): Tracked<T> {
   return tracked;
 }
 
-/** Every surface a caller could print an error through, its cause included. */
-function surfaces(err: unknown): string[] {
+/** Every surface a caller could print an error through, its cause included, by name. */
+function surfaces(err: unknown): Array<[where: string, text: string]> {
   return [
-    JSON.stringify(err),
-    String(err),
-    inspect(err),
-    inspect((err as Error).cause, { depth: null }),
+    ['JSON.stringify', JSON.stringify(err)],
+    ['String', String(err)],
+    ['inspect', inspect(err)],
+    ['inspect(cause)', inspect((err as Error).cause, { depth: null })],
   ];
+}
+
+/**
+ * Asserts `text` does not contain `value`. The failure names only `where`,
+ * so a failing run never prints the value it was guarding.
+ */
+function expectAbsent(text: string, value: string, where: string): void {
+  expect(text.includes(value), `${where} must not contain the guarded value`).toBe(false);
 }
 
 /** Builds an unsigned, syntactically valid JWT carrying `claims` as its payload. */
@@ -96,9 +104,11 @@ test('the token request carries the credentials and DEFAULT_SCOPE, comma-joined,
   await new ClientCredentialsProvider(CREDS).getAccessToken();
 
   expect(DEFAULT_SCOPE).toBe('openid,AdobeID,firefly_api,ff_apis');
-  expect(ims.requests).toEqual([
-    `grant_type=client_credentials&client_id=${CLIENT_ID}&client_secret=${SECRET}&scope=${DEFAULT_SCOPE}`,
-  ]);
+  expect(ims.requests).toHaveLength(1);
+  // The secret is swapped for a placeholder before comparing, so a failure never prints it.
+  expect(ims.requests[0]?.replaceAll(SECRET, '<secret>')).toBe(
+    `grant_type=client_credentials&client_id=${CLIENT_ID}&client_secret=<secret>&scope=${DEFAULT_SCOPE}`,
+  );
 });
 
 test('a custom scope is sent straight through unchanged', async () => {
@@ -575,13 +585,14 @@ test.each(['&', '=', '+', '%', '#'])(
       () => new ClientCredentialsProvider({ clientId: CLIENT_ID, clientSecret: secret }),
     );
 
+    // Absence first: the assertions below print the error when they fail.
+    for (const [where, text] of surfaces(err)) {
+      expectAbsent(text, 'Q7XZ', where);
+      expectAbsent(text, 'K2WM', where);
+    }
     expect(err).toBeInstanceOf(AudioVideoError);
     expect((err as AudioVideoError).code).toBe('invalid_argument');
     expect((err as AudioVideoError).message).toMatch(/^clientSecret contains one of & = \+ % #/);
-    for (const s of surfaces(err)) {
-      expect(s).not.toContain('Q7XZ');
-      expect(s).not.toContain('K2WM');
-    }
     expect(authenticate).not.toHaveBeenCalled();
     expect(ims.requests).toHaveLength(0);
   },
@@ -640,7 +651,9 @@ test('a secret with punctuation the form body carries safely is accepted and sen
     clientSecret: secret,
   }).getAccessToken();
 
-  expect(ims.form(0).get('client_secret')).toBe(secret);
+  expect(ims.form(0).get('client_secret') === secret, 'IMS receives the secret verbatim').toBe(
+    true,
+  );
 });
 
 // --- failure -------------------------------------------------------------------
@@ -651,16 +664,17 @@ test('an unreachable IMS rejects auth_failed, and no surface carries the secret'
 
   const err: unknown = await provider.getAccessToken().catch((e: unknown) => e);
 
+  // Absence first: the assertions below print what they inspect when they fail.
+  for (const [where, text] of surfaces(err)) {
+    expectAbsent(text, SECRET, where);
+  }
+  expectAbsent(inspect(consoleError.mock.calls, { depth: null }), SECRET, 'console.error');
   expect(err).toBeInstanceOf(AudioVideoError);
   expect((err as AudioVideoError).code).toBe('auth_failed');
   expect((err as AudioVideoError).cause).toBeInstanceOf(Error);
-  for (const s of surfaces(err)) {
-    expect(s).not.toContain(SECRET);
-  }
 
-  // The official provider reports the failure on stderr itself; it never prints the secret.
+  // The official provider reports the failure on stderr itself.
   expect(consoleError).toHaveBeenCalledWith('Error while fetching token', expect.anything());
-  expect(inspect(consoleError.mock.calls, { depth: null })).not.toContain(SECRET);
 });
 
 test('the official provider still writes to console.error when a mint that already timed out fails', async () => {
@@ -719,6 +733,10 @@ test.each(UNUSABLE_REPLIES)(
 
     const err: unknown = await provider.getAccessToken().catch((e: unknown) => e);
 
+    // Absence first: the assertions below print the error when they fail.
+    for (const [where, text] of surfaces(err)) {
+      expectAbsent(text, SECRET, where);
+    }
     expect(err).toBeInstanceOf(AudioVideoError);
     const { code, message } = err as AudioVideoError;
     expect(code).toBe('auth_failed');
@@ -727,9 +745,6 @@ test.each(UNUSABLE_REPLIES)(
       expect(message).not.toContain('IMS error');
     } else {
       expect(message).toContain(`(IMS error: ${imsError})`);
-    }
-    for (const s of surfaces(err)) {
-      expect(s).not.toContain(SECRET);
     }
 
     // Nothing was cached: the next call asks IMS again.
@@ -755,12 +770,13 @@ test.each(THROWING_REPLIES)(
 
     const err: unknown = await provider.getAccessToken().catch((e: unknown) => e);
 
+    // Absence first: the assertions below print the error when they fail.
+    for (const [where, text] of surfaces(err)) {
+      expectAbsent(text, SECRET, where);
+    }
     expect(err).toBeInstanceOf(AudioVideoError);
     expect((err as AudioVideoError).code).toBe('auth_failed');
     expect((err as AudioVideoError).cause).toBeInstanceOf(Error);
-    for (const s of surfaces(err)) {
-      expect(s).not.toContain(SECRET);
-    }
 
     await expect(provider.getAccessToken()).resolves.toBe('TOKEN_2');
     expect(ims.requests).toHaveLength(2);
@@ -784,8 +800,9 @@ test.each(UNQUOTABLE_ERRORS)(
 
     const err: unknown = await provider.getAccessToken().catch((e: unknown) => e);
 
+    // Absence first: the assertions below print the message when they fail.
+    expectAbsent((err as AudioVideoError).message, error, 'the message');
     expect((err as AudioVideoError).code).toBe('auth_failed');
     expect((err as AudioVideoError).message).not.toContain('IMS error');
-    expect((err as AudioVideoError).message).not.toContain(error);
   },
 );

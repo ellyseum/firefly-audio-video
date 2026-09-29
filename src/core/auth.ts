@@ -55,15 +55,23 @@ export interface TokenProvider {
  * — anywhere this SDK accepts authentication.
  */
 export interface ClientCredentials {
-  /** The integration's client ID. Also sent as the `x-api-key` header. */
+  /**
+   * The integration's client ID. Also sent as the `x-api-key` header. Must
+   * not contain `&`, `=`, `+`, `%` or `#` (see {@link ClientCredentialsProvider}).
+   */
   clientId: string;
-  /** The integration's client secret. Never logged, thrown, or otherwise surfaced. */
+  /**
+   * The integration's client secret. Never logged, thrown, or otherwise
+   * surfaced. Must not contain `&`, `=`, `+`, `%` or `#` (see
+   * {@link ClientCredentialsProvider}).
+   */
   clientSecret: string;
   /**
    * A single comma-joined scope string, e.g. `'openid,AdobeID,firefly_api,ff_apis'`
    * — `ServerToServerTokenProvider` (and the `ims/token/v3` endpoint it calls)
    * takes scopes this way, not as an array. Defaults to
-   * `openid,AdobeID,firefly_api,ff_apis` when omitted.
+   * `openid,AdobeID,firefly_api,ff_apis` when omitted. The same characters
+   * as the client ID are refused.
    */
   scope?: string;
 }
@@ -191,6 +199,12 @@ export interface ClientCredentialsProviderOptions {
  * same reason a caller's {@link GetAccessTokenOptions.signal} stops only
  * that caller waiting: it rejects `cancelled`, while the shared mint carries
  * on for every other caller.
+ *
+ * **Credentials are checked at construction.** The wrapped provider builds
+ * its form body without URL-encoding, so a client ID, secret or scope
+ * containing `&`, `=`, `+`, `%` or `#` would reach IMS as a different value;
+ * the constructor rejects such values, and empty or non-string ones, with
+ * `invalid_argument` before any request is made.
  */
 export class ClientCredentialsProvider implements TokenProvider {
   readonly #details: ServerToServerAuthDetails;
@@ -203,12 +217,22 @@ export class ClientCredentialsProvider implements TokenProvider {
   /**
    * @param credentials - The client ID/secret (and optional scope) to authenticate with.
    * @param options - Cache tuning; see {@link ClientCredentialsProviderOptions}.
+   * @throws {@link AudioVideoError} with `code: 'invalid_argument'` when a
+   *   credential is not a non-empty string, or contains a character the
+   *   wrapped provider would send unencoded (`&`, `=`, `+`, `%`, `#`). The
+   *   message names the field, never its value.
    */
   constructor(credentials: ClientCredentials, options: ClientCredentialsProviderOptions = {}) {
+    if (credentials === null || typeof credentials !== 'object') {
+      throw new AudioVideoError({
+        message: 'ClientCredentialsProvider expects { clientId, clientSecret }.',
+        code: 'invalid_argument',
+      });
+    }
     this.#details = {
-      clientId: credentials.clientId,
-      clientSecret: credentials.clientSecret,
-      scopes: credentials.scope ?? DEFAULT_SCOPE,
+      clientId: formSafe(credentials.clientId, 'clientId'),
+      clientSecret: formSafe(credentials.clientSecret, 'clientSecret'),
+      scopes: formSafe(credentials.scope ?? DEFAULT_SCOPE, 'scope'),
     };
     this.#tokenTtlMs = options.tokenTtlMs ?? DEFAULT_TOKEN_TTL_MS;
     this.#refreshMarginMs = options.refreshMarginMs ?? DEFAULT_REFRESH_MARGIN_MS;
@@ -303,6 +327,33 @@ export class ClientCredentialsProvider implements TokenProvider {
       });
     }
   }
+}
+
+/** The characters that change meaning in the form body the wrapped provider builds unencoded. */
+const FORM_RESERVED_RE = /[&=+%#]/;
+
+/**
+ * `value`, once it is known to survive the wrapped provider's form body: a
+ * non-empty string with none of `&`, `=`, `+`, `%` or `#`, which the
+ * provider interpolates without URL-encoding. The error names `field`,
+ * never the value.
+ */
+function formSafe(value: unknown, field: 'clientId' | 'clientSecret' | 'scope'): string {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new AudioVideoError({
+      message: `${field} must be a non-empty string.`,
+      code: 'invalid_argument',
+    });
+  }
+  if (FORM_RESERVED_RE.test(value)) {
+    throw new AudioVideoError({
+      message:
+        `${field} contains one of & = + % #. The official IMS token provider sends ` +
+        'credentials without URL-encoding, so IMS would read a different value.',
+      code: 'invalid_argument',
+    });
+  }
+  return value;
 }
 
 /** The shape of an OAuth 2.0 `error` code: a short run of letters and underscores. */
@@ -432,6 +483,8 @@ function millisecondsClaim(value: unknown): number | undefined {
  * @param input - A {@link TokenProvider} or {@link ClientCredentials}.
  * @returns `input` unchanged if it is already a {@link TokenProvider},
  *   otherwise a new {@link ClientCredentialsProvider} built from it.
+ * @throws {@link AudioVideoError} `invalid_argument` for credentials the
+ *   {@link ClientCredentialsProvider} constructor refuses.
  *
  * @internal
  */

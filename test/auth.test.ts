@@ -9,6 +9,7 @@ import {
   MINT_TIMEOUT_MS,
   MIN_TOKEN_REUSE_MS,
   resolveTokenProvider,
+  type ClientCredentials,
 } from '../src/core/auth.js';
 import { AudioVideoError } from '../src/core/errors.js';
 import { FakeIms, deferred } from './support/fake-ims.js';
@@ -550,6 +551,96 @@ test('a caller whose mint settles leaves no abort listener on its signal', async
     code: 'auth_failed',
   });
   expect(getEventListeners(signal, 'abort')).toHaveLength(0);
+});
+
+// --- credentials the official provider would mis-encode ------------------------------
+
+/** What `build` throws, or `undefined` when it returns. */
+function thrownBy(build: () => unknown): unknown {
+  try {
+    build();
+  } catch (error) {
+    return error;
+  }
+  return undefined;
+}
+
+test.each(['&', '=', '+', '%', '#'])(
+  'a client secret containing %s rejects invalid_argument before any request, never echoing it',
+  (reserved) => {
+    const authenticate = vi.spyOn(ServerToServerTokenProvider.prototype, 'authenticate');
+    const secret = `p8e-Q7XZ${reserved}K2WM`;
+
+    const err = thrownBy(
+      () => new ClientCredentialsProvider({ clientId: CLIENT_ID, clientSecret: secret }),
+    );
+
+    expect(err).toBeInstanceOf(AudioVideoError);
+    expect((err as AudioVideoError).code).toBe('invalid_argument');
+    expect((err as AudioVideoError).message).toMatch(/^clientSecret contains one of & = \+ % #/);
+    for (const s of surfaces(err)) {
+      expect(s).not.toContain('Q7XZ');
+      expect(s).not.toContain('K2WM');
+    }
+    expect(authenticate).not.toHaveBeenCalled();
+    expect(ims.requests).toHaveLength(0);
+  },
+);
+
+test.each<[field: 'clientId' | 'scope', value: string]>([
+  ['clientId', 'client&id'],
+  ['clientId', 'client#id'],
+  ['scope', 'openid&AdobeID'],
+  ['scope', 'openid+AdobeID'],
+])('a %s of %s rejects invalid_argument', (field, value) => {
+  const err = thrownBy(() => resolveTokenProvider({ ...CREDS, [field]: value }));
+
+  expect(err).toBeInstanceOf(AudioVideoError);
+  expect((err as AudioVideoError).code).toBe('invalid_argument');
+  expect((err as AudioVideoError).message).toMatch(new RegExp(`^${field} contains one of`));
+});
+
+test.each<[field: string, value: unknown]>([
+  ['clientId', ''],
+  ['clientId', '   '],
+  ['clientId', undefined],
+  ['clientId', 42],
+  ['clientSecret', ''],
+  ['clientSecret', '   '],
+  ['clientSecret', undefined],
+  ['clientSecret', null],
+  ['scope', ''],
+  ['scope', 123],
+])('a %s of %o rejects invalid_argument', (field, value) => {
+  const credentials = { ...CREDS, [field]: value } as unknown as ClientCredentials;
+
+  const err = thrownBy(() => new ClientCredentialsProvider(credentials));
+
+  expect(err).toBeInstanceOf(AudioVideoError);
+  expect((err as AudioVideoError).code).toBe('invalid_argument');
+  expect((err as AudioVideoError).message).toBe(`${field} must be a non-empty string.`);
+});
+
+test('credentials that are not an object reject invalid_argument', () => {
+  for (const credentials of [null, undefined, 'client-id:secret']) {
+    const err = thrownBy(
+      () => new ClientCredentialsProvider(credentials as unknown as ClientCredentials),
+    );
+    expect(err).toBeInstanceOf(AudioVideoError);
+    expect((err as AudioVideoError).code).toBe('invalid_argument');
+  }
+});
+
+test('a secret with punctuation the form body carries safely is accepted and sent verbatim', async () => {
+  const secret = 'p8e-Ab_1.2~3!*()';
+  ims.token('TOKEN_1');
+
+  await new ClientCredentialsProvider({
+    clientId: CLIENT_ID,
+    clientSecret: secret,
+  }).getAccessToken();
+
+  expect(ims.form(0).get('client_secret')).toBe(secret);
 });
 
 // --- failure -------------------------------------------------------------------

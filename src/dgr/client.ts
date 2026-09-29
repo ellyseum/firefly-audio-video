@@ -13,6 +13,7 @@ import { resolveAsset, type Asset, type ResolveAs } from '../core/asset.js';
 import { resolveTokenProvider, type TokenProvider } from '../core/auth.js';
 import { AudioVideoError } from '../core/errors.js';
 import { HttpClient } from '../core/http.js';
+import { redactValue } from '../core/redact.js';
 import {
   runJob,
   type AsyncJob,
@@ -529,7 +530,7 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
     }
     let target: AudioVideoClient;
     try {
-      target = this.#target(options);
+      target = this.#targetOrLog(options, 'render', RENDER_ENDPOINT, undefined);
     } catch (error) {
       return rejectedJob(error);
     }
@@ -541,7 +542,7 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
   describe(input: DescribeInput, options: DescribeOptions = {}): RenderJob<TemplateDescription> {
     let target: AudioVideoClient;
     try {
-      target = this.#target(options);
+      target = this.#targetOrLog(options, 'describe', DESCRIBE_ENDPOINT, undefined);
     } catch (error) {
       return rejectedJob(error);
     }
@@ -576,9 +577,9 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
 
   /** See {@link Client.listPresets}. */
   async listPresets(options: RequestOptions = {}): Promise<PresetSummary[]> {
-    const target = this.#target(options);
+    const target = this.#targetOrLog(options, 'list presets', PRESETS_ENDPOINT, undefined);
     if (target !== this) return target.listPresets(options);
-    return this.#logged('list presets', PRESETS_ENDPOINT, undefined, async () => {
+    return this.#logged('list presets', PRESETS_ENDPOINT, undefined, options.signal, async () => {
       const res = await this.#http.request<unknown>(
         'GET',
         PRESETS_PATH,
@@ -591,12 +592,13 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
 
   /** See {@link Client.status}. */
   async status(jobId: string, options: RequestOptions = {}): Promise<JobStatusLike> {
-    const target = this.#target(options);
+    const target = this.#targetOrLog(options, 'status', STATUS_ENDPOINT, jobIdField(jobId));
     if (target !== this) return target.status(jobId, options);
     return this.#logged(
       'status',
       STATUS_ENDPOINT,
       jobIdField(jobId),
+      options.signal,
       async () => {
         const id = requireJobId(jobId, 'status');
         const res = await this.#http.request<unknown>(
@@ -620,12 +622,13 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
 
   /** See {@link Client.cancel}. */
   async cancel(jobId: string, options: RequestOptions = {}): Promise<JobStatusLike> {
-    const target = this.#target(options);
+    const target = this.#targetOrLog(options, 'cancel', CANCEL_ENDPOINT, jobIdField(jobId));
     if (target !== this) return target.cancel(jobId, options);
     return this.#logged(
       'cancel',
       CANCEL_ENDPOINT,
       jobIdField(jobId),
+      options.signal,
       async () => {
         const id = requireJobId(jobId, 'cancel');
         const res = await this.#http.request<unknown>(
@@ -642,9 +645,9 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
 
   /** See {@link Client.stage}. */
   async stage(input: StageInput, options: StageOptions = {}): Promise<string> {
-    const target = this.#target(options);
+    const target = this.#targetOrLog(options, 'stage', STAGE_ENDPOINT, undefined);
     if (target !== this) return target.stage(input, options);
-    return this.#logged('stage', STAGE_ENDPOINT, undefined, async () => {
+    return this.#logged('stage', STAGE_ENDPOINT, undefined, undefined, async () => {
       const storage = this.#storage;
       if (storage === undefined) {
         throw invalidArgument(
@@ -775,17 +778,25 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
   }
 
   /** Runs one single-request call and logs exactly one record when it settles. */
+  /**
+   * Runs one single-request call and logs exactly one record when it
+   * settles. Anything `run` throws that is not already an
+   * {@link AudioVideoError} is wrapped as one before it is logged and
+   * rethrown — see {@link publicFailure}.
+   */
   async #logged<T>(
     action: string,
     endpoint: string,
     jobId: string | undefined,
+    signal: AbortSignal | undefined,
     run: () => Promise<T>,
     detail?: (value: T) => Pick<BuildLogRecordInput, 'status' | 'totalJobItems'>,
   ): Promise<T> {
     let value: T;
     try {
       value = await run();
-    } catch (error) {
+    } catch (raw) {
+      const error = publicFailure(raw, signal);
       this.#log({ ...settleFields(action, { ok: false, error }), endpoint, jobId });
       throw error;
     }
@@ -805,6 +816,30 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
   #target(options: { client?: Client } | undefined): AudioVideoClient {
     const client = options?.client;
     return client === undefined ? this : asClient(client);
+  }
+
+  /**
+   * {@link AudioVideoClient.#target}, logging one record on this client when
+   * the named `{ client }` is invalid — the only client such a call could
+   * ever reach, since the named one never resolved.
+   */
+  #targetOrLog(
+    options: { client?: Client } | undefined,
+    action: string,
+    endpoint: string,
+    jobId: string | undefined,
+  ): AudioVideoClient {
+    try {
+      return this.#target(options);
+    } catch (error) {
+      this.#log({ ...settleFields(action, { ok: false, error }), endpoint, jobId });
+      throw error;
+    }
+  }
+
+  /** @internal Logs a fluent render as cancelled before it reached this client; see {@link FluentRenderer.logCancelled}. */
+  logCancelled(error: AudioVideoError): void {
+    this.#log({ ...settleFields('render', { ok: false, error }), endpoint: RENDER_ENDPOINT });
   }
 }
 
@@ -848,6 +883,37 @@ function settleFields(
     return { level: 'warn', msg: `${action} cancelled`, error };
   }
   return { level: 'error', msg: `${action} failed`, error };
+}
+
+/**
+ * Everything a single-request call promises to reject with: an
+ * {@link AudioVideoError} unchanged, or anything else — a raw fetch failure,
+ * an abort reason `HttpClient` does not wrap — as one. `code` is
+ * `'cancelled'` when `signal` is why it failed, else `'request_failed'`.
+ */
+function publicFailure(error: unknown, signal: AbortSignal | undefined): AudioVideoError {
+  if (error instanceof AudioVideoError) return error;
+  const aborted = signal?.aborted ?? false;
+  return new AudioVideoError({
+    message: aborted ? 'The request was cancelled.' : 'The request failed.',
+    code: aborted ? 'cancelled' : 'request_failed',
+    cause: sanitizedCause(error),
+  });
+}
+
+/**
+ * A redacted stand-in for a rejection's `cause`: a new `Error` carrying the
+ * original's `name` and `code` (when it has one) and a message with every
+ * embedded URL redacted — never the original error itself, which may still
+ * be holding an unredacted URL or secret.
+ */
+function sanitizedCause(error: unknown): Error {
+  const original = error instanceof Error ? error : new Error(String(error));
+  const sanitized = new Error(redactValue(original.message));
+  sanitized.name = original.name;
+  const code = (original as Error & { code?: unknown }).code;
+  if (typeof code === 'string') (sanitized as Error & { code?: string }).code = code;
+  return sanitized;
 }
 
 /** Checks a `resolveAs` value a caller outside TypeScript may have passed. */

@@ -765,6 +765,46 @@ test('the single-request calls each emit one record', async () => {
   ]);
 });
 
+test('a raw transport failure on status, cancel or listPresets is wrapped as request_failed with a redacted cause', async () => {
+  const secretUrl = `${STORAGE}/leak?sv=2021&sp=r&sig=LEAKED_SIG`;
+  api.agent
+    .get(API)
+    .intercept({ path: '/v1/status/job-x', method: 'GET' })
+    .replyWithError(new Error(`fetch failed reaching ${secretUrl}`));
+  api.agent
+    .get(API)
+    .intercept({ path: '/v1/cancel/job-x', method: 'PUT' })
+    .replyWithError(new Error(`fetch failed reaching ${secretUrl}`));
+  api.agent
+    .get(API)
+    .intercept({ path: '/v1/presets', method: 'GET' })
+    .replyWithError(new Error(`fetch failed reaching ${secretUrl}`));
+
+  for (const call of [
+    () => client().status('job-x'),
+    () => client().cancel('job-x'),
+    () => client().listPresets(),
+  ]) {
+    const error = await rejection(call());
+    expect(error.code).toBe('request_failed');
+    expect(error.cause).toBeInstanceOf(Error);
+    expect((error.cause as Error).message).not.toContain('LEAKED_SIG');
+  }
+});
+
+test('an already-aborted signal on status, cancel or listPresets is wrapped as cancelled', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  for (const call of [
+    () => client().status('job-x', { signal: controller.signal }),
+    () => client().cancel('job-x', { signal: controller.signal }),
+    () => client().listPresets({ signal: controller.signal }),
+  ]) {
+    const error = await rejection(call());
+    expect(error.code).toBe('cancelled');
+  }
+});
+
 test('stage uploads through storage and resolves its read URL', async () => {
   const storage = fakeStorage();
   const input = Buffer.from('png bytes');
@@ -851,6 +891,26 @@ test('a { client } option that did not come from createClient rejects invalid_ar
   expect(error.code).toBe('invalid_argument');
   const statusError = await rejection(client().status('job-1', { client: fake }));
   expect(statusError.code).toBe('invalid_argument');
+});
+
+test('a { client } option that did not come from createClient still emits exactly one record, on every public call', async () => {
+  const fake = { render: () => undefined } as unknown as Client;
+  const logger = recordingLogger();
+  const c = client({ logging: logger });
+
+  await rejection(c.render(singleSpec(), { client: fake }));
+  await rejection(c.describe(CAPSULE, { client: fake }));
+  await rejection(c.status('job-1', { client: fake }));
+  await rejection(c.cancel('job-1', { client: fake }));
+  await rejection(c.listPresets({ client: fake }));
+  await rejection(c.stage(Buffer.from('x'), { client: fake }));
+  await flush();
+
+  expect(logger.records).toHaveLength(6);
+  for (const record of logger.records) {
+    expect(record.level).toBe('error');
+    expect(record.error?.startsWith('invalid_argument: ')).toBe(true);
+  }
 });
 
 test('a { client } option on a client method runs the call on that client', async () => {

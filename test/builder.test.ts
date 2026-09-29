@@ -257,6 +257,31 @@ test('cancel() before the render starts makes it reject cancelled once awaited, 
   expect(storage.allocations).toEqual([]);
 });
 
+test('cancel() before the render starts logs one warn record on a builder bound to a client', async () => {
+  const logger = recordingLogger();
+  const bound = createClient({
+    clientId: 'bound-id',
+    clientSecret: 'secret',
+    logging: logger,
+    storage,
+  });
+  const builder = client().render(CAPSULE, { client: bound }).prores;
+  await builder.cancel();
+  await rejection(builder);
+  await flush();
+  expect(logger.records).toHaveLength(1);
+  expect(logger.records[0]).toMatchObject({ level: 'warn', msg: 'render cancelled' });
+});
+
+test('cancel() before the render starts stays silent on an unbound builder, so it never creates the default client', async () => {
+  const logger = recordingLogger();
+  const builder = client({ logging: logger }).render(CAPSULE).prores;
+  await builder.cancel();
+  await rejection(builder);
+  await flush();
+  expect(logger.records).toEqual([]);
+});
+
 test('cancel() after the submit asks the service to stop the job', async () => {
   api.submit(['job-1']);
   api.status('job-1', () => running('job-1'));

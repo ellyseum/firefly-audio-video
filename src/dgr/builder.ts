@@ -98,6 +98,8 @@ export interface RenderBuilder extends RenderJob<Asset>, NamedBuilderSteps {
 /** @internal What a builder starts its render through: the client it resolves to. */
 export interface FluentRenderer {
   startFluentRender(input: FluentRenderInput, options: RenderBuilderOptions): JobHandle<Asset>;
+  /** Logs a render as cancelled before it reached this client — for a builder already bound to it. */
+  logCancelled(error: AudioVideoError): void;
 }
 
 /**
@@ -262,14 +264,30 @@ class FluentRender implements Omit<RenderBuilder, PresetName> {
     return this.#job;
   }
 
+  /**
+   * Logs this builder's before-start cancellation on `options.client`, when
+   * naming one costs nothing: a builder already bound to a client needs no
+   * default resolved to find it. An unbound builder stays silent rather than
+   * resolve the default client just to log a cancellation that never reached
+   * it.
+   */
+  #logCancelledIfBound(error: AudioVideoError): void {
+    if (this.#options.client === undefined) return;
+    try {
+      this.#resolve().logCancelled(error);
+    } catch {
+      // The named client was invalid; there is nothing to log on.
+    }
+  }
+
   #start(): JobHandle<Asset> {
     if (this.#cancelled) {
-      return rejectedJob(
-        new AudioVideoError({
-          message: 'The job was cancelled before it was submitted.',
-          code: 'cancelled',
-        }),
-      );
+      const error = new AudioVideoError({
+        message: 'The job was cancelled before it was submitted.',
+        code: 'cancelled',
+      });
+      this.#logCancelledIfBound(error);
+      return rejectedJob(error);
     }
     let renderer: FluentRenderer;
     try {

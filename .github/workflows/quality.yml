@@ -83,6 +83,11 @@ jobs:
       matrix:
         node-version: [22, 24]
     runs-on: ubuntu-latest
+    # Populated even when the secret is absent (empty string), so the step
+    # below can gate on it without ever referencing `secrets` directly in an
+    # `if:` — GitHub Actions does not expose that context there at all.
+    env:
+      HAS_CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -91,6 +96,16 @@ jobs:
           cache: 'npm'
       - run: npm ci
       - run: npm run coverage
+      # Codecov account setup happens at the public flip; until then this
+      # step is a no-op rather than a failing one. Uploaded once, from the
+      # .nvmrc leg, so one PR gets one coverage comment, not two.
+      - if: matrix.node-version == 24 && env.HAS_CODECOV_TOKEN == 'true'
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        continue-on-error: true
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/lcov.info
+          fail_ci_if_error: false
 
   # The one build the runtime-smoke matrix downloads, independent of whether
   # the build gate's Node 22 leg above passes — a portability failure there

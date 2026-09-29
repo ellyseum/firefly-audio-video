@@ -1,0 +1,21 @@
+codecov:
+  require_ci_to_pass: false
+
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 1%
+    patch:
+      default:
+        target: auto
+        threshold: 5%
+        # A one- or two-line diff moving patch coverage by a few points
+        # either way is normal for a library this size; report it without
+        # ever failing the check.
+        informational: true
+
+comment:
+  layout: 'reach, diff, flags, files'
+  require_changes: false

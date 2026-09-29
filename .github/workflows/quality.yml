@@ -13,20 +13,84 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  quality:
+  # 24 matches .nvmrc; 22 is the only other Node major the pinned dev
+  # toolchain can run on at all — vitest 5, eslint 10 and undici 8 (used by
+  # the test suite's HTTP mocks) each drop support for 18 and 20 in their own
+  # `engines` field. Every gate below runs on both.
+  lint:
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22, 24]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version-file: '.nvmrc'
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run lint
+
+  format:
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22, 24]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run format:check
+
+  typecheck:
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22, 24]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
           cache: 'npm'
       - run: npm ci
       - run: npm run typecheck
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22, 24]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+      - run: npm ci
       - run: npm run build
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22, 24]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+      - run: npm ci
       - run: npm run coverage
-      - run: npm run lint
-      - run: npm run format:check
 
   commitlint:
     if: github.event_name == 'pull_request'

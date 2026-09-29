@@ -62,6 +62,13 @@ export interface HttpRequestInit {
    * wins, for the rare case a call needs to override one.
    */
   headers?: Record<string, string>;
+  /**
+   * Set when `path` came from a response body — a `202`'s `statusUrl` —
+   * rather than from this SDK's caller: a path this client refuses (see
+   * {@link HttpClient.request}) then rejects `invalid_response` instead of
+   * `invalid_argument`.
+   */
+  fromResponse?: boolean;
 }
 
 /**
@@ -93,15 +100,19 @@ export interface HttpResponse<T> {
  */
 export class HttpClient {
   readonly #host: string;
+  readonly #origin: string;
   readonly #apiKey: string;
   readonly #tokenProvider: TokenProvider;
   readonly #maxRetries: number;
 
   /**
    * @param opts - See {@link HttpClientOptions}.
+   * @throws {@link AudioVideoError} `invalid_argument` when `opts.host` is not
+   *   an http(s) URL, or carries user credentials (`https://user:pass@…`).
    */
   constructor(opts: HttpClientOptions) {
     this.#host = opts.host ?? DEFAULT_HOST;
+    this.#origin = hostOrigin(this.#host);
     this.#apiKey = opts.apiKey;
     this.#tokenProvider = opts.tokenProvider;
     this.#maxRetries = opts.maxRetries ?? DEFAULT_MAX_RETRIES;
@@ -118,6 +129,20 @@ export class HttpClient {
    * `path` may be a path relative to this client's host (`'/v1/status/abc'`)
    * or an already-absolute URL (e.g. a `statusUrl` the API returned) — both
    * resolve correctly via the native `URL` constructor.
+   *
+   * **Credentials never leave this client's origin.** A `path` that resolves
+   * to a different origin than the host — another host or port, or `http:`
+   * where the host is `https:` — or that carries user credentials, or does not
+   * parse, is refused before a token is fetched or any header is attached:
+   * `invalid_argument`, or `invalid_response` with
+   * {@link HttpRequestInit.fromResponse}. Redirects are not followed, so a
+   * `3xx` rejects as its own `http_3xx` rather than carrying the credentials
+   * to wherever it points. A plain-`http` URL is accepted only when the host
+   * itself is `http:`.
+   *
+   * The token is requested with `init.signal`, and an abort while it is being
+   * fetched rejects `cancelled` at once, whether or not the provider honors
+   * the signal itself.
    *
    * @typeParam T - The shape of the parsed JSON response body.
    * @param method - The HTTP verb to send.
@@ -149,8 +174,8 @@ export class HttpClient {
     body?: unknown,
     init: HttpRequestInit = {},
   ): Promise<HttpResponse<T>> {
-    const url = new URL(path, this.#host);
-    let token = await this.#token(false);
+    const url = this.#resolve(path, init.fromResponse === true);
+    let token = await this.#token(false, init.signal, url);
     let usedAuthRetry = false;
 
     for (let attempt = 0; ;) {
@@ -162,6 +187,7 @@ export class HttpClient {
           method,
           headers: buildRequestHeaders(token, this.#apiKey, body !== undefined, init.headers),
           body: body === undefined ? undefined : JSON.stringify(body),
+          redirect: 'manual',
           signal,
         });
 
@@ -175,7 +201,7 @@ export class HttpClient {
         if (res.status === 401 && !usedAuthRetry) {
           await drainBody(res);
           usedAuthRetry = true;
-          token = await this.#token(true);
+          token = await this.#token(true, init.signal, url);
           continue;
         }
 
@@ -196,15 +222,50 @@ export class HttpClient {
   }
 
   /**
-   * A token from the provider — force-refreshed when `forceRefresh` is set.
-   * A provider failure that is not already an {@link AudioVideoError}
-   * becomes `auth_failed`, with a redacted copy of it as `cause`.
+   * `path` resolved against this client's host — or, for a path that does
+   * not parse, carries user credentials, or lands on another origin, an
+   * `invalid_argument` error (`invalid_response` when `fromResponse`).
    */
-  async #token(forceRefresh: boolean): Promise<string> {
+  #resolve(path: string, fromResponse: boolean): URL {
+    let url: URL | undefined;
     try {
-      return forceRefresh
-        ? await this.#tokenProvider.getAccessToken({ forceRefresh: true })
-        : await this.#tokenProvider.getAccessToken();
+      url = new URL(path, this.#host);
+    } catch {
+      url = undefined;
+    }
+    if (url?.origin === this.#origin && url.username === '' && url.password === '') return url;
+    const problem =
+      url === undefined
+        ? 'is not a valid URL'
+        : url.origin !== this.#origin
+          ? `is on ${url.origin}, not ${this.#origin}`
+          : 'carries user credentials';
+    throw new AudioVideoError({
+      message:
+        `${fromResponse ? 'The URL the response named' : 'The request URL'} ${problem}: ` +
+        'it was not requested, and no credentials were sent.',
+      code: fromResponse ? 'invalid_response' : 'invalid_argument',
+    });
+  }
+
+  /**
+   * A token from the provider — force-refreshed when `forceRefresh` is set —
+   * requested with `signal`. An abort, before the call or while it is
+   * pending, rejects `cancelled`; a provider failure that is not already an
+   * {@link AudioVideoError} becomes `auth_failed`, with a redacted copy of it
+   * as `cause`.
+   */
+  async #token(forceRefresh: boolean, signal: AbortSignal | undefined, url: URL): Promise<string> {
+    if (signal?.aborted) throw cancelledRequest(url, signal.reason);
+    const provider = this.#tokenProvider;
+    try {
+      if (signal === undefined) {
+        return await (forceRefresh
+          ? provider.getAccessToken({ forceRefresh: true })
+          : provider.getAccessToken());
+      }
+      const pending = provider.getAccessToken(forceRefresh ? { forceRefresh, signal } : { signal });
+      return await untilAborted(pending, signal, url);
     } catch (error) {
       if (error instanceof AudioVideoError) throw error;
       throw new AudioVideoError({
@@ -214,6 +275,65 @@ export class HttpClient {
       });
     }
   }
+}
+
+/**
+ * The origin every request of a client targets. The host must parse as an
+ * http(s) URL without user credentials: those belong in the token provider,
+ * and a URL carrying them would be sent to, and printed by, everything that
+ * reads the request URL.
+ */
+function hostOrigin(host: string): string {
+  let url: URL | undefined;
+  try {
+    url = new URL(host);
+  } catch {
+    url = undefined;
+  }
+  if (url === undefined || (url.protocol !== 'https:' && url.protocol !== 'http:')) {
+    throw new AudioVideoError({
+      message: 'host must be an http(s) URL, e.g. https://audio-video-api.adobe.io.',
+      code: 'invalid_argument',
+    });
+  }
+  if (url.username !== '' || url.password !== '') {
+    throw new AudioVideoError({
+      message: 'host must not carry user credentials (user:password@).',
+      code: 'invalid_argument',
+    });
+  }
+  return url.origin;
+}
+
+/**
+ * `pending`'s outcome, unless `signal` aborts first — then `cancelled`, while
+ * `pending` settles on its own. The abort listener is removed once either
+ * happens.
+ */
+function untilAborted<T>(pending: T | PromiseLike<T>, signal: AbortSignal, url: URL): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(cancelledRequest(url, signal.reason));
+    signal.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve(pending).then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+/** The `cancelled` error for a request whose caller's signal aborted, with a redacted copy of `reason` as cause. */
+function cancelledRequest(url: URL, reason: unknown): AudioVideoError {
+  return new AudioVideoError({
+    message: `Request to ${redactUrl(url.toString())} was cancelled.`,
+    code: 'cancelled',
+    cause: redactError(reason),
+  });
 }
 
 /**
@@ -230,15 +350,9 @@ function requestFailure(
   callerSignal: AbortSignal | undefined,
   timeoutSignal: AbortSignal,
 ): AudioVideoError {
+  if (callerSignal?.aborted) return cancelledRequest(url, error);
   const target = redactUrl(url.toString());
   const cause = redactError(error);
-  if (callerSignal?.aborted) {
-    return new AudioVideoError({
-      message: `Request to ${target} was cancelled.`,
-      code: 'cancelled',
-      cause,
-    });
-  }
   if (timeoutSignal.aborted) {
     return new AudioVideoError({
       message: `Request to ${target} did not complete within ${DEFAULT_ATTEMPT_TIMEOUT_MS / 1_000} seconds.`,

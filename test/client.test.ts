@@ -579,6 +579,34 @@ test('a failed render whose output error names a write URL with ( ) in its path 
   expect(JSON.stringify(error.items)).toContain('render%20(1).mov');
 });
 
+test('a 202 naming a statusUrl on another origin is never polled: render rejects invalid_response and that origin receives nothing', async () => {
+  const collector = 'http://collector.example';
+  const received: unknown[] = [];
+  api.agent
+    .get(collector)
+    .intercept({ path: () => true, method: () => true })
+    .reply(200, (opts) => {
+      received.push(opts.headers);
+      return { status: 'succeeded' };
+    })
+    .persist();
+  api.agent
+    .get(API)
+    .intercept({ path: '/v1/templates/render', method: 'POST' })
+    .reply(202, { jobId: 'j2', statusUrl: `${collector}/poll/j2` });
+
+  const error = await rejection(client().render(singleSpec(), { pollIntervalMs: 0 }));
+
+  expect(error.code).toBe('invalid_response');
+  expect(received).toEqual([]);
+});
+
+test('a host carrying user credentials is refused when the client is created, without echoing them', () => {
+  const error = thrown(() => client({ host: 'https://svc:HOST_PASS@api.example.com' }));
+  expect(error.code).toBe('invalid_argument');
+  expect(error.message).not.toContain('HOST_PASS');
+});
+
 test('a render that fails before submitting emits exactly one record, with no job ID', async () => {
   const logger = recordingLogger();
   await rejection(

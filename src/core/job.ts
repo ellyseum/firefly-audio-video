@@ -474,7 +474,9 @@ export class AsyncJob<T> implements PromiseLike<T> {
  *   response) — each such failure is retried after a growing delay, and a
  *   successful poll resets the count;
  * - rejects at once with the request's own error when a status poll fails in any
- *   other way (a `404`, say — the job is gone);
+ *   other way (a `404`, say — the job is gone), including `invalid_response`
+ *   when the submission's `statusUrl` is not on the HTTP client's own origin,
+ *   which is never requested;
  * - rejects `submit_failed`, with the rejection as `cause`, when the submit call
  *   rejects with anything other than an {@link AudioVideoError}; a submit
  *   rejecting with one (`http_429`, an auth failure, …) rejects the job with that
@@ -583,7 +585,10 @@ async function pollUntilTerminal<T>(
     signal.throwIfAborted();
     let response: HttpResponse<unknown>;
     try {
-      response = await http.request<unknown>('GET', statusUrl, undefined, { signal });
+      response = await http.request<unknown>('GET', statusUrl, undefined, {
+        signal,
+        fromResponse: true,
+      });
     } catch (err) {
       // The request's own `cancelled` is this job's abort arriving through it: rethrow the abort
       // reason so the job settles as its own `cancelled` or `job_timeout`.

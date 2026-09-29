@@ -1,7 +1,8 @@
+import { getEventListeners } from 'node:events';
 import { inspect } from 'node:util';
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
-import type { TokenProvider } from '../src/core/auth.js';
+import type { GetAccessTokenOptions, TokenProvider } from '../src/core/auth.js';
 import { AudioVideoError } from '../src/core/errors.js';
 import { DEFAULT_HOST, HttpClient } from '../src/core/http.js';
 import { deferred } from './support/fake-ims.js';
@@ -10,7 +11,7 @@ import { flush, until } from './support/mock-api.js';
 const originalDispatcher = getGlobalDispatcher();
 let agent: MockAgent;
 
-const getAccessTokenMock = vi.fn<(opts?: { forceRefresh?: boolean }) => Promise<string>>();
+const getAccessTokenMock = vi.fn<(opts?: GetAccessTokenOptions) => Promise<string>>();
 const tokenProvider: TokenProvider = { getAccessToken: getAccessTokenMock };
 
 beforeEach(() => {
@@ -114,18 +115,192 @@ test('a caller-supplied header merges over (and can override) the computed defau
   });
 });
 
-test('an already-absolute path (e.g. a returned statusUrl) is used as-is, ignoring the host', async () => {
-  agent
-    .get('https://other-host.example')
-    .intercept({ path: '/v1/status/xyz', method: 'GET' })
-    .reply(200, { status: 'completed' });
+test("an absolute URL on the client's own origin (e.g. a returned statusUrl) is used as-is", async () => {
+  pool().intercept({ path: '/v1/status/xyz', method: 'GET' }).reply(200, { status: 'completed' });
 
   const client = new HttpClient({ apiKey: 'key', tokenProvider });
-  const res = await client.request<{ status: string }>(
-    'GET',
-    'https://other-host.example/v1/status/xyz',
-  );
+  const res = await client.request<{ status: string }>('GET', `${DEFAULT_HOST}/v1/status/xyz`);
   expect(res.body.status).toBe('completed');
+});
+
+// --- credentials never leave the configured origin ----------------------------------
+
+/** Counts every request that reaches `origin`, whatever its path or method. */
+function countingOrigin(origin: string): () => number {
+  let hits = 0;
+  agent
+    .get(origin)
+    .intercept({ path: () => true, method: () => true })
+    .reply(200, () => {
+      hits += 1;
+      return {};
+    })
+    .persist();
+  return () => hits;
+}
+
+/** The tail every refused-URL message ends with. */
+const NOT_SENT = ': it was not requested, and no credentials were sent.';
+
+test.each([
+  [
+    'another host',
+    'https://other-host.example/v1/status/xyz',
+    'The request URL is on https://other-host.example/, not https://audio-video-api.adobe.io/',
+  ],
+  [
+    'another port',
+    'https://audio-video-api.adobe.io:8443/v1/status/xyz',
+    'The request URL is on https://audio-video-api.adobe.io:8443/, not https://audio-video-api.adobe.io/',
+  ],
+  [
+    'http: where the host is https:',
+    'http://audio-video-api.adobe.io/v1/status/xyz',
+    'The request URL is on http://audio-video-api.adobe.io/, not https://audio-video-api.adobe.io/',
+  ],
+  [
+    'a protocol-relative URL',
+    '//other-host.example/v1/status/xyz',
+    'The request URL is on https://other-host.example/, not https://audio-video-api.adobe.io/',
+  ],
+  [
+    'user credentials',
+    'https://user:URL_PASSWORD@audio-video-api.adobe.io/v1/status/xyz',
+    'The request URL carries user credentials',
+  ],
+  [
+    'a URL that does not parse',
+    'http://[not-a-host/v1/status',
+    'The request URL is not a valid URL',
+  ],
+])(
+  'a caller-supplied path with %s is refused invalid_argument before any token or header',
+  async (_case, path, message) => {
+    const elsewhere = countingOrigin('https://other-host.example');
+
+    const err = await rejection(
+      new HttpClient({ apiKey: 'key', tokenProvider }).request('GET', path),
+    );
+
+    expect(err.code).toBe('invalid_argument');
+    expect(err.message).toBe(message + NOT_SENT);
+    expect(err.message).not.toContain('URL_PASSWORD');
+    expect(getAccessTokenMock).not.toHaveBeenCalled();
+    expect(elsewhere()).toBe(0);
+  },
+);
+
+test('a path that came from a response body and leaves the origin is refused invalid_response', async () => {
+  const collector = countingOrigin('http://collector.example');
+
+  const err = await rejection(
+    new HttpClient({ apiKey: 'key', tokenProvider }).request(
+      'GET',
+      'http://collector.example/poll/j2',
+      undefined,
+      { fromResponse: true },
+    ),
+  );
+
+  expect(err.code).toBe('invalid_response');
+  expect(err.message).toBe(
+    'The URL the response named is on http://collector.example/, not https://audio-video-api.adobe.io/' +
+      NOT_SENT,
+  );
+  expect(collector()).toBe(0);
+  expect(getAccessTokenMock).not.toHaveBeenCalled();
+});
+
+test('a redirect is not followed: the 3xx rejects as http_3xx and its target receives nothing', async () => {
+  const elsewhere = countingOrigin('https://other-host.example');
+  pool()
+    .intercept({ path: '/v1/presets', method: 'GET' })
+    .reply(302, '', { headers: { location: 'https://other-host.example/collect' } });
+
+  const err = await rejection(
+    new HttpClient({ apiKey: 'key', tokenProvider }).request('GET', '/v1/presets'),
+  );
+
+  expect(err.code).toBe('http_302');
+  expect(elsewhere()).toBe(0);
+});
+
+test('a plain-http host serves http paths on its own origin, and refuses https ones', async () => {
+  const local = 'http://localhost:8080';
+  agent.get(local).intercept({ path: '/v1/presets', method: 'GET' }).reply(200, { ok: true });
+  const client = new HttpClient({ host: local, apiKey: 'key', tokenProvider });
+
+  await expect(client.request('GET', '/v1/presets')).resolves.toMatchObject({ status: 200 });
+  expect((await rejection(client.request('GET', 'https://localhost:8080/v1/presets'))).code).toBe(
+    'invalid_argument',
+  );
+});
+
+test.each([
+  [
+    'not a URL',
+    'audio-video-api.adobe.io',
+    'host must be an http(s) URL, e.g. https://audio-video-api.adobe.io/.',
+  ],
+  [
+    'not http(s)',
+    'ftp://files.example',
+    'host must be an http(s) URL, e.g. https://audio-video-api.adobe.io/.',
+  ],
+  [
+    'carrying user credentials',
+    'https://svc:HOST_PASSWORD@audio-video-api.adobe.io',
+    'host must not carry user credentials (user:password@).',
+  ],
+])('a host %s is refused invalid_argument at construction', (_case, host, message) => {
+  let thrown: unknown;
+  try {
+    new HttpClient({ host, apiKey: 'key', tokenProvider });
+  } catch (error) {
+    thrown = error;
+  }
+  expect(thrown).toBeInstanceOf(AudioVideoError);
+  expect((thrown as AudioVideoError).code).toBe('invalid_argument');
+  expect((thrown as AudioVideoError).message).toBe(message);
+});
+
+// --- the request signal reaches the token provider -----------------------------------
+
+test('the request signal is handed to the token provider, on the first call and on a forced refresh', async () => {
+  const { signal } = new AbortController();
+  getAccessTokenMock
+    .mockReset()
+    .mockResolvedValueOnce('STALE_TOKEN')
+    .mockResolvedValueOnce('FRESH');
+  pool().intercept({ path: '/v1/presets', method: 'GET' }).reply(401, { error: 'unauthorized' });
+  pool().intercept({ path: '/v1/presets', method: 'GET' }).reply(200, { presets: [] });
+
+  await new HttpClient({ apiKey: 'key', tokenProvider }).request('GET', '/v1/presets', undefined, {
+    signal,
+  });
+
+  expect(getAccessTokenMock).toHaveBeenNthCalledWith(1, { signal });
+  expect(getAccessTokenMock).toHaveBeenNthCalledWith(2, { forceRefresh: true, signal });
+  expect(getEventListeners(signal, 'abort')).toHaveLength(0);
+});
+
+test('an abort while a token provider that ignores the signal is still pending rejects cancelled at once', async () => {
+  getAccessTokenMock.mockReset().mockReturnValue(new Promise<string>(() => undefined));
+  const controller = new AbortController();
+
+  const pending = new HttpClient({ apiKey: 'key', tokenProvider }).request(
+    'GET',
+    '/v1/presets',
+    undefined,
+    { signal: controller.signal },
+  );
+  await until(() => getAccessTokenMock.mock.calls.length === 1);
+  controller.abort(new Error('stop waiting'));
+
+  const err = await rejection(pending);
+  expect(err.code).toBe('cancelled');
+  expect((err.cause as Error).message).toBe('stop waiting');
+  expect(agent.pendingInterceptors()).toHaveLength(0);
 });
 
 test('an empty response body resolves body as undefined', async () => {
@@ -405,6 +580,7 @@ test('a caller signal that is already aborted rejects cancelled without hitting 
   expect(err.code).toBe('cancelled');
   expect(err.message).toBe(`Request to ${DEFAULT_HOST}/v1/presets was cancelled.`);
   expect((err.cause as Error).name).toBe('AbortError');
+  expect(getAccessTokenMock).not.toHaveBeenCalled();
   expect(agent.pendingInterceptors()).toHaveLength(0);
 });
 

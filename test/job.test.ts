@@ -792,6 +792,28 @@ test('a status poll that runs past the per-attempt timeout is retried, and the j
   }
 });
 
+test('a statusUrl on another origin is never polled: the job rejects invalid_response', async () => {
+  let polled = 0;
+  agent
+    .get('https://other-host.example')
+    .intercept({ path: '/v1/status/j1', method: 'GET' })
+    .reply(200, () => {
+      polled += 1;
+      return { status: 'completed' };
+    })
+    .persist();
+  const job = runJob(http(), {
+    submit: () =>
+      Promise.resolve({ jobId: 'j1', statusUrl: 'https://other-host.example/v1/status/j1' }),
+    mapResult: () => 'unreached',
+  });
+
+  const err = await rejectionOf(job);
+
+  expect(err?.code).toBe('invalid_response');
+  expect(polled).toBe(0);
+});
+
 test('the listener on the caller signal is detached when the job settles without that signal aborting', async () => {
   const polls = runningForever();
   cancelEndpoint();

@@ -37,3 +37,6 @@ export type {
   RotatingFileLoggerOptions,
   StdoutJsonLoggerOptions,
 } from './core/logging.js';
+
+export { InMemoryPool, DEFAULT_CONCURRENCY } from './core/pool.js';
+export type { PoolBackend } from './core/pool.js';

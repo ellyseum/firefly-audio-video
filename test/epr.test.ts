@@ -18,6 +18,7 @@ import {
   fourccOf,
   fourccValue,
   parseEprHeadline,
+  presetIdFor,
   toEpr,
 } from '../src/presets/epr.js';
 
@@ -245,6 +246,26 @@ describe('output shape', () => {
     expect(topLevel(xml, 'PresetName')).toBe('HEVC (H.265) 1920x1080 10-bit');
     expect(topLevel(xml, 'PresetComments')).toContain('Main10');
     expect(topLevel(toEpr(PRORES_XQ), 'PresetName')).toBe('Apple ProRes 4444 XQ with alpha');
+  });
+});
+
+describe('PresetID', () => {
+  test('the same config yields the same id on repeated calls', () => {
+    expect(topLevel(toEpr(HEVC_1080P_10), 'PresetID')).toBe(
+      topLevel(toEpr(HEVC_1080P_10), 'PresetID'),
+    );
+  });
+
+  test('a one-byte change to the template text yields a different id', () => {
+    const mutated = HEVC_BASE_EPR.replace('HD 1080p', 'HD 1080q');
+    expect(mutated).not.toBe(HEVC_BASE_EPR);
+    expect(presetIdFor(mutated)).not.toBe(presetIdFor(HEVC_BASE_EPR));
+  });
+
+  test('two different configs yield different ids', () => {
+    expect(topLevel(toEpr(HEVC_1080P_10), 'PresetID')).not.toBe(
+      topLevel(toEpr({ ...HEVC_1080P_10, bitDepth: 8 }), 'PresetID'),
+    );
   });
 });
 

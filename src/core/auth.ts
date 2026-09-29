@@ -10,6 +10,19 @@ import { ServerToServerTokenProvider } from '@adobe/firefly-services-common-apis
 import { AudioVideoError } from './errors.js';
 
 /**
+ * Per-call tuning for {@link TokenProvider.getAccessToken}.
+ */
+export interface GetAccessTokenOptions {
+  /**
+   * Bypasses the provider's own cache and re-mints a fresh token even if the
+   * cached one is not yet near its assumed expiry. The HTTP client's 401
+   * auth-retry passes this — a `401` from the API is a stronger signal that
+   * the cached token is stale than this provider's own clock-based guess.
+   */
+  forceRefresh?: boolean;
+}
+
+/**
  * The seam every authenticated call in this SDK depends on — the HTTP client
  * and the top-level client accept anything shaped like this, never a concrete
  * provider class, so a caller can substitute their own token source (a
@@ -19,9 +32,10 @@ import { AudioVideoError } from './errors.js';
 export interface TokenProvider {
   /**
    * Returns a valid bearer access token, minting or refreshing one if needed.
+   * @param opts - See {@link GetAccessTokenOptions}.
    * @returns A non-expired IMS access token, ready to send as `Authorization: Bearer <token>`.
    */
-  getAccessToken(): Promise<string>;
+  getAccessToken(opts?: GetAccessTokenOptions): Promise<string>;
 }
 
 /**
@@ -51,11 +65,15 @@ export const DEFAULT_SCOPE = 'openid,AdobeID,firefly_api,ff_apis';
 
 /**
  * The commonly documented lifetime of an IMS server-to-server access token —
- * the assumed value {@link ClientCredentialsProvider} refreshes against,
- * since the wrapped provider does not report the real `expires_in` it
- * receives (see the class docs). Override via
+ * the FALLBACK {@link ClientCredentialsProvider} refreshes against when a
+ * minted token cannot be read as a JWT with an `exp` claim (see
+ * {@link ClientCredentialsProvider}'s class docs: the wrapped provider itself
+ * never reports the real `expires_in` it receives). The preferred path reads
+ * the real expiry directly from the token, so this constant is a safety net,
+ * not the primary mechanism. Override via
  * {@link ClientCredentialsProviderOptions.tokenTtlMs} if a given
- * integration's actual token lifetime differs.
+ * integration's actual token lifetime differs and its tokens are not
+ * decodable JWTs.
  */
 export const DEFAULT_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -97,8 +115,22 @@ export interface ClientCredentialsProviderOptions {
  * {@link ClientCredentialsProviderOptions}, never from the wrapped
  * provider's internal state) decides a fresh mint is due.
  *
+ * **The real expiry comes from the token itself, not a guess.** IMS access
+ * tokens are JWTs, so each freshly minted token is decoded (its middle
+ * segment, base64url → JSON) and its `exp` claim (seconds since epoch) is
+ * used as the assumed expiry when present and numeric — the wrapped
+ * provider's silence about `expires_in` (above) turns out not to matter,
+ * because this class reads the same fact directly off the wire format. The
+ * configured TTL ({@link DEFAULT_TOKEN_TTL_MS} unless overridden via
+ * {@link ClientCredentialsProviderOptions.tokenTtlMs}) is only a fallback for
+ * a token that is not a decodable JWT, or has no `exp` claim; the decode
+ * never throws, so a malformed or opaque token degrades to that fallback
+ * rather than breaking authentication.
+ *
  * Concurrent calls while a mint is in flight share the same underlying
- * request rather than each triggering their own.
+ * request rather than each triggering their own — including a
+ * {@link GetAccessTokenOptions.forceRefresh} call that arrives while another
+ * mint (forced or cache-driven) is already in progress.
  */
 export class ClientCredentialsProvider implements TokenProvider {
   readonly #provider: ServerToServerTokenProvider;
@@ -129,17 +161,23 @@ export class ClientCredentialsProvider implements TokenProvider {
    * Returns the cached access token, re-minting through the wrapped provider
    * only once the cache is within
    * {@link ClientCredentialsProviderOptions.refreshMarginMs} of its assumed
-   * expiry. A mint already in flight is shared by every concurrent caller
-   * rather than triggering a second one.
+   * expiry — or immediately, when {@link GetAccessTokenOptions.forceRefresh}
+   * is set. A mint already in flight (cache-driven or forced) is shared by
+   * every concurrent caller rather than triggering a second one.
    *
+   * @param opts - See {@link GetAccessTokenOptions}.
    * @throws {@link AudioVideoError} with `code: 'auth_failed'` if the wrapped
    *   provider's `authenticate()` call fails. The client secret is never
    *   included in the thrown error's message; `.cause` carries the original
    *   error for programmatic inspection and is excluded from every
    *   serialized form of {@link AudioVideoError} by construction.
    */
-  async getAccessToken(): Promise<string> {
-    if (this.#cachedToken !== undefined && Date.now() < this.#expiresAt - this.#refreshMarginMs) {
+  async getAccessToken(opts: GetAccessTokenOptions = {}): Promise<string> {
+    if (
+      !opts.forceRefresh &&
+      this.#cachedToken !== undefined &&
+      Date.now() < this.#expiresAt - this.#refreshMarginMs
+    ) {
       return this.#cachedToken;
     }
     if (!this.#inflight) {
@@ -162,8 +200,41 @@ export class ClientCredentialsProvider implements TokenProvider {
       });
     }
     this.#cachedToken = token;
-    this.#expiresAt = Date.now() + this.#tokenTtlMs;
+    this.#expiresAt = decodeJwtExpiryMs(token) ?? Date.now() + this.#tokenTtlMs;
     return token;
+  }
+}
+
+/**
+ * Best-effort decode of a JWT's `exp` claim (seconds since epoch) into a
+ * millisecond timestamp — WITHOUT verifying the token's signature. This SDK
+ * only reads the claim to size its own cache; it never treats the token as
+ * trusted input on the strength of this decode, so signature verification
+ * would add cost without adding safety here.
+ *
+ * Returns `undefined` for anything that is not a three-segment JWT, whose
+ * payload segment does not decode to JSON, or whose decoded payload has no
+ * finite numeric `exp` (including a payload that parses to something other
+ * than an object). Never throws: an opaque, non-JWT access token — or a
+ * malformed one — is a legitimate shape this SDK must tolerate, not an
+ * error; `ClientCredentialsProvider`'s `#mint` falls back to its configured
+ * TTL ({@link DEFAULT_TOKEN_TTL_MS} by default) whenever this returns
+ * `undefined`.
+ *
+ * @param token - The raw access token, as returned by `authenticate()`.
+ * @returns The token's `exp` claim in epoch milliseconds, or `undefined`.
+ */
+function decodeJwtExpiryMs(token: string): number | undefined {
+  const segments = token.split('.');
+  const payload = segments.length === 3 ? segments[1] : undefined;
+  if (!payload) return undefined;
+  try {
+    const claims: unknown = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    const exp =
+      claims && typeof claims === 'object' ? (claims as { exp?: unknown }).exp : undefined;
+    return typeof exp === 'number' && Number.isFinite(exp) ? exp * 1000 : undefined;
+  } catch {
+    return undefined;
   }
 }
 

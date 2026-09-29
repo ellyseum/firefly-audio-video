@@ -1,3 +1,4 @@
+import { getEventListeners } from 'node:events';
 import { inspect } from 'node:util';
 import { ServerToServerTokenProvider } from '@adobe/firefly-services-common-apis';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
@@ -471,6 +472,84 @@ test('a mint that settles inside the bound, resolved or rejected, leaves no time
     code: 'auth_failed',
   });
   expect(vi.getTimerCount()).toBe(0);
+});
+
+// --- a caller's abort signal ---------------------------------------------------------
+
+test("one caller's abort rejects only that caller, cancelled, while the shared mint resolves the others", async () => {
+  const held = deferred();
+  ims.token('TOKEN_1', { hold: held.promise });
+  const provider = new ClientCredentialsProvider(CREDS);
+  const controller = new AbortController();
+  const reason = new Error('caller gave up');
+
+  // The aborting caller is the one whose call started the mint.
+  const aborted = track(provider.getAccessToken({ signal: controller.signal }));
+  const plain = track(provider.getAccessToken());
+  const withSignal = track(provider.getAccessToken({ signal: new AbortController().signal }));
+  try {
+    await until(() => ims.requests.length === 1);
+
+    controller.abort(reason);
+    await until(() => aborted.state !== 'pending');
+    expect(aborted.state).toBe('rejected');
+    expect(aborted.error).toBeInstanceOf(AudioVideoError);
+    expect((aborted.error as AudioVideoError).code).toBe('cancelled');
+    expect((aborted.error as AudioVideoError).cause).toBe(reason);
+    await flush();
+    expect(plain.state).toBe('pending');
+    expect(withSignal.state).toBe('pending');
+
+    held.resolve();
+    await until(() => plain.state !== 'pending' && withSignal.state !== 'pending');
+    expect(plain.value).toBe('TOKEN_1');
+    expect(withSignal.value).toBe('TOKEN_1');
+    expect(ims.requests).toHaveLength(1);
+
+    // The mint the aborted caller started still filled the cache.
+    await expect(provider.getAccessToken()).resolves.toBe('TOKEN_1');
+    expect(ims.requests).toHaveLength(1);
+  } finally {
+    held.resolve();
+  }
+});
+
+test('an already-aborted signal rejects cancelled at once, cached token or not, and never contacts IMS', async () => {
+  const authenticate = vi.spyOn(ServerToServerTokenProvider.prototype, 'authenticate');
+  ims.token('TOKEN_1');
+  const provider = new ClientCredentialsProvider(CREDS);
+  const reason = new Error('already stopped');
+
+  for (const round of ['cold cache', 'warm cache']) {
+    const err: unknown = await provider
+      .getAccessToken({ signal: AbortSignal.abort(reason) })
+      .catch((e: unknown) => e);
+
+    expect(err, round).toBeInstanceOf(AudioVideoError);
+    expect((err as AudioVideoError).code, round).toBe('cancelled');
+    expect((err as AudioVideoError).cause, round).toBe(reason);
+    expect(authenticate, round).toHaveBeenCalledTimes(round === 'cold cache' ? 0 : 1);
+
+    if (round === 'cold cache') {
+      await expect(provider.getAccessToken()).resolves.toBe('TOKEN_1');
+    }
+  }
+  expect(ims.requests).toHaveLength(1);
+});
+
+test('a caller whose mint settles leaves no abort listener on its signal', async () => {
+  ims.token('TOKEN_1');
+  ims.answer(400, { error: 'invalid_client' });
+  const provider = new ClientCredentialsProvider(CREDS);
+  const { signal } = new AbortController();
+
+  await expect(provider.getAccessToken({ signal })).resolves.toBe('TOKEN_1');
+  expect(getEventListeners(signal, 'abort')).toHaveLength(0);
+
+  await expect(provider.getAccessToken({ signal, forceRefresh: true })).rejects.toMatchObject({
+    code: 'auth_failed',
+  });
+  expect(getEventListeners(signal, 'abort')).toHaveLength(0);
 });
 
 // --- failure -------------------------------------------------------------------

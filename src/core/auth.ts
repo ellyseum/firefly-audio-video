@@ -23,6 +23,14 @@ export interface GetAccessTokenOptions {
    * the cached token is stale than this provider's own clock-based guess.
    */
   forceRefresh?: boolean;
+  /**
+   * Stops this caller waiting for a token. {@link ClientCredentialsProvider}
+   * rejects with {@link AudioVideoError} `code: 'cancelled'` (the signal's
+   * `reason` as `.cause`) the moment it aborts — at once, without contacting
+   * IMS, if it already has. A mint other callers are waiting on is never
+   * cancelled: it runs on for them and still fills the cache.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -179,7 +187,10 @@ export interface ClientCredentialsProviderOptions {
  * no timeout of its own and cannot be aborted, so a mint IMS has not
  * answered within 30 seconds rejects every caller waiting on it with
  * `auth_failed`, and the next call starts a fresh mint. The abandoned
- * request runs on; its eventual answer is dropped, never cached.
+ * request runs on; its eventual answer is dropped, never cached. For the
+ * same reason a caller's {@link GetAccessTokenOptions.signal} stops only
+ * that caller waiting: it rejects `cancelled`, while the shared mint carries
+ * on for every other caller.
  */
 export class ClientCredentialsProvider implements TokenProvider {
   readonly #details: ServerToServerAuthDetails;
@@ -221,8 +232,13 @@ export class ClientCredentialsProvider implements TokenProvider {
    *   when the wrapped provider threw, `.cause` carries its error for
    *   programmatic inspection and is excluded from every serialized form of
    *   {@link AudioVideoError} by construction.
+   * @throws {@link AudioVideoError} with `code: 'cancelled'` when
+   *   `opts.signal` has aborted, or aborts before a token is available; a
+   *   mint other callers are waiting on carries on for them.
    */
   async getAccessToken(opts: GetAccessTokenOptions = {}): Promise<string> {
+    const { signal } = opts;
+    if (signal?.aborted) throw cancelledError(signal);
     if (!opts.forceRefresh && this.#cachedToken !== undefined && Date.now() < this.#refreshAt) {
       return this.#cachedToken;
     }
@@ -231,7 +247,7 @@ export class ClientCredentialsProvider implements TokenProvider {
         this.#inflight = undefined;
       });
     }
-    return this.#inflight;
+    return signal === undefined ? this.#inflight : untilAborted(this.#inflight, signal);
   }
 
   /**
@@ -309,6 +325,38 @@ function imsErrorCode(
   return error.includes(details.clientSecret) || error.includes(details.clientId)
     ? undefined
     : error;
+}
+
+/**
+ * `promise`'s outcome, unless `signal` aborts first — then `cancelled`.
+ * `promise` itself runs on for anyone else awaiting it, and the abort
+ * listener is removed as soon as `promise` settles.
+ */
+function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(cancelledError(signal));
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/** The `cancelled` error a caller receives once its own signal stops its wait for a token. */
+function cancelledError(signal: AbortSignal): AudioVideoError {
+  return new AudioVideoError({
+    message: 'Waiting for an access token was cancelled.',
+    code: 'cancelled',
+    cause: signal.reason,
+  });
 }
 
 /** The `auth_failed` error every waiter on a mint receives once it outlives {@link MINT_TIMEOUT_MS}. */

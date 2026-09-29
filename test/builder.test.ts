@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmdirSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmdirSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Readable } from 'node:stream';
@@ -154,6 +154,14 @@ test('every step returns a new builder and leaves the one it came from unchanged
   expect(inspect(hevc)).toContain("codec: 'hevc'");
 });
 
+test('a presigned .epr URL passed as { preset } never appears in inspect, even before the render starts', () => {
+  const signedEpr = `${STORAGE}/custom.epr?sv=2021&sp=r&sig=EPR_SIG`;
+  const builder = client().render(CAPSULE, { preset: signedEpr });
+  expect(inspect(builder)).not.toContain('sig=');
+  expect(inspect(builder)).not.toContain('EPR_SIG');
+  expect(inspect(builder)).toContain("kind: 'epr'");
+});
+
 test('building submits nothing; awaiting starts one render that every consumer shares', async () => {
   jobsSucceed('job-1', 'job-2');
   const builder = client().render(CAPSULE, { pollIntervalMs: 0 }).prores;
@@ -190,6 +198,42 @@ test('.buffer(), .save() and .stream() render, then read the finished asset', as
   for await (const chunk of stream) chunks.push(chunk as Buffer);
   expect(Buffer.compare(Buffer.concat(chunks), BYTES)).toBe(0);
   expect(api.count('POST', '/v1/templates/render')).toBe(3);
+});
+
+test('the builder signal cancels an in-progress .save(), writing nothing to disk, even after the render has settled', async () => {
+  jobsSucceed('job-save-cancel');
+  let started = false;
+  api.downloadDelayed('/out/', BYTES, 200, () => {
+    started = true;
+  });
+  const controller = new AbortController();
+  const dir = mkdtempSync(join(tmpdir(), 'firefly-audio-video-builder-'));
+  const path = join(dir, 'out.mov');
+
+  const builder = client().render(CAPSULE, { pollIntervalMs: 0, signal: controller.signal }).prores;
+  await builder;
+  const saved = builder.save(path);
+  await until(() => started);
+  controller.abort();
+  const error = await rejection(saved);
+  expect(error.code).toBe('cancelled');
+  expect(existsSync(path)).toBe(false);
+  rmdirSync(dir);
+});
+
+test('cancel() after the builder has settled cancels an in-progress .buffer() read', async () => {
+  jobsSucceed('job-buffer-cancel');
+  let started = false;
+  api.downloadDelayed('/out/', BYTES, 200, () => {
+    started = true;
+  });
+  const builder = client().render(CAPSULE, { pollIntervalMs: 0 }).prores;
+  await builder;
+  const read = builder.buffer();
+  await until(() => started);
+  await builder.cancel();
+  const error = await rejection(read);
+  expect(error.code).toBe('cancelled');
 });
 
 test('a render failure surfaces on .stream() as an error event', async () => {

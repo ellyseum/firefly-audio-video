@@ -121,6 +121,8 @@ class FluentRender implements Omit<RenderBuilder, PresetName> {
   readonly #preset: PresetInput | undefined;
   #job: JobHandle<Asset> | undefined;
   #cancelled = false;
+  /** Aborts a terminal's in-progress read (`buffer()`, `stream()`, `save()`) on `cancel()`, even once the render has already settled. */
+  readonly #reading = new AbortController();
 
   constructor(
     source: TemplateSource,
@@ -159,14 +161,28 @@ class FluentRender implements Omit<RenderBuilder, PresetName> {
     return this.#started().finally(onfinally);
   }
 
+  /**
+   * See {@link JobHandle.cancel}. Also aborts a terminal's read
+   * (`buffer()`, `stream()`, `save()`) if one is in progress, or starts,
+   * regardless of whether the render itself has already settled — a
+   * builder's terminal downloads the finished asset after the underlying
+   * job does, which is otherwise past the point {@link JobHandle.cancel}'s
+   * own abort reaches.
+   */
   cancel(): Promise<void> {
+    this.#reading.abort(
+      new AudioVideoError({
+        message: 'The job was cancelled while its result was being read.',
+        code: 'cancelled',
+      }),
+    );
     if (this.#job !== undefined) return this.#job.cancel();
     this.#cancelled = true;
     return Promise.resolve();
   }
 
   buffer(options?: AssetReadOptions): Promise<Buffer> {
-    return this.#started().then((asset) => asset.buffer(options));
+    return this.#started().then((asset) => asset.buffer(this.#readOptions(options)));
   }
 
   stream(options?: AssetReadOptions): Readable {
@@ -174,7 +190,7 @@ class FluentRender implements Omit<RenderBuilder, PresetName> {
   }
 
   save(path: string, options?: AssetReadOptions): Promise<void> {
-    return this.#started().then((asset) => asset.save(path, options));
+    return this.#started().then((asset) => asset.save(path, this.#readOptions(options)));
   }
 
   resize(target: ResizeTarget): RenderBuilder {
@@ -207,11 +223,22 @@ class FluentRender implements Omit<RenderBuilder, PresetName> {
 
   /**
    * Backs `util.inspect(builder)` / `console.log(builder)`: the job ID, and the
-   * chosen preset's JSON form when it is already a `Preset`.
+   * chosen preset's redacted JSON form. A preset given as a raw `.epr` URL or
+   * XML is normalized first, so a presigned URL's signature never prints.
    */
   [Symbol.for('nodejs.util.inspect.custom')](): { jobId: string | undefined; preset: unknown } {
+    return { jobId: this.jobId, preset: this.#inspectPreset() };
+  }
+
+  /** The preset field `inspect` shows: its redacted JSON form, or `undefined` when none is chosen yet or it cannot be normalized. */
+  #inspectPreset(): unknown {
     const preset = this.#preset;
-    return { jobId: this.jobId, preset: preset instanceof Preset ? preset.toJSON() : preset };
+    if (preset === undefined) return undefined;
+    try {
+      return toPreset(preset).toJSON();
+    } catch {
+      return '<unresolved preset>';
+    }
   }
 
   /** A new builder with `change` applied to this builder's preset, or to an empty base without one. */
@@ -263,7 +290,19 @@ class FluentRender implements Omit<RenderBuilder, PresetName> {
 
   async *#chunks(options: AssetReadOptions | undefined): AsyncGenerator<Buffer> {
     const asset = await this.#started();
-    yield* asset.stream(options);
+    yield* asset.stream(this.#readOptions(options));
+  }
+
+  /**
+   * The options a terminal's underlying `Asset` read observes: the caller's
+   * own signal, this builder's `signal` option, and this builder's own
+   * `cancel()` — whichever fires first.
+   */
+  #readOptions(options: AssetReadOptions | undefined): AssetReadOptions {
+    const signals = [this.#reading.signal, this.#options.signal, options?.signal].filter(
+      (signal): signal is AbortSignal => signal !== undefined,
+    );
+    return { signal: AbortSignal.any(signals) };
   }
 
   static {

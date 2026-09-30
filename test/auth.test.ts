@@ -427,11 +427,14 @@ test('a non-JWT opaque token falls back to DEFAULT_TOKEN_TTL_MS when no tokenTtl
 
 // --- the mint time-box -------------------------------------------------------------
 
-test('a mint IMS has not answered within MINT_TIMEOUT_MS rejects every waiter auth_failed, and its late answer is dropped', async () => {
+test('a mint IMS has not answered within MINT_TIMEOUT_MS rejects every waiter auth_failed, and its late token is cached for the next caller', async () => {
   useFakeClock();
   const authenticate = vi.spyOn(ServerToServerTokenProvider.prototype, 'authenticate');
   const held = deferred();
-  ims.token('LATE_TOKEN', { hold: held.promise });
+  // A real IMS token's shape: no exp; created_at a 13-digit string of epoch
+  // milliseconds; expires_in the string 86400000 (24 hours).
+  const lateToken = fakeJwt(imsClaims(String(Date.now()), '86400000'));
+  ims.token(lateToken, { hold: held.promise });
   ims.token('TOKEN_2');
   const provider = new ClientCredentialsProvider(CREDS);
 
@@ -458,9 +461,74 @@ test('a mint IMS has not answered within MINT_TIMEOUT_MS rejects every waiter au
       );
     }
 
-    // IMS answers only now: the abandoned mint's token is dropped, not cached.
+    // IMS answers only now: the late token passes validation and is cached.
     held.resolve();
-    await expect(authenticate.mock.results[0]?.value).resolves.toBe('LATE_TOKEN');
+    await expect(authenticate.mock.results[0]?.value).resolves.toBe(lateToken);
+    await flush();
+    await expect(provider.getAccessToken()).resolves.toBe(lateToken);
+    expect(ims.requests).toHaveLength(1);
+
+    // Its claims set the cache life: served until 60 s before its 24 hours are up.
+    await vi.advanceTimersByTimeAsync(23 * HOUR_MS);
+    await expect(provider.getAccessToken()).resolves.toBe(lateToken);
+    expect(ims.requests).toHaveLength(1);
+  } finally {
+    held.resolve();
+  }
+});
+
+test('a call made while a timed-out mint is still pending waits on it, under its own bound, rather than starting another', async () => {
+  useFakeClock();
+  const held = deferred();
+  ims.token('LATE_TOKEN', { hold: held.promise });
+  ims.token('TOKEN_2');
+  const provider = new ClientCredentialsProvider(CREDS);
+
+  try {
+    const first = track(provider.getAccessToken());
+    await until(() => ims.requests.length === 1);
+    await vi.advanceTimersByTimeAsync(MINT_TIMEOUT_MS);
+    await until(() => first.state === 'rejected');
+
+    // Joins the pending mint: no second request, and its own 30 s from now.
+    const second = track(provider.getAccessToken());
+    await flush();
+    expect(ims.requests).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(MINT_TIMEOUT_MS - 1);
+    await flush();
+    expect(second.state).toBe('pending');
+    await vi.advanceTimersByTimeAsync(1);
+    await until(() => second.state === 'rejected');
+    expect((second.error as AudioVideoError).code).toBe('auth_failed');
+
+    // Still no second mint; the late answer serves the caller waiting now.
+    const third = track(provider.getAccessToken({ forceRefresh: true }));
+    await flush();
+    expect(ims.requests).toHaveLength(1);
+    held.resolve();
+    await until(() => third.state === 'fulfilled');
+    expect(third.value).toBe('LATE_TOKEN');
+    expect(ims.requests).toHaveLength(1);
+  } finally {
+    held.resolve();
+  }
+});
+
+test('a late answer that fails token validation is not cached, and the next call starts a fresh mint', async () => {
+  useFakeClock();
+  const held = deferred();
+  ims.answer(400, { error: 'invalid_client' }, { hold: held.promise });
+  ims.token('TOKEN_2');
+  const provider = new ClientCredentialsProvider(CREDS);
+
+  try {
+    const first = track(provider.getAccessToken());
+    await until(() => ims.requests.length === 1);
+    await vi.advanceTimersByTimeAsync(MINT_TIMEOUT_MS);
+    await until(() => first.state === 'rejected');
+
+    held.resolve();
+    await flush();
     await flush();
     await expect(provider.getAccessToken()).resolves.toBe('TOKEN_2');
     expect(ims.requests).toHaveLength(2);

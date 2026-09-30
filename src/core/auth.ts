@@ -114,10 +114,11 @@ const DEFAULT_REFRESH_MARGIN_MS = 60_000;
 export const MIN_TOKEN_REUSE_MS = 5_000;
 
 /**
- * How long a mint waits for IMS before every caller waiting on it rejects
- * `auth_failed`. The wrapped provider's request carries no timeout or abort
- * signal of its own, so this bound is what stops a stalled IMS connection
- * from stalling every caller.
+ * How long each caller waits for IMS before rejecting `auth_failed`. The
+ * wrapped provider's request carries no timeout or abort signal of its own,
+ * so this bound is what stops a stalled IMS connection from stalling every
+ * caller; the request itself runs on, and a valid token it yields later is
+ * still cached.
  *
  * @internal
  */
@@ -191,14 +192,16 @@ export interface ClientCredentialsProviderOptions {
  * {@link GetAccessTokenOptions.forceRefresh} call that arrives while another
  * mint (forced or cache-driven) is already in progress.
  *
- * **A mint is time-boxed to 30 seconds.** The wrapped provider's request has
- * no timeout of its own and cannot be aborted, so a mint IMS has not
- * answered within 30 seconds rejects every caller waiting on it with
- * `auth_failed`, and the next call starts a fresh mint. The abandoned
- * request runs on; its eventual answer is dropped, never cached. For the
- * same reason a caller's {@link GetAccessTokenOptions.signal} stops only
- * that caller waiting: it rejects `cancelled`, while the shared mint carries
- * on for every other caller.
+ * **Each caller waits at most 30 seconds.** The wrapped provider's request
+ * has no timeout of its own and cannot be aborted, so a caller IMS has not
+ * answered within 30 seconds rejects `auth_failed`. The request itself runs
+ * on, still shared: a call made while it is pending waits on it, under its
+ * own 30-second bound, rather than starting a second one; and when IMS does
+ * answer with a valid token, that token is cached like any other, so even a
+ * consistently slow IMS ends up serving the calls that follow. For the same
+ * reason a caller's {@link GetAccessTokenOptions.signal} stops only that
+ * caller waiting: it rejects `cancelled`, while the shared mint carries on
+ * for every other caller.
  *
  * **Credentials are checked at construction.** The wrapped provider builds
  * its form body without URL-encoding, so a client ID, secret or scope
@@ -259,7 +262,8 @@ export class ClientCredentialsProvider implements TokenProvider {
    * @throws {@link AudioVideoError} with `code: 'auth_failed'` when IMS does
    *   not return a usable token — the message then names IMS's OAuth `error`
    *   code when it sent one — when the wrapped provider's `authenticate()`
-   *   call fails outright, or when IMS has not answered within 30 seconds.
+   *   call fails outright, or when IMS has not answered this caller within 30
+   *   seconds.
    *   The client secret is never included in the thrown error's message;
    *   when the wrapped provider threw, `.cause` carries its error for
    *   programmatic inspection and is excluded from every serialized form of
@@ -274,41 +278,27 @@ export class ClientCredentialsProvider implements TokenProvider {
     if (!opts.forceRefresh && this.#cachedToken !== undefined && Date.now() < this.#refreshAt) {
       return this.#cachedToken;
     }
-    if (!this.#inflight) {
-      this.#inflight = this.#mint().finally(() => {
-        this.#inflight = undefined;
-      });
-    }
-    return signal === undefined ? this.#inflight : untilAborted(this.#inflight, signal);
+    this.#inflight ??= this.#mint();
+    const waited = withinMintTimeout(this.#inflight);
+    return signal === undefined ? waited : untilAborted(waited, signal);
   }
 
   /**
-   * One exchange, time-boxed to {@link MINT_TIMEOUT_MS}: the cache is written
-   * only when IMS answers inside the bound. Past it, the promise rejects
-   * `auth_failed`; the exchange itself cannot be stopped, so it runs on and
-   * its eventual result is dropped.
+   * One exchange, shared by every caller until IMS answers or the request
+   * fails, however long that takes: a valid token it yields is cached even
+   * when every caller that was waiting on it has stopped. Each caller's own
+   * wait is bounded separately, by {@link withinMintTimeout}.
    */
   #mint(): Promise<string> {
-    return new Promise<string>((resolve, reject) => {
-      let timedOut = false;
-      const timer = setTimeout(() => {
-        timedOut = true;
-        reject(mintTimeoutError());
-      }, MINT_TIMEOUT_MS);
-      this.#exchange().then(
-        ({ token, refreshAt }) => {
-          clearTimeout(timer);
-          if (timedOut) return;
-          this.#cachedToken = token;
-          this.#refreshAt = refreshAt;
-          resolve(token);
-        },
-        (error: unknown) => {
-          clearTimeout(timer);
-          reject(error);
-        },
-      );
+    const mint = this.#exchange().then(({ token, refreshAt }) => {
+      this.#cachedToken = token;
+      this.#refreshAt = refreshAt;
+      return token;
     });
+    const shared: Promise<string> = mint.finally(() => {
+      if (this.#inflight === shared) this.#inflight = undefined;
+    });
+    return shared;
   }
 
   /**
@@ -409,6 +399,29 @@ function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   });
 }
 
+/**
+ * `mint`'s outcome, unless {@link MINT_TIMEOUT_MS} passes first — then
+ * `auth_failed`, while `mint` runs on for anyone else. The timer is cleared
+ * as soon as `mint` settles, and the handler stays attached after a timeout,
+ * so a mint that fails once nobody is waiting is never an unhandled
+ * rejection.
+ */
+function withinMintTimeout(mint: Promise<string>): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const timer = setTimeout(() => reject(mintTimeoutError()), MINT_TIMEOUT_MS);
+    mint.then(
+      (token) => {
+        clearTimeout(timer);
+        resolve(token);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 /** The `cancelled` error a caller receives once its own signal stops its wait for a token. */
 function cancelledError(signal: AbortSignal): AudioVideoError {
   return new AudioVideoError({
@@ -418,7 +431,7 @@ function cancelledError(signal: AbortSignal): AudioVideoError {
   });
 }
 
-/** The `auth_failed` error every waiter on a mint receives once it outlives {@link MINT_TIMEOUT_MS}. */
+/** The `auth_failed` error a caller receives once it has waited {@link MINT_TIMEOUT_MS} for a mint. */
 function mintTimeoutError(): AudioVideoError {
   return new AudioVideoError({
     message: `IMS did not answer the token request within ${MINT_TIMEOUT_MS / 1_000} seconds.`,

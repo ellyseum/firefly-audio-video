@@ -189,13 +189,12 @@ describe.skipIf(!process.env.IMS_OAUTH_S2S_CLIENT_ID)('live render round trip', 
       retry: { maxRetries: 0 },
     });
     const path = join(outDir, `${name}${leg.extension}`);
-    // The service refuses a render with no `variations` (422), so the spec carries one variation
-    // that overrides nothing: every control keeps the template's default.
+    // No `variations`: the SDK sends the one the service requires, overriding nothing, so every
+    // control keeps the template's default and the leg exercises what a caller gets by default.
     const asset = await client.render(
       {
         source: template,
         presets: [leg.preset],
-        variations: [{ variables: [] }],
         outputs: [{ presetIndex: 0 }],
       },
       { signal },

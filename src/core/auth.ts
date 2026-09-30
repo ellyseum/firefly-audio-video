@@ -28,7 +28,7 @@ export interface GetAccessTokenOptions {
    * rejects with {@link AudioVideoError} `code: 'cancelled'` (the signal's
    * `reason` as `.cause`) the moment it aborts — at once, without contacting
    * IMS, if it already has. A mint other callers are waiting on is never
-   * cancelled: it runs on for them and still fills the cache.
+   * cancelled: it runs on for them, and its token is cached like any other.
    */
   signal?: AbortSignal;
 }
@@ -114,15 +114,29 @@ const DEFAULT_REFRESH_MARGIN_MS = 60_000;
 export const MIN_TOKEN_REUSE_MS = 5_000;
 
 /**
- * How long each caller waits for IMS before rejecting `auth_failed`. The
- * wrapped provider's request carries no timeout or abort signal of its own,
- * so this bound is what stops a stalled IMS connection from stalling every
- * caller; the request itself runs on, and a valid token it yields later is
- * still cached.
+ * How long each caller waits for IMS before rejecting `auth_failed`, and how
+ * old a pending request may grow before the next caller starts a fresh one
+ * instead of joining it. The wrapped provider's request carries no timeout or
+ * abort signal of its own, so this bound is what stops a stalled IMS
+ * connection from stalling every caller; the request itself runs on, and a
+ * valid token it yields later is still cached unless the cache already holds
+ * one that expires later.
  *
  * @internal
  */
 export const MINT_TIMEOUT_MS = 30_000;
+
+/**
+ * How many IMS requests may be pending at once: one past its time-box that
+ * never settled, and the fresh one started after it.
+ */
+const MAX_PENDING_MINTS = 2;
+
+/** An IMS request still pending, and when it started. */
+interface PendingMint {
+  readonly promise: Promise<string>;
+  readonly startedAt: number;
+}
 
 /**
  * Tuning knobs for {@link ClientCredentialsProvider}'s own token cache.
@@ -187,21 +201,24 @@ export interface ClientCredentialsProviderOptions {
  * not one per call. {@link GetAccessTokenOptions.forceRefresh} (which the
  * HTTP client sends after a `401`) still mints at once.
  *
- * Concurrent calls while a mint is in flight share the same underlying
- * request rather than each triggering their own — including a
- * {@link GetAccessTokenOptions.forceRefresh} call that arrives while another
- * mint (forced or cache-driven) is already in progress.
+ * A call that needs a token while a mint is in flight waits on that mint
+ * rather than starting its own — a {@link GetAccessTokenOptions.forceRefresh}
+ * call included — as long as the mint is less than 30 seconds old.
  *
- * **Each caller waits at most 30 seconds.** The wrapped provider's request
- * has no timeout of its own and cannot be aborted, so a caller IMS has not
- * answered within 30 seconds rejects `auth_failed`. The request itself runs
- * on, still shared: a call made while it is pending waits on it, under its
- * own 30-second bound, rather than starting a second one; and when IMS does
- * answer with a valid token, that token is cached like any other, so even a
- * consistently slow IMS ends up serving the calls that follow. For the same
- * reason a caller's {@link GetAccessTokenOptions.signal} stops only that
- * caller waiting: it rejects `cancelled`, while the shared mint carries on
- * for every other caller.
+ * **Each caller waits at most 30 seconds, and a request that never settles
+ * cannot block recovery.** The wrapped provider's request has no timeout of
+ * its own and cannot be aborted, so a caller IMS has not answered within 30
+ * seconds rejects `auth_failed`, and the request itself runs on. Once it is
+ * 30 seconds old, the next call that needs a token starts a fresh request
+ * instead of joining it; at most two are ever pending, and with two pending a
+ * call waits on the newer one. Every valid token that arrives is cached,
+ * however late — so even a consistently slow IMS ends up serving the calls
+ * that follow — and when two arrive, the one that expires later is kept. A
+ * cached token that is due for refresh, or that a
+ * {@link GetAccessTokenOptions.forceRefresh} call asked to replace, gives way
+ * to the next valid token whatever its expiry. A caller's
+ * {@link GetAccessTokenOptions.signal} stops only that caller waiting: it
+ * rejects `cancelled`, while the mint carries on for every other caller.
  *
  * **Credentials are checked at construction.** The wrapped provider builds
  * its form body without URL-encoding, so a client ID, secret or scope
@@ -222,8 +239,11 @@ export class ClientCredentialsProvider implements TokenProvider {
   readonly #tokenTtlMs: number;
   readonly #refreshMarginMs: number;
   #cachedToken: string | undefined;
+  /** When the cached token expires; `-Infinity` with none cached, or once a caller needs it replaced. */
+  #cachedExpiresAt = Number.NEGATIVE_INFINITY;
   #refreshAt = 0;
-  #inflight: Promise<string> | undefined;
+  /** The IMS requests still pending, oldest first; never more than {@link MAX_PENDING_MINTS}. */
+  readonly #pending: PendingMint[] = [];
 
   /**
    * @param credentials - The client ID/secret (and optional scope) to authenticate with.
@@ -256,7 +276,8 @@ export class ClientCredentialsProvider implements TokenProvider {
    * expiry (and at least 5 seconds after the token arrived) — or
    * immediately, when {@link GetAccessTokenOptions.forceRefresh}
    * is set. A mint already in flight (cache-driven or forced) is shared by
-   * every concurrent caller rather than triggering a second one.
+   * every caller that arrives while it is less than 30 seconds old; after
+   * that a caller starts a fresh one, with at most two pending.
    *
    * @param opts - See {@link GetAccessTokenOptions}.
    * @throws {@link AudioVideoError} with `code: 'auth_failed'` when IMS does
@@ -278,34 +299,61 @@ export class ClientCredentialsProvider implements TokenProvider {
     if (!opts.forceRefresh && this.#cachedToken !== undefined && Date.now() < this.#refreshAt) {
       return this.#cachedToken;
     }
-    this.#inflight ??= this.#mint();
-    const waited = withinMintTimeout(this.#inflight);
+    // The cached token is due for refresh or refused: the next valid token replaces it.
+    this.#cachedExpiresAt = Number.NEGATIVE_INFINITY;
+    const waited = withinMintTimeout(this.#mintToJoin());
     return signal === undefined ? waited : untilAborted(waited, signal);
   }
 
   /**
-   * One exchange, shared by every caller until IMS answers or the request
-   * fails, however long that takes: a valid token it yields is cached even
-   * when every caller that was waiting on it has stopped. Each caller's own
-   * wait is bounded separately, by {@link withinMintTimeout}.
+   * The mint a caller that needs a token waits on: the newest pending one
+   * while it is inside its {@link MINT_TIMEOUT_MS} time-box, or once
+   * {@link MAX_PENDING_MINTS} are pending; otherwise a fresh one, so a
+   * request that never settles cannot hold every later caller.
+   */
+  #mintToJoin(): Promise<string> {
+    const newest = this.#pending.at(-1);
+    if (
+      newest !== undefined &&
+      (Date.now() - newest.startedAt < MINT_TIMEOUT_MS || this.#pending.length >= MAX_PENDING_MINTS)
+    ) {
+      return newest.promise;
+    }
+    return this.#mint();
+  }
+
+  /**
+   * One exchange, pending until IMS answers or the request fails, however
+   * long that takes. A valid token it yields is cached even when every caller
+   * that was waiting on it has stopped — unless the cache holds one that
+   * expires later and is not due for refresh. Each caller's own wait is
+   * bounded separately, by {@link withinMintTimeout}.
    */
   #mint(): Promise<string> {
-    const mint = this.#exchange().then(({ token, refreshAt }) => {
-      this.#cachedToken = token;
-      this.#refreshAt = refreshAt;
-      return token;
-    });
-    const shared: Promise<string> = mint.finally(() => {
-      if (this.#inflight === shared) this.#inflight = undefined;
-    });
-    return shared;
+    const startedAt = Date.now();
+    const promise: Promise<string> = this.#exchange()
+      .then(({ token, expiresAt, refreshAt }) => {
+        if (this.#cachedToken === undefined || expiresAt >= this.#cachedExpiresAt) {
+          this.#cachedToken = token;
+          this.#cachedExpiresAt = expiresAt;
+          this.#refreshAt = refreshAt;
+        }
+        return token;
+      })
+      .finally(() => {
+        const index = this.#pending.findIndex((mint) => mint.promise === promise);
+        if (index !== -1) this.#pending.splice(index, 1);
+      });
+    this.#pending.push({ promise, startedAt });
+    return promise;
   }
 
   /**
    * One IMS exchange on a fresh instance of the wrapped provider: the token
-   * is checked, and its refresh point computed, without touching the cache.
+   * is checked, and its expiry and refresh point computed, without touching
+   * the cache.
    */
-  async #exchange(): Promise<{ token: string; refreshAt: number }> {
+  async #exchange(): Promise<{ token: string; expiresAt: number; refreshAt: number }> {
     const vendor = new ServerToServerTokenProvider({ ...this.#details }, { autoRefresh: false });
     try {
       const token: unknown = await vendor.authenticate();
@@ -315,7 +363,7 @@ export class ClientCredentialsProvider implements TokenProvider {
       const arrivedAt = Date.now();
       const expiresAt = claimedExpiryMs(token) ?? arrivedAt + this.#tokenTtlMs;
       const refreshAt = Math.max(expiresAt - this.#refreshMarginMs, arrivedAt + MIN_TOKEN_REUSE_MS);
-      return { token, refreshAt };
+      return { token, expiresAt, refreshAt };
     } catch (cause) {
       if (cause instanceof AudioVideoError) throw cause;
       throw new AudioVideoError({

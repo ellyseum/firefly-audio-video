@@ -76,6 +76,9 @@ jobs:
           cache: 'npm'
       - run: npm ci
       - run: npm run build
+      # An application bundling the built package without the optional storage
+      # peers still builds, and each storage provider reports its missing peer.
+      - run: npm run bundle-smoke
 
   test:
     strategy:

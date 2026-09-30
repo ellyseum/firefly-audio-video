@@ -521,6 +521,37 @@ test('a non-2xx response throws AudioVideoError whose serialized form has no sig
   }
 });
 
+test('a signature in the request URL never reaches the error message', async () => {
+  pool()
+    .intercept({ path: (path) => path.startsWith('/v1/presets'), method: 'GET' })
+    .reply(403, { error: 'forbidden' });
+
+  const err = await rejection(
+    new HttpClient({ apiKey: 'key', tokenProvider }).request(
+      'GET',
+      '/v1/presets?sig=PATH_SIG&rest=keep',
+    ),
+  );
+
+  expect(err.message).toBe(
+    `Request to ${DEFAULT_HOST}/v1/presets?rest=keep failed with status 403.`,
+  );
+});
+
+test('the body of a retried 429 or 401 is cancelled before the retry, releasing its connection', async () => {
+  const cancel = vi.spyOn(ReadableStream.prototype, 'cancel');
+  getAccessTokenMock.mockReset().mockResolvedValue('TOKEN_1');
+  pool()
+    .intercept({ path: '/v1/presets', method: 'GET' })
+    .reply(429, { error: 'rate_limit' }, { headers: { 'retry-after': '0' } });
+  pool().intercept({ path: '/v1/presets', method: 'GET' }).reply(401, { error: 'unauthorized' });
+  pool().intercept({ path: '/v1/presets', method: 'GET' }).reply(200, { presets: [] });
+
+  await new HttpClient({ apiKey: 'key', tokenProvider }).request('GET', '/v1/presets');
+
+  expect(cancel).toHaveBeenCalledTimes(2);
+});
+
 test('a non-JSON error body is cut to 4096 characters in .items, noting its full length, and still redacted', async () => {
   const page = `<html><a href="https://h.example/f?sv=1&amp;sig=HTMLSIG">retry</a>${'x'.repeat(1_000_000)}</html>`;
   pool().intercept({ path: '/v1/presets', method: 'GET' }).reply(502, page);

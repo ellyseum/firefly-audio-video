@@ -33,8 +33,20 @@ test('variationIndex defaults to 0; fileName omitted when absent', () => {
   expect('fileName' in body.outputs[0]!).toBe(false);
 });
 
-test('an invalid spec throws a zod error', () => {
-  expect(() => buildRenderBody({ source: 's', presets: [] } as unknown as RenderSpec)).toThrow();
+test('a spec with no presets, and nothing else wrong, throws a zod error saying so', () => {
+  const spec: RenderSpec = {
+    source: 's',
+    presets: [],
+    outputs: [{ presetIndex: 0, destination: 'd' }],
+  };
+  expect(() => buildRenderBody(spec)).toThrow(z.ZodError);
+  expect(() => buildRenderBody(spec)).toThrow('at least one preset is required');
+});
+
+test('a spec with no outputs, and nothing else wrong, throws a zod error saying so', () => {
+  const spec: RenderSpec = { source: 's', presets: [{ presetId: 'p' }], outputs: [] };
+  expect(() => buildRenderBody(spec)).toThrow(z.ZodError);
+  expect(() => buildRenderBody(spec)).toThrow('at least one output is required');
 });
 
 test('an assetIndex past the end of assets throws a zod error naming exactly that variable', () => {

@@ -843,6 +843,33 @@ test('a missing AWS SDK package rejects missing_peer_dependency naming both pack
   expect(presignerOnly.message).toContain('the presigner option');
 });
 
+test('an AWS SDK package that is installed but fails to load names the option that takes it, with the loader error redacted', async () => {
+  const actual =
+    await vi.importActual<typeof import('../src/storage/peer.js')>('../src/storage/peer.js');
+  vi.mocked(loadPeer).mockImplementation((peer: Peer) =>
+    actual.loadPeer(peer, () =>
+      Promise.reject(new Error('refused at https://x.example/sdk.js?sig=LOAD_SIG_LEAK')),
+    ),
+  );
+  const s3 = await rejection(new S3StorageProvider({ bucket: BUCKET }).stageRead(Buffer.from('x')));
+  expect(s3.code).toBe('storage_failed');
+  expect(s3.message).toBe(
+    'Loading @aws-sdk/client-s3 for S3StorageProvider failed (Error: refused at ' +
+      'https://x.example/sdk.js). Pass the module as the s3 option instead: a module passed in ' +
+      'needs no run-time import.',
+  );
+
+  const presigner = await rejection(
+    new S3StorageProvider({ bucket: BUCKET, s3: s3Module(fakeClient()).module }).allocateOutput(),
+  );
+  expect(presigner.message).toContain(
+    'Loading @aws-sdk/s3-request-presigner for S3StorageProvider',
+  );
+  expect(presigner.message).toContain('Pass the module as the presigner option instead');
+  for (const error of [s3, presigner])
+    expect(everythingPrinted(error)).not.toContain('LOAD_SIG_LEAK');
+});
+
 test('a failed load is retried on the next call', async () => {
   const client = fakeClient();
   const presigner = fakePresigner();

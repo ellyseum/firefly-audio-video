@@ -500,6 +500,23 @@ test('a missing @adobe/aio-lib-files rejects missing_peer_dependency naming the 
   expect(error.message).toContain('pass the module as the module option instead');
 });
 
+test('an installed @adobe/aio-lib-files that fails to load names the module option, with the loader error as text', async () => {
+  const actual =
+    await vi.importActual<typeof import('../src/storage/peer.js')>('../src/storage/peer.js');
+  vi.mocked(loadPeer).mockImplementation((peer: Peer) =>
+    actual.loadPeer(peer, () => Promise.reject(new TypeError('the sandbox refused import()'))),
+  );
+  const error = await rejection(
+    new AioFilesStorageProvider({ namespace: 'ns', auth: AUTH }).stageRead(Buffer.from('x')),
+  );
+  expect(error.code).toBe('storage_failed');
+  expect(error.message).toBe(
+    'Loading @adobe/aio-lib-files for AioFilesStorageProvider failed (TypeError: the sandbox ' +
+      'refused import()). Pass the module as the module option instead: a module passed in ' +
+      'needs no run-time import.',
+  );
+});
+
 /** Every common printed form of a value: `inspect`, `String`, `JSON.stringify`, a spread copy, and what `console.log` writes. */
 function printedForms(value: object): string {
   const written: string[] = [];

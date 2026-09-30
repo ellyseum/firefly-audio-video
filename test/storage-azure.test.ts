@@ -855,6 +855,27 @@ test('a missing @azure/storage-blob rejects missing_peer_dependency naming the i
   expect(error.message).toContain('AzureBlobStorageProvider needs @azure/storage-blob');
   expect(error.message).toContain('`npm install @azure/storage-blob`');
   expect(error.message).toContain('pass the module as the module option instead');
+  expect(error.message).toContain('(Error [ERR_MODULE_NOT_FOUND]: Cannot find package)');
+});
+
+test('an installed @azure/storage-blob that fails to load names the module option, with the loader error as text', async () => {
+  const actual =
+    await vi.importActual<typeof import('../src/storage/peer.js')>('../src/storage/peer.js');
+  vi.mocked(loadPeer).mockImplementation((peer: Peer) =>
+    actual.loadPeer(peer, () => Promise.reject(new TypeError('the sandbox refused import()'))),
+  );
+  const error = await rejection(
+    new AzureBlobStorageProvider({
+      container: CONTAINER,
+      connectionString: CONNECTION_STRING,
+    }).stageRead(Buffer.from('x')),
+  );
+  expect(error.code).toBe('storage_failed');
+  expect(error.message).toBe(
+    'Loading @azure/storage-blob for AzureBlobStorageProvider failed (TypeError: the sandbox ' +
+      'refused import()). Pass the module as the module option instead: a module passed in ' +
+      'needs no run-time import.',
+  );
 });
 
 test('a failed load is retried on the next call', async () => {

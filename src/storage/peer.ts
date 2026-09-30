@@ -38,9 +38,11 @@ export interface Peer {
  * @internal Imports `peer` through `importer`.
  *
  * @throws {@link AudioVideoError} `missing_peer_dependency`, naming the
- *   install command and the option that takes the module instead, when the
- *   module cannot be found; `storage_failed` when loading it fails in any
- *   other way. Either way the cause is a redacted copy of the loader's error.
+ *   install command, when the module cannot be found; `storage_failed` when
+ *   loading it fails in any other way — a test runner's sandbox that refuses
+ *   a run-time `import()`, a module that throws while it loads. Either way
+ *   the message names the option that takes the module itself, and carries
+ *   the loader's error as redacted text; the cause is a redacted copy of it.
  */
 export async function loadPeer(
   peer: Peer,
@@ -49,20 +51,24 @@ export async function loadPeer(
   try {
     return await importer(peer.specifier);
   } catch (error) {
+    const cause = redactError(error);
+    const reason = causeText(cause);
     if (isModuleNotFound(error)) {
       throw new AudioVideoError({
         message:
-          `${peer.provider} needs ${peer.specifier}, which could not be found: install it with ` +
-          `\`${peer.install}\`. In bundled code, where it cannot be loaded at run time, pass the ` +
-          `module as the ${peer.option} option instead.`,
+          `${peer.provider} needs ${peer.specifier}, which could not be found (${reason}): ` +
+          `install it with \`${peer.install}\`. In bundled code, where it cannot be loaded at ` +
+          `run time, pass the module as the ${peer.option} option instead.`,
         code: 'missing_peer_dependency',
-        cause: redactError(error),
+        cause,
       });
     }
     throw new AudioVideoError({
-      message: `Loading ${peer.specifier} for ${peer.provider} failed.`,
+      message:
+        `Loading ${peer.specifier} for ${peer.provider} failed (${reason}). Pass the module as ` +
+        `the ${peer.option} option instead: a module passed in needs no run-time import.`,
       code: 'storage_failed',
-      cause: redactError(error),
+      cause,
     });
   }
 }
@@ -83,6 +89,17 @@ export function exportOf(module: unknown, name: string, peer: Peer): unknown {
     message: `${peer.specifier} does not export ${name}, which ${peer.provider} needs.`,
     code: 'storage_failed',
   });
+}
+
+/** How much of a loader's error a message repeats. */
+const CAUSE_LIMIT = 300;
+
+/** A redacted loader error as one line, `name [code]: message`, cut short. */
+function causeText(cause: Error): string {
+  const code = (cause as Error & { code?: unknown }).code;
+  const head = code === undefined ? cause.name : `${cause.name} [${String(code)}]`;
+  const text = cause.message === '' ? head : `${head}: ${cause.message}`;
+  return text.length > CAUSE_LIMIT ? `${text.slice(0, CAUSE_LIMIT - 3)}...` : text;
 }
 
 /** True for the error `import()` (`ERR_MODULE_NOT_FOUND`) or `require()` (`MODULE_NOT_FOUND`) raises for a module it cannot find. */

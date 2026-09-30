@@ -181,6 +181,36 @@ test.each<[flag: string]>([['--aws-secret-access-key'], ['--azure-storage-connec
   },
 );
 
+test('dgr with no command prints its help to stderr and exits 2', async () => {
+  const harness = createHarness();
+  await harness.run([]);
+  expect(harness.stdoutText()).toBe('');
+  expect(harness.stderrText()).toContain('Usage: dgr');
+  expect(harness.exit).toHaveBeenCalledExactlyOnceWith(2);
+});
+
+test('dgr --json with no command prints one invalid_argument document naming the commands, exit 2', async () => {
+  const harness = createHarness();
+  await harness.run(['--json']);
+  const lines = stdoutLines(harness.stdoutText());
+  expect(lines).toHaveLength(1);
+  expect(JSON.parse(lines[0] ?? '')).toEqual({
+    ok: false,
+    error: {
+      code: 'invalid_argument',
+      message: 'dgr needs a command: render, describe, presets, status, cancel, stage or encode.',
+    },
+  });
+  expect(harness.exit).toHaveBeenCalledExactlyOnceWith(2);
+});
+
+test('dgr help, asked for, prints the help to stdout and exits 0', async () => {
+  const harness = createHarness();
+  await harness.run(['help']);
+  expect(harness.stdoutText()).toContain('Usage: dgr');
+  expect(harness.exit).toHaveBeenCalledExactlyOnceWith(0);
+});
+
 test('a usage error honors --json given after the subcommand, and not a --json that follows --', async () => {
   const after = createHarness({ client: createFakeClient() });
   await after.run(['stage', 'x', '--bogus', '--json']);

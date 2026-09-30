@@ -198,7 +198,7 @@ function wrapParseAsync(program: Command, runtime: CliRuntime, parse: ParseState
       if (error instanceof CommanderError) {
         const code = commanderExitCode(error);
         if (code === 2 && parse.json) {
-          printFailure(runtime, true, invalidArgument(usageMessage(error)));
+          printFailure(runtime, true, invalidArgument(usageMessage(error, program)));
         }
         runtime.exit(code);
       } else {
@@ -211,10 +211,14 @@ function wrapParseAsync(program: Command, runtime: CliRuntime, parse: ParseState
   program.parseAsync = wrapped;
 }
 
-/** `--version` and `--help` exit `0`; every other commander usage error exits `2`. */
+/**
+ * Help or the version, asked for, exits `0`; every other commander usage
+ * error exits `2` — `dgr` with no command included, which commander answers
+ * with help on stderr and a non-zero code of its own.
+ */
 function commanderExitCode(error: CommanderError): number {
-  const passthrough = new Set(['commander.version', 'commander.help', 'commander.helpDisplayed']);
-  return passthrough.has(error.code) ? error.exitCode : 2;
+  const shown = new Set(['commander.version', 'commander.help', 'commander.helpDisplayed']);
+  return shown.has(error.code) && error.exitCode === 0 ? 0 : 2;
 }
 
 /** True when `argv` passes `--json` ahead of any `--`, after which every token is a positional. */
@@ -223,7 +227,16 @@ function wantsJson(argv: readonly string[]): boolean {
   return (end === -1 ? argv : argv.slice(0, end)).includes('--json');
 }
 
-/** Commander's usage-error text without its `error: ` prefix, which the failure document already says. */
-function usageMessage(error: CommanderError): string {
+/**
+ * The failure document's message for a usage error: commander's text without
+ * its `error: ` prefix, which the document already says — or, for `dgr` with
+ * no command, whose help commander prints instead of a message, the commands
+ * to choose from.
+ */
+function usageMessage(error: CommanderError, program: Command): string {
+  if (error.code === 'commander.help') {
+    const names = program.commands.map((command) => command.name());
+    return `dgr needs a command: ${names.slice(0, -1).join(', ')} or ${names.at(-1) ?? ''}.`;
+  }
   return error.message.replace(/^error: /, '').trim();
 }

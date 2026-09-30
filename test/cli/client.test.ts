@@ -1,4 +1,4 @@
-import { expect, test } from 'vitest';
+import { expect, test, vi } from 'vitest';
 import { AudioVideoError } from '../../src/core/errors.js';
 import type { CliRuntime } from '../../src/cli/runtime.js';
 import { resolveClient, resolveCredentials } from '../../src/cli/client.js';
@@ -196,15 +196,21 @@ test('--log routes one NDJSON record per call to the runtime stderr stream, neve
   expect(record).toMatchObject({ level: 'error', msg: 'stage failed' });
 });
 
-test('without --log, the SDK writes no log record to either stream', async () => {
+test('without --log, the SDK writes no log record to the runtime streams or the process stdout', async () => {
   const stdoutChunks: string[] = [];
   const stderrChunks: string[] = [];
   const runtime = runtimeOf({
     stdout: writableStub((c) => stdoutChunks.push(c)),
     stderr: writableStub((c) => stderrChunks.push(c)),
   });
-  const client = resolveClient(runtime, { clientId: 'id', clientSecret: 'secret' });
-  await expect(client.stage('not-a-url-and-not-a-file')).rejects.toBeInstanceOf(AudioVideoError);
+  const processStdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+  try {
+    const client = resolveClient(runtime, { clientId: 'id', clientSecret: 'secret' });
+    await expect(client.stage('not-a-url-and-not-a-file')).rejects.toBeInstanceOf(AudioVideoError);
+    expect(processStdout).not.toHaveBeenCalled();
+  } finally {
+    processStdout.mockRestore();
+  }
   expect(stdoutChunks).toEqual([]);
   expect(stderrChunks).toEqual([]);
 });

@@ -7,7 +7,7 @@
  * nothing here touches the network.
  */
 
-import { expect, test } from 'vitest';
+import { expect, test, vi } from 'vitest';
 import { createHarness } from './support/harness.js';
 
 function jsonLines(text: string): string[] {
@@ -23,6 +23,22 @@ test('--json stdout is exactly one document with --log off (the default)', async
   expect(lines).toHaveLength(1);
   expect(JSON.parse(lines[0] ?? '')).toMatchObject({ ok: false });
   expect(harness.stderrText()).toBe('');
+});
+
+test('without --log, a real client writes nothing to the process stdout', async () => {
+  // The SDK's default logger writes to the process's own stdout, not the
+  // runtime's stream, so only a spy on the real stream sees it.
+  const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+  try {
+    const harness = createHarness({
+      env: { IMS_OAUTH_S2S_CLIENT_ID: 'id', IMS_OAUTH_S2S_CLIENT_SECRET: 's' },
+    });
+    await harness.run(['stage', 'not-a-url-and-not-a-file', '--json']);
+    expect(harness.exit).toHaveBeenCalledExactlyOnceWith(2);
+    expect(write).not.toHaveBeenCalled();
+  } finally {
+    write.mockRestore();
+  }
 });
 
 test('--json stdout is exactly one document with --log on — the SDK log line lands on stderr', async () => {

@@ -11,7 +11,7 @@
 import type { TokenProvider } from './auth.js';
 import { AudioVideoError } from './errors.js';
 import { redactError, redactUrl } from './redact.js';
-import { linkSignals } from './signals.js';
+import { delay, linkSignals } from './signals.js';
 
 /** @internal The default host every {@link HttpClient} targets unless {@link HttpClientOptions.host} overrides it. */
 export const DEFAULT_HOST = 'https://audio-video-api.adobe.io';
@@ -197,7 +197,7 @@ export class HttpClient {
 
         if (res.status === 429 && attempt < this.#maxRetries) {
           await drainBody(res);
-          await sleep(computeDelayMs(res.headers.get('retry-after'), attempt), init.signal);
+          await delay(computeDelayMs(res.headers.get('retry-after'), attempt), init.signal);
           attempt += 1;
           continue;
         }
@@ -490,22 +490,6 @@ function retryAfterMs(header: string | null): number | undefined {
 function computeBackoffMs(attempt: number): number {
   const capped = Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * 2 ** attempt);
   return Math.random() * capped;
-}
-
-/** `setTimeout`-backed delay, abortable via `signal` so a cancellation does not wait out a backoff. */
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) return Promise.reject(signal.reason as Error);
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    }, ms);
-    const onAbort = (): void => {
-      clearTimeout(timer);
-      reject(signal?.reason as Error);
-    };
-    signal?.addEventListener('abort', onAbort, { once: true });
-  });
 }
 
 /**

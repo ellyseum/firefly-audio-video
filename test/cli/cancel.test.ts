@@ -46,3 +46,33 @@ test('--json mode failure', async () => {
   });
   expect(harness.exit).toHaveBeenCalledExactlyOnceWith(5);
 });
+
+const WRITE_SIGNATURE = 'CANCEL_WRITE_SIG_MUST_NOT_PRINT';
+const OUTPUT_PATH = 'https://acct.blob.core.windows.net/c/out.mov';
+
+/** An acknowledgement echoing an output's presigned write URL, the way a status body carries it. */
+const SIGNED_ACK = {
+  jobId: 'job-1',
+  status: 'canceling',
+  outputs: [
+    { destination: { url: `${OUTPUT_PATH}?sv=2021&sp=cw&se=2026&sig=${WRITE_SIGNATURE}` } },
+  ],
+};
+
+const REDACTED_ACK = { ...SIGNED_ACK, outputs: [{ destination: { url: OUTPUT_PATH } }] };
+
+test('human mode prints the acknowledgement without a signature it echoes', async () => {
+  const client = createFakeClient({ cancel: vi.fn(async () => SIGNED_ACK) });
+  const harness = createHarness({ client });
+  await harness.run(['cancel', 'job-1']);
+  expect(harness.stdoutText()).not.toContain(WRITE_SIGNATURE);
+  expect(JSON.parse(harness.stdoutText())).toEqual(REDACTED_ACK);
+});
+
+test('--json mode prints the acknowledgement without a signature it echoes', async () => {
+  const client = createFakeClient({ cancel: vi.fn(async () => SIGNED_ACK) });
+  const harness = createHarness({ client });
+  await harness.run(['cancel', 'job-1', '--json']);
+  expect(harness.stdoutText()).not.toContain(WRITE_SIGNATURE);
+  expect(JSON.parse(harness.stdoutText().trim())).toEqual({ ok: true, job: REDACTED_ACK });
+});

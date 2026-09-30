@@ -1,6 +1,10 @@
-/** `dgr cancel <jobId>`: asks the service to stop a render job. */
+/**
+ * `dgr cancel <jobId>`: asks the service to stop a render job, and prints its
+ * acknowledgement redacted, as `status` prints a status body.
+ */
 
 import { Command } from 'commander';
+import { redactValue } from '../../core/redact.js';
 import { resolveClient } from '../client.js';
 import { runCommand } from '../run-command.js';
 import type { CliRuntime, GlobalOptions } from '../runtime.js';
@@ -14,7 +18,7 @@ export function buildCancelCommand(runtime: CliRuntime): Command {
       const options = self.optsWithGlobals() as GlobalOptions;
       await runCommand(runtime, options.json === true, async () => {
         const client = resolveClient(runtime, options);
-        const status = await client.cancel(jobId);
+        const status = redactValue(await client.cancel(jobId));
         return { result: status, json: { job: status } };
       });
     });

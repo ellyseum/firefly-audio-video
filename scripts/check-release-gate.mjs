@@ -15,17 +15,28 @@
  *    `publish-next` jobs, and both of them declare it.
  *  - `publish-latest`'s `if:` requires `release_created == 'true'` AND
  *    (not OR) `vars.PUBLISH_ENABLED == 'true'`.
+ *  - `publish-latest`'s `needs:` includes `verify`.
  *  - `publish-latest` declares `environment: release`.
  *  - `publish-next`'s `if:` requires `vars.PUBLISH_ENABLED == 'true'` and
  *    the not-a-release-commit check (`release_created != 'true'`).
  *  - `publish-next`'s `needs:` includes `verify`.
  *  - `publish-next` declares `environment: npm-next`.
+ *  - `publish-next` runs `npm version` before `npm run build`, and checks
+ *    the built package's `dist/cli.cjs --version` after the build and
+ *    before `npm publish`, so a prerelease never ships reporting another
+ *    version.
  *  - the only `secrets.*` referenced inside either publish job is
  *    `NPM_BOOTSTRAP_TOKEN`.
  *  - every `npm publish` invocation, in any job, carries `--provenance` —
  *    trusted publishing adds it automatically once configured, but a
  *    publish authenticated by the bootstrap token alone must not ship
  *    without it.
+ *  - `verify`, which both publish jobs need, runs every quality gate
+ *    (typecheck, lint, format check, build, test), the packed-file check
+ *    (`scripts/verify-pack-contents.mjs`), and `scripts/runtime-smoke.mjs`
+ *    under each Node major from the engines floor through the current LTS —
+ *    18, 20, 22 and 24 — each set by a `setup-node` `node-version:` step
+ *    before the smoke run.
  *
  * Usage: `node scripts/check-release-gate.mjs [path-to-release.yml]`
  */
@@ -220,6 +231,51 @@ function secretsReferenced(lines) {
   return [...names];
 }
 
+/** The commands `verify` must run before either publish job may start, each named in its violation. */
+const VERIFY_COMMANDS = [
+  { label: 'npm run typecheck', pattern: /\bnpm run typecheck\b/ },
+  { label: 'npm run lint', pattern: /\bnpm run lint\b/ },
+  { label: 'npm run format:check', pattern: /\bnpm run format:check\b/ },
+  { label: 'npm run build', pattern: /\bnpm run build\b/ },
+  { label: 'npm test', pattern: /\bnpm (?:run )?test\b/ },
+  {
+    label: 'node scripts/verify-pack-contents.mjs',
+    pattern: /\bnode scripts\/verify-pack-contents\.mjs\b/,
+  },
+];
+
+/** The Node majors `verify` must smoke-test the built package on: the engines floor through the current LTS. */
+const RUNTIME_SMOKE_MAJORS = ['18', '20', '22', '24'];
+
+/**
+ * Each Node major a job runs `scripts/runtime-smoke.mjs` under: the value of
+ * the last `node-version:` line above each smoke run, or none for a run
+ * after a `node-version-file:` step. Comment lines are skipped.
+ */
+function runtimeSmokeMajors(lines) {
+  const majors = new Set();
+  let current;
+  for (const line of lines) {
+    if (isBlankOrComment(line)) {
+      continue;
+    }
+    const version = line.match(/^\s*node-version:\s*['"]?(\d+)['"]?\s*$/);
+    if (version) {
+      current = version[1];
+    } else if (/^\s*node-version-file:/.test(line)) {
+      current = undefined;
+    } else if (/\bnode scripts\/runtime-smoke\.mjs\b/.test(line) && current !== undefined) {
+      majors.add(current);
+    }
+  }
+  return majors;
+}
+
+/** The index of the first line in `lines` that is not a comment and matches `pattern`, or -1. */
+function stepIndex(lines, pattern) {
+  return lines.findIndex((line) => !isBlankOrComment(line) && pattern.test(line));
+}
+
 /** Every trimmed line invoking `npm publish` without `--provenance`, in a job's body. */
 function npmPublishLinesWithoutProvenance(lines) {
   return lines
@@ -285,6 +341,13 @@ export function checkReleaseGate(text) {
   if (!latest) {
     push('publish-latest-if', 'job "publish-latest" is missing from the workflow');
   } else {
+    const needs = findNeedsList(latest);
+    if (!needs.includes('verify')) {
+      push(
+        'publish-latest-needs-verify',
+        `needs: must include "verify", found: ${JSON.stringify(needs)}`,
+      );
+    }
     const expr = findIfExpression(latest);
     if (!expr) {
       push('publish-latest-if', 'publish-latest has no if: condition');
@@ -338,12 +401,49 @@ export function checkReleaseGate(text) {
         `needs: must include "verify", found: ${JSON.stringify(needs)}`,
       );
     }
+    const versionAt = stepIndex(next, /\bnpm version\b/);
+    const buildAt = stepIndex(next, /\bnpm run build\b/);
+    const checkAt = stepIndex(next, /\bdist\/cli\.cjs --version\b/);
+    const publishAt = stepIndex(next, /\bnpm publish\b/);
+    if (versionAt === -1 || buildAt === -1 || versionAt > buildAt) {
+      push(
+        'publish-next-version',
+        'npm version must run before npm run build, so the package is built at the version it is published as',
+      );
+    }
+    if (checkAt === -1 || checkAt < buildAt || (publishAt !== -1 && checkAt > publishAt)) {
+      push(
+        'publish-next-version',
+        "the built package's dist/cli.cjs --version must be checked after npm run build and before npm publish",
+      );
+    }
     const env = findEnvironmentName(next);
     if (env !== 'npm-next') {
       push(
         'publish-next-environment',
         `environment must be "npm-next", found: ${JSON.stringify(env)}`,
       );
+    }
+  }
+
+  const verify = jobs.get('verify');
+  if (!verify) {
+    push('verify-coverage', 'job "verify" is missing from the workflow');
+  } else {
+    const commands = verify.filter((line) => !isBlankOrComment(line));
+    for (const { label, pattern } of VERIFY_COMMANDS) {
+      if (!commands.some((line) => pattern.test(line))) {
+        push('verify-coverage', `verify does not run ${label}`);
+      }
+    }
+    const smoked = runtimeSmokeMajors(verify);
+    for (const major of RUNTIME_SMOKE_MAJORS) {
+      if (!smoked.has(major)) {
+        push(
+          'verify-coverage',
+          `verify does not run scripts/runtime-smoke.mjs on Node ${major} (a setup-node step with node-version: ${major} before it)`,
+        );
+      }
     }
   }
 

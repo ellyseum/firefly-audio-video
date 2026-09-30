@@ -20,6 +20,7 @@ test.each<[code: string, expected: number]>([
   ['job_poll_failed', 5],
   ['asset_fetch_failed', 5],
   ['storage_failed', 5],
+  ['save_failed', 1],
   ['http_404', 5],
   ['http_429', 5],
   ['http_500', 5],

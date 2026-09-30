@@ -49,8 +49,11 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
-  # Gates the `next` channel: an untested commit never reaches npm. Skipped
-  # while publishing is disabled, since nothing downstream can run anyway.
+  # Gates both publish jobs: nothing reaches npm, on either channel, unless
+  # every quality gate passes, the packed file list is exactly the public
+  # surface, and the built package loads on each Node major from the
+  # engines floor through the current LTS. Skipped while publishing is
+  # disabled, since nothing downstream can run anyway.
   verify:
     if: github.event_name == 'push' && vars.PUBLISH_ENABLED == 'true'
     runs-on: ubuntu-latest
@@ -61,8 +64,31 @@ jobs:
           node-version-file: '.nvmrc'
           cache: 'npm'
       - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run format:check
       - run: npm run build
       - run: npm test
+      - run: node scripts/verify-pack-contents.mjs
+      # The smoke runs below load the dist/ built above with only the
+      # production dependencies installed, as a consumer has them, with no
+      # optional storage peer; the dev toolchain cannot run on 18 or 20.
+      - run: npm ci --omit=dev --ignore-scripts
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 18
+      - run: node scripts/runtime-smoke.mjs
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+      - run: node scripts/runtime-smoke.mjs
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - run: node scripts/runtime-smoke.mjs
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
       - run: node scripts/runtime-smoke.mjs
 
   # Reads whether the package has ever shipped a stable @latest version, so
@@ -84,9 +110,10 @@ jobs:
           fi
 
   # Publishes the stable release to the default npm dist-tag (`latest`) the
-  # moment release-please tags one, with provenance and no long-lived token.
+  # moment release-please tags one and `verify` passes on that commit, with
+  # provenance and no long-lived token.
   publish-latest:
-    needs: release-please
+    needs: [release-please, verify]
     if: needs.release-please.outputs.release_created == 'true' && vars.PUBLISH_ENABLED == 'true'
     runs-on: ubuntu-latest
     environment:
@@ -138,7 +165,6 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
           package-manager-cache: false
       - run: npm ci
-      - run: npm run build
       - name: compute the next prerelease version
         id: version
         run: |
@@ -147,9 +173,26 @@ jobs:
           sha7="${GITHUB_SHA:0:7}"
           version="${major}.${minor}.$((patch + 1))-next.${GITHUB_RUN_NUMBER}.g${sha7}"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
-      # Applied to the checked-out workspace only; never committed, so
-      # package.json in the repo keeps its release-please-owned version.
+      # The version is set before the build, in both places it lives:
+      # package.json, which npm publishes under, and the VERSION literal in
+      # src/index.ts, which the build bakes into the package and `dgr -V`
+      # prints. Neither change is committed, so the repository keeps its
+      # release-please-owned version.
       - run: npm version "${{ steps.version.outputs.version }}" --no-git-tag-version
+      - name: stamp the prerelease version into src/index.ts
+        run: sed -i -E "s/^export const VERSION = '[^']*';/export const VERSION = '${VERSION}';/" src/index.ts
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+      - run: npm run build
+      - name: check the built package reports the prerelease version
+        run: |
+          built="$(node dist/cli.cjs --version)"
+          if [ "$built" != "$VERSION" ]; then
+            echo "::error::the built package reports ${built}, not ${VERSION}"
+            exit 1
+          fi
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
       - run: npm publish --provenance --tag next --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}

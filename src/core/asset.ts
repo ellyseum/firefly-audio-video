@@ -270,11 +270,15 @@ export class Asset {
    * @param options - See {@link AssetReadOptions}.
    * @throws {@link AudioVideoError} — `code: 'asset_fetch_failed'` — for a
    *   non-2xx response to the first request, a download that ran out of
-   *   retries or met a status it does not retry, any other fetch failure (a
-   *   malformed URL, a DNS failure), or a failed file-system step — creating
-   *   the directory, creating, writing, closing or replacing the temp file,
-   *   moving it into place — which the message names. The URL is always
-   *   redacted, and the `cause` sanitized.
+   *   retries or met a status it does not retry, or any other fetch failure
+   *   (a malformed URL, a DNS failure). The URL is always redacted, and the
+   *   `cause` sanitized.
+   * @throws {@link AudioVideoError} — `code: 'save_failed'` — for a failed
+   *   file-system step — creating the directory, creating, writing, closing
+   *   or replacing the temp file, moving it into place — which the message
+   *   names beside `path`, with the redacted URL and the file system's own
+   *   error, sanitized, as the `cause`. The asset is intact: saving it again
+   *   downloads it again.
    * @throws {@link AudioVideoError} — `code: 'cancelled'` — when
    *   `options.signal` aborts before or during the download.
    * @throws {@link AudioVideoError} — `code: 'invalid_argument'` — when
@@ -563,7 +567,7 @@ export class Asset {
   /**
    * The error {@link Asset.save} rejects with. A download failure is already
    * an {@link AudioVideoError} and passes through. A failed file-system step
-   * becomes `asset_fetch_failed`, its message naming the step and `path` —
+   * becomes `save_failed`, its message naming the step and `path` —
    * never the temp file's own path — and its `cause` the sanitized
    * file-system error; while `signal` is aborted it reports `cancelled`
    * instead, as any other failure would.
@@ -573,7 +577,7 @@ export class Asset {
     if (err instanceof DiskStepFailure && signal?.aborted !== true) {
       return new AudioVideoError({
         message: `Saving the asset at ${redactUrl(this.#url)} to ${path} failed while ${err.step}.`,
-        code: 'asset_fetch_failed',
+        code: 'save_failed',
         cause: sanitizeTransportError(err.cause, this.#url),
       });
     }

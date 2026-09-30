@@ -1,8 +1,9 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import { createProgram } from '../../src/cli/program.js';
+import { Asset } from '../../src/core/asset.js';
 import { AudioVideoError } from '../../src/core/errors.js';
 import type { JobMeta } from '../../src/core/job.js';
 import type { RenderRequest } from '../../src/dgr/schemas.js';
@@ -14,6 +15,20 @@ import { cancelledError, deferredJob, settledJob } from './support/job.js';
 const SECRET = 'RENDER_TEST_SECRET_MUST_NEVER_APPEAR';
 
 const META: JobMeta = { jobId: 'job-1', queueMs: 100, renderMs: 900, totalMs: 1000, perItem: [] };
+
+/** A finished output, as a spec render without `resolveAs` resolves with it. */
+function asset(url: string): Asset {
+  return new Asset({ url, meta: META });
+}
+
+/** A finished output whose download answers with `body`. */
+function downloadableAsset(body: string): Asset {
+  return new Asset({
+    url: 'https://out.example.test/render.mp4?sig=abc',
+    meta: META,
+    fetch: async () => new Response(body, { headers: { 'content-length': String(body.length) } }),
+  });
+}
 
 let dir: string;
 
@@ -32,10 +47,10 @@ function specFile(spec: unknown): string {
 }
 
 test('with no --out and no --resolve-as, human mode prints the bare output URL and exits 0', async () => {
-  const render = vi.fn((_spec: RenderRequest, options: { resolveAs?: string }) => {
-    expect(options.resolveAs).toBe('url');
+  const render = vi.fn((_spec: RenderRequest, options?: { resolveAs?: string }) => {
+    expect(options).toBeUndefined();
     return settledJob(
-      { value: 'https://out.example.test/render.mp4?sig=abc' },
+      { value: asset('https://out.example.test/render.mp4?sig=abc') },
       { jobId: 'job-1', meta: META },
     );
   });
@@ -48,7 +63,7 @@ test('with no --out and no --resolve-as, human mode prints the bare output URL a
 test('--json mode reports jobId, output, queueMs, renderMs and totalMs as exactly one document', async () => {
   const render = vi.fn(() =>
     settledJob(
-      { value: 'https://out.example.test/render.mp4?sig=abc' },
+      { value: asset('https://out.example.test/render.mp4?sig=abc') },
       { jobId: 'job-1', meta: META },
     ),
   );
@@ -76,7 +91,7 @@ test('builds a one-output spec with no destination from --template and --preset'
       presets: ['prores'],
       outputs: [{ presetIndex: 0 }],
     });
-    return settledJob({ value: 'https://out.example.test/a?sig=1' }, { meta: META });
+    return settledJob({ value: asset('https://out.example.test/a?sig=1') }, { meta: META });
   });
   const harness = createHarness({ client: createFakeClient({ render }) });
   await harness.run(['render', '--template', 't.mogrt', '--preset', 'prores']);
@@ -86,7 +101,7 @@ test('builds a one-output spec with no destination from --template and --preset'
 test('builds the preset from --encode JSON instead of --preset', async () => {
   const render = vi.fn((spec: RenderRequest) => {
     expect(spec.presets).toEqual([{ codec: 'hevc', bitDepth: 10 }]);
-    return settledJob({ value: 'https://out.example.test/a?sig=1' }, { meta: META });
+    return settledJob({ value: asset('https://out.example.test/a?sig=1') }, { meta: META });
   });
   const harness = createHarness({ client: createFakeClient({ render }) });
   await harness.run([
@@ -99,14 +114,15 @@ test('builds the preset from --encode JSON instead of --preset', async () => {
   expect(render).toHaveBeenCalledTimes(1);
 });
 
-test('--resolve-as file with --out saves to that path and prints the bare path', async () => {
+test('--resolve-as file with --out saves the output to that path and prints the bare path', async () => {
   const outPath = join(dir, 'out.mp4');
-  const render = vi.fn(
-    (_spec: RenderRequest, options: { resolveAs?: string; savePath?: string }) => {
-      expect(options).toEqual({ resolveAs: 'file', savePath: outPath });
-      return settledJob({ value: outPath }, { jobId: 'job-1', meta: META });
-    },
-  );
+  const render = vi.fn((_spec: RenderRequest, options?: { resolveAs?: string }) => {
+    expect(options).toBeUndefined();
+    return settledJob(
+      { value: downloadableAsset('rendered-bytes') },
+      { jobId: 'job-1', meta: META },
+    );
+  });
   const harness = createHarness({ client: createFakeClient({ render }) });
   await harness.run([
     'render',
@@ -120,19 +136,134 @@ test('--resolve-as file with --out saves to that path and prints the bare path',
     'file',
   ]);
   expect(harness.stdoutText()).toBe(`${outPath}\n`);
+  expect(readFileSync(outPath, 'utf8')).toBe('rendered-bytes');
+  expect(harness.exit).toHaveBeenCalledExactlyOnceWith(0);
 });
 
 test('--out alone (no --resolve-as) defaults to file mode', async () => {
   const outPath = join(dir, 'out.mp4');
-  const render = vi.fn(
-    (_spec: RenderRequest, options: { resolveAs?: string; savePath?: string }) => {
-      expect(options).toEqual({ resolveAs: 'file', savePath: outPath });
-      return settledJob({ value: outPath }, { meta: META });
-    },
-  );
+  const render = vi.fn(() => settledJob({ value: downloadableAsset('bytes') }, { meta: META }));
   const harness = createHarness({ client: createFakeClient({ render }) });
   await harness.run(['render', '--template', 't.mogrt', '--preset', 'prores', '--out', outPath]);
   expect(harness.stdoutText()).toBe(`${outPath}\n`);
+  expect(readFileSync(outPath, 'utf8')).toBe('bytes');
+});
+
+test('--out --json reports the saved path under output, with the job and its timing', async () => {
+  const outPath = join(dir, 'out.mp4');
+  const render = vi.fn(() =>
+    settledJob({ value: downloadableAsset('bytes') }, { jobId: 'job-1', meta: META }),
+  );
+  const harness = createHarness({ client: createFakeClient({ render }) });
+  await harness.run([
+    'render',
+    '--template',
+    't.mogrt',
+    '--preset',
+    'prores',
+    '--out',
+    outPath,
+    '--json',
+  ]);
+  expect(JSON.parse(harness.stdoutText().trim())).toEqual({
+    ok: true,
+    jobId: 'job-1',
+    output: outPath,
+    queueMs: 100,
+    renderMs: 900,
+    totalMs: 1000,
+  });
+});
+
+test('a save that fails after the render finished exits 1 with save_failed, the job and its redacted read URL', async () => {
+  // A directory where the output file would go: moving the finished file into place fails.
+  const outPath = join(dir, 'out.mp4');
+  mkdirSync(outPath);
+  const render = vi.fn(() =>
+    settledJob({ value: downloadableAsset('bytes') }, { jobId: 'job-1', meta: META }),
+  );
+  const args = ['render', '--template', 't.mogrt', '--preset', 'prores', '--out', outPath];
+
+  const human = createHarness({ client: createFakeClient({ render }) });
+  await human.run(args);
+  expect(human.stderrText()).toMatch(/failed while moving its temporary file into place\.\n/);
+  expect(human.stderrText()).toContain(
+    'Code: save_failed\nJob: job-1\nRead URL: https://out.example.test/render.mp4\n',
+  );
+  expect(human.stderrText()).not.toContain('sig=abc');
+  expect(human.exit).toHaveBeenCalledExactlyOnceWith(1);
+
+  const json = createHarness({ client: createFakeClient({ render }) });
+  await json.run([...args, '--json']);
+  expect(JSON.parse(json.stdoutText().trim())).toEqual({
+    ok: false,
+    error: {
+      code: 'save_failed',
+      message: expect.stringMatching(/failed while moving its temporary file into place\.$/),
+      jobId: 'job-1',
+      readUrl: 'https://out.example.test/render.mp4',
+    },
+  });
+  expect(json.stdoutText()).not.toContain('sig=abc');
+  expect(json.exit).toHaveBeenCalledExactlyOnceWith(1);
+});
+
+test('a render that fails before it finishes carries no read URL', async () => {
+  const outPath = join(dir, 'out.mp4');
+  const failure = new AudioVideoError({
+    message: 'render failed',
+    code: 'job_failed',
+    jobId: 'job-1',
+  });
+  const render = vi.fn(() => settledJob<Asset>({ error: failure }));
+  const harness = createHarness({ client: createFakeClient({ render }) });
+  await harness.run([
+    'render',
+    '--template',
+    't.mogrt',
+    '--preset',
+    'prores',
+    '--out',
+    outPath,
+    '--json',
+  ]);
+  expect(JSON.parse(harness.stdoutText().trim())).toEqual({
+    ok: false,
+    error: { code: 'job_failed', message: 'render failed', jobId: 'job-1' },
+  });
+});
+
+test('Ctrl+C while the finished output is saving stops the save and exits 130', async () => {
+  const outPath = join(dir, 'out.mp4');
+  let downloading = false;
+  const hanging = new Asset({
+    url: 'https://out.example.test/render.mp4?sig=abc',
+    meta: META,
+    fetch: (_url, init) =>
+      new Promise<Response>((_resolve, reject) => {
+        downloading = true;
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+      }),
+  });
+  const render = vi.fn(() => settledJob({ value: hanging }, { jobId: 'job-1', meta: META }));
+  const harness = createHarness({ client: createFakeClient({ render }) });
+
+  const run = harness.run([
+    'render',
+    '--template',
+    't.mogrt',
+    '--preset',
+    'prores',
+    '--out',
+    outPath,
+  ]);
+  await until(() => downloading);
+  harness.interrupt();
+  await run;
+
+  expect(harness.stderrText()).toContain('Code: cancelled\n');
+  expect(harness.exit).toHaveBeenCalledExactlyOnceWith(130);
+  expect(existsSync(outPath)).toBe(false);
 });
 
 test('--resolve-as file with no --out rejects invalid_argument, exit 2, before any render call', async () => {
@@ -180,11 +311,79 @@ test('--spec reads a full render request from a JSON file and passes it through 
   };
   const render = vi.fn((got: RenderRequest) => {
     expect(got).toEqual(spec);
-    return settledJob({ value: 'https://read.example.test' }, { meta: META });
+    return settledJob({ value: asset('https://read.example.test') }, { meta: META });
   });
   const harness = createHarness({ client: createFakeClient({ render }) });
   await harness.run(['render', '--spec', specFile(spec)]);
   expect(render).toHaveBeenCalledTimes(1);
+});
+
+const URL_A = 'https://out.example.test/a.mp4?sig=A';
+const URL_B = 'https://out.example.test/b.mp4?sig=B';
+
+/** A spec with two outputs, each naming its own destination and read URL. */
+const TWO_OUTPUTS = {
+  source: 'https://example.test/capsule.mogrt',
+  presets: ['h264Land1080pHq', 'h264Vert1920pHq'],
+  outputs: [
+    { presetIndex: 0, destination: 'https://write.example.test/a.mp4', readUrl: URL_A },
+    { presetIndex: 1, destination: 'https://write.example.test/b.mp4', readUrl: URL_B },
+  ],
+};
+
+/**
+ * A render() double that keeps the SDK's own contract — `resolveAs` applies
+ * only to a spec with exactly one output — and otherwise resolves with an
+ * asset per output, in spec order.
+ */
+function twoOutputRender() {
+  return vi.fn((spec: RenderRequest, options?: { resolveAs?: string }) => {
+    if (options?.resolveAs !== undefined && spec.outputs.length !== 1) {
+      return settledJob<Asset[]>({
+        error: new AudioVideoError({
+          message:
+            'resolveAs applies to a render with exactly one output, and this spec has ' +
+            `${spec.outputs.length}: resolve each asset yourself.`,
+          code: 'invalid_argument',
+        }),
+      });
+    }
+    return settledJob({ value: [asset(URL_A), asset(URL_B)] }, { jobId: 'job-2', meta: META });
+  });
+}
+
+test('a spec with several outputs prints each read URL on its own line, in spec order', async () => {
+  const render = twoOutputRender();
+  const harness = createHarness({ client: createFakeClient({ render }) });
+  await harness.run(['render', '--spec', specFile(TWO_OUTPUTS)]);
+  expect(harness.stdoutText()).toBe(`${URL_A}\n${URL_B}\n`);
+  expect(render).toHaveBeenCalledExactlyOnceWith(TWO_OUTPUTS);
+  expect(harness.exit).toHaveBeenCalledExactlyOnceWith(0);
+});
+
+test('--json reports a several-output render with output as an array of read URLs', async () => {
+  const harness = createHarness({ client: createFakeClient({ render: twoOutputRender() }) });
+  await harness.run(['render', '--spec', specFile(TWO_OUTPUTS), '--json']);
+  expect(JSON.parse(harness.stdoutText().trim())).toEqual({
+    ok: true,
+    jobId: 'job-2',
+    output: [URL_A, URL_B],
+    queueMs: 100,
+    renderMs: 900,
+    totalMs: 1000,
+  });
+});
+
+test("--out with a several-output spec is refused in the CLI's terms, exit 2, before any render call", async () => {
+  const render = vi.fn();
+  const harness = createHarness({ client: createFakeClient({ render }) });
+  await harness.run(['render', '--spec', specFile(TWO_OUTPUTS), '--out', join(dir, 'out.mp4')]);
+  expect(render).not.toHaveBeenCalled();
+  expect(harness.stderrText()).toBe(
+    'Error: --out saves a render with one output, and this spec has 2: ' +
+      "leave out --out to print each output's read URL.\nCode: invalid_argument\n",
+  );
+  expect(harness.exit).toHaveBeenCalledExactlyOnceWith(2);
 });
 
 test('--spec combined with --template is invalid_argument, exit 2, before any render call', async () => {
@@ -275,6 +474,81 @@ test('the --json failure document carries the job and request IDs the error has'
     error: { code: 'job_failed', message: 'render failed', jobId: 'job-9', requestId: 'req-9' },
   });
   expect(harness.exit).toHaveBeenCalledExactlyOnceWith(4);
+});
+
+/** A failed job's items, as the SDK builds them from the status body's `outputs[].errors`. */
+const MISSING_FONT_ITEMS = [
+  {
+    index: 0,
+    errors: [
+      {
+        code: 'missing_font',
+        message: 'The template uses font AdobeClean-Bold, which must be uploaded with the render.',
+      },
+    ],
+  },
+];
+
+function missingFontFailure(): AudioVideoError {
+  return new AudioVideoError({
+    message: 'Job job-1 failed: errors on output 0.',
+    code: 'job_failed',
+    jobId: 'job-1',
+    items: MISSING_FONT_ITEMS,
+  });
+}
+
+test("a failed job's first reason follows the message on the error line", async () => {
+  const render = vi.fn(() => settledJob<string>({ error: missingFontFailure() }));
+  const harness = createHarness({ client: createFakeClient({ render }) });
+  await harness.run(['render', '--template', 't.mogrt', '--preset', 'prores']);
+  expect(harness.stderrText()).toBe(
+    'Error: Job job-1 failed: errors on output 0. Reason: missing_font: ' +
+      'The template uses font AdobeClean-Bold, which must be uploaded with the render.\n' +
+      'Code: job_failed\n',
+  );
+  expect(harness.exit).toHaveBeenCalledExactlyOnceWith(4);
+});
+
+test("the --json failure document carries every reason the error's items hold", async () => {
+  const render = vi.fn(() => settledJob<string>({ error: missingFontFailure() }));
+  const harness = createHarness({ client: createFakeClient({ render }) });
+  await harness.run(['render', '--template', 't.mogrt', '--preset', 'prores', '--json']);
+  expect(JSON.parse(harness.stdoutText().trim())).toEqual({
+    ok: false,
+    error: {
+      code: 'job_failed',
+      message: 'Job job-1 failed: errors on output 0.',
+      jobId: 'job-1',
+      items: MISSING_FONT_ITEMS,
+    },
+  });
+  expect(harness.exit).toHaveBeenCalledExactlyOnceWith(4);
+});
+
+test("a signed URL in a failure's reason reaches neither stream", async () => {
+  const signature = 'REASON_WRITE_SIG_MUST_NOT_PRINT';
+  const writeUrl = `https://acct.blob.core.windows.net/c/out.mov?sv=2021&sp=cw&sig=${signature}`;
+  const failure = new AudioVideoError({
+    message: 'Job job-1 failed: errors on output 0.',
+    code: 'job_failed',
+    items: [{ index: 0, errors: [{ message: `could not write ${writeUrl}` }] }],
+  });
+  const render = vi.fn(() => settledJob<string>({ error: failure }));
+
+  const human = createHarness({ client: createFakeClient({ render }) });
+  await human.run(['render', '--template', 't.mogrt', '--preset', 'prores']);
+  expect(human.stderrText()).toContain(
+    'Reason: could not write https://acct.blob.core.windows.net/c/out.mov\n',
+  );
+  expect(human.stderrText()).not.toContain(signature);
+
+  const json = createHarness({ client: createFakeClient({ render }) });
+  await json.run(['render', '--template', 't.mogrt', '--preset', 'prores', '--json']);
+  expect(json.stdoutText()).toContain(
+    'could not write https://acct.blob.core.windows.net/c/out.mov',
+  );
+  expect(json.stdoutText()).not.toContain(signature);
 });
 
 test('a cancelled error this process did not initiate maps to exit 4, not 130', async () => {
@@ -442,12 +716,12 @@ test('Ctrl+C with no in-flight job (a synchronous validation failure) never subs
 });
 
 test('the Ctrl+C listener is subscribed while the job runs and released once it succeeds', async () => {
-  const dj = deferredJob<string>({ jobId: 'job-1', meta: META });
+  const dj = deferredJob<Asset>({ jobId: 'job-1', meta: META });
   const harness = createHarness({ client: createFakeClient({ render: vi.fn(() => dj.job) }) });
 
   const run = harness.run(['render', '--template', 't.mogrt', '--preset', 'prores']);
   await until(() => harness.interruptListeners() === 1);
-  dj.settle('https://out.example.test/render.mp4');
+  dj.settle(asset('https://out.example.test/render.mp4'));
   await run;
 
   expect(harness.interruptListeners()).toBe(0);

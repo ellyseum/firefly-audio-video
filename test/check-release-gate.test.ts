@@ -222,3 +222,142 @@ test('mutation: dropping --provenance from both publish jobs reddens npm-publish
   const violations = checkReleaseGate(mutated);
   expect(ids(violations)).toEqual(['npm-publish-provenance', 'npm-publish-provenance']);
 });
+
+test('mutation: publish-latest needs: without verify reddens publish-latest-needs-verify', () => {
+  const mutated = mutate(BASE, 'needs: [release-please, verify]\n', 'needs: release-please\n');
+  const violations = checkReleaseGate(mutated);
+  expect(ids(violations)).toEqual(['publish-latest-needs-verify']);
+  expect(onlyMessage(violations)).toMatch(/"verify"/);
+});
+
+test.each<[command: string, search: string, replace: string]>([
+  ['npm run typecheck', '      - run: npm run typecheck\n', ''],
+  ['npm run lint', '      - run: npm run lint\n', ''],
+  ['npm run format:check', '      - run: npm run format:check\n', ''],
+  [
+    'npm run build',
+    '      - run: npm run build\n      - run: npm test\n',
+    '      - run: npm test\n',
+  ],
+  ['npm test', '      - run: npm test\n', ''],
+  [
+    'node scripts/verify-pack-contents.mjs',
+    '      - run: node scripts/verify-pack-contents.mjs\n      # The smoke runs below',
+    '      # The smoke runs below',
+  ],
+])('mutation: verify without %s reddens verify-coverage, naming it', (command, search, replace) => {
+  const violations = checkReleaseGate(mutate(BASE, search, replace));
+  expect(ids(violations)).toEqual(['verify-coverage']);
+  expect(onlyMessage(violations)).toBe(`[verify-coverage] verify does not run ${command}`);
+});
+
+test('mutation: a command only named in a comment does not count as run', () => {
+  const violations = checkReleaseGate(
+    mutate(BASE, '      - run: npm run lint\n', '      # - run: npm run lint\n'),
+  );
+  expect(ids(violations)).toEqual(['verify-coverage']);
+  expect(onlyMessage(violations)).toMatch(/npm run lint/);
+});
+
+test.each(['18', '20', '22', '24'])(
+  'mutation: verify without the Node %s smoke run reddens verify-coverage, naming that major',
+  (major) => {
+    const violations = checkReleaseGate(
+      mutate(
+        BASE,
+        `          node-version: ${major}\n      - run: node scripts/runtime-smoke.mjs\n`,
+        `          node-version: ${major}\n`,
+      ),
+    );
+    expect(ids(violations)).toEqual(['verify-coverage']);
+    expect(onlyMessage(violations)).toMatch(new RegExp(`on Node ${major} `));
+  },
+);
+
+test('mutation: a smoke run on another major does not stand in for a required one', () => {
+  const violations = checkReleaseGate(
+    mutate(BASE, '          node-version: 20\n', '          node-version: 21\n'),
+  );
+  expect(ids(violations)).toEqual(['verify-coverage']);
+  expect(onlyMessage(violations)).toMatch(/on Node 20 /);
+});
+
+test('mutation: removing the verify job reddens verify-coverage', () => {
+  const start = BASE.indexOf('  verify:\n');
+  const end = BASE.indexOf('  # Reads whether the package has ever shipped');
+  expect(start).toBeGreaterThan(-1);
+  expect(end).toBeGreaterThan(start);
+  const violations = checkReleaseGate(BASE.slice(0, start) + BASE.slice(end));
+  expect(ids(violations)).toContain('verify-coverage');
+  expect(violations.some((v) => v.message.includes('job "verify" is missing'))).toBe(true);
+});
+
+test('mutation: a smoke run after a setup-node from .nvmrc does not count for the major set before it', () => {
+  const violations = checkReleaseGate(
+    mutate(
+      BASE,
+      '          node-version: 18\n      - run: node scripts/runtime-smoke.mjs\n',
+      "          node-version: 18\n      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0\n        with:\n          node-version-file: '.nvmrc'\n      - run: node scripts/runtime-smoke.mjs\n",
+    ),
+  );
+  expect(ids(violations)).toEqual(['verify-coverage']);
+  expect(onlyMessage(violations)).toMatch(/on Node 18 /);
+});
+
+/** publish-next's npm version step, as the committed workflow writes it. */
+const NPM_VERSION_STEP =
+  '      - run: npm version "${{ steps.version.outputs.version }}" --no-git-tag-version\n';
+
+/** publish-next's check of the built package's version, as the committed workflow writes it. */
+const VERSION_CHECK_STEP = [
+  '      - name: check the built package reports the prerelease version',
+  '        run: |',
+  '          built="$(node dist/cli.cjs --version)"',
+  '          if [ "$built" != "$VERSION" ]; then',
+  '            echo "::error::the built package reports ${built}, not ${VERSION}"',
+  '            exit 1',
+  '          fi',
+  '        env:',
+  '          VERSION: ${{ steps.version.outputs.version }}',
+  '',
+].join('\n');
+
+test('mutation: npm version after the build reddens publish-next-version', () => {
+  const withoutVersion = mutate(BASE, NPM_VERSION_STEP, '');
+  const mutated = mutate(withoutVersion, VERSION_CHECK_STEP, NPM_VERSION_STEP + VERSION_CHECK_STEP);
+  const violations = checkReleaseGate(mutated);
+  expect(ids(violations)).toEqual(['publish-next-version']);
+  expect(onlyMessage(violations)).toMatch(/npm version must run before npm run build/);
+});
+
+test('mutation: no npm version step reddens publish-next-version', () => {
+  const violations = checkReleaseGate(mutate(BASE, NPM_VERSION_STEP, ''));
+  expect(ids(violations)).toEqual(['publish-next-version']);
+  expect(onlyMessage(violations)).toMatch(/npm version must run before npm run build/);
+});
+
+test('mutation: no check of the built version reddens publish-next-version', () => {
+  const violations = checkReleaseGate(mutate(BASE, VERSION_CHECK_STEP, ''));
+  expect(ids(violations)).toEqual(['publish-next-version']);
+  expect(onlyMessage(violations)).toMatch(/dist\/cli\.cjs --version must be checked/);
+});
+
+test('mutation: the built version checked after npm publish reddens publish-next-version', () => {
+  const mutated = mutate(BASE, VERSION_CHECK_STEP, '') + VERSION_CHECK_STEP;
+  const violations = checkReleaseGate(mutated);
+  expect(ids(violations)).toEqual(['publish-next-version']);
+  expect(onlyMessage(violations)).toMatch(/after npm run build and before npm publish/);
+});
+
+test('mutation: the built version checked before the build reddens publish-next-version', () => {
+  const withoutCheck = mutate(BASE, VERSION_CHECK_STEP, '');
+  const mutated = mutate(
+    withoutCheck,
+    '      - run: npm run build\n      - run: npm publish --provenance --tag next',
+    VERSION_CHECK_STEP +
+      '      - run: npm run build\n      - run: npm publish --provenance --tag next',
+  );
+  const violations = checkReleaseGate(mutated);
+  expect(ids(violations)).toEqual(['publish-next-version']);
+  expect(onlyMessage(violations)).toMatch(/must be checked after npm run build/);
+});

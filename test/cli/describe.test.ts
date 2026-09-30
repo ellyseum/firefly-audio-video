@@ -52,18 +52,16 @@ test('--json mode prints exactly one document with controls and fonts fields', a
   });
 });
 
-test('a local file is staged first, and describe() runs on the staged URL', async () => {
+test('a local file goes to describe() as its path, which stages it in its pool slot; the CLI stages nothing', async () => {
   const path = join(dir, 't.mogrt');
   writeFileSync(path, 'bytes');
   const stage = vi.fn(async () => 'https://staged.example.test/t.mogrt?sig=z');
-  const describe = vi.fn((source: unknown) => {
-    expect(source).toBe('https://staged.example.test/t.mogrt?sig=z');
-    return settledJob({ value: DESCRIPTION });
-  });
+  const describe = vi.fn(() => settledJob({ value: DESCRIPTION }));
   const client = createFakeClient({ stage, describe });
   const harness = createHarness({ client });
   await harness.run(['describe', path]);
-  expect(stage).toHaveBeenCalledWith(path);
+  expect(describe).toHaveBeenCalledExactlyOnceWith(path);
+  expect(stage).not.toHaveBeenCalled();
   expect(harness.exit).toHaveBeenCalledExactlyOnceWith(0);
 });
 

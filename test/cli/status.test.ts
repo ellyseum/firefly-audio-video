@@ -73,3 +73,68 @@ test('a missing jobId argument is a commander usage error, exit 2', async () => 
   await harness.run(['status']);
   expect(harness.exit).toHaveBeenCalledExactlyOnceWith(2);
 });
+
+const WRITE_SIGNATURE = 'STATUS_WRITE_SIG_MUST_NOT_PRINT';
+const OUTPUT_PATH = 'https://acct.blob.core.windows.net/c/out.mov';
+
+/** A status body as the live API sends it: each output echoes the presigned write URL it was given. */
+const SIGNED_STATUS = {
+  jobId: 'job-1',
+  status: 'succeeded',
+  outputs: [
+    {
+      destination: { url: `${OUTPUT_PATH}?sv=2021&sp=cw&se=2026&sig=${WRITE_SIGNATURE}` },
+      variationIndex: '0',
+      presetIndex: '0',
+    },
+  ],
+};
+
+/** {@link SIGNED_STATUS} with its write URL's signing parameters removed. */
+const REDACTED_STATUS = {
+  ...SIGNED_STATUS,
+  outputs: [{ destination: { url: OUTPUT_PATH }, variationIndex: '0', presetIndex: '0' }],
+};
+
+test("human mode prints an output's write URL without its signature", async () => {
+  const client = createFakeClient({ status: vi.fn(async () => SIGNED_STATUS) });
+  const harness = createHarness({ client });
+  await harness.run(['status', 'job-1']);
+  expect(harness.stdoutText()).not.toContain(WRITE_SIGNATURE);
+  expect(JSON.parse(harness.stdoutText())).toEqual(REDACTED_STATUS);
+  expect(harness.exit).toHaveBeenCalledExactlyOnceWith(0);
+});
+
+test("--json mode prints an output's write URL without its signature", async () => {
+  const client = createFakeClient({ status: vi.fn(async () => SIGNED_STATUS) });
+  const harness = createHarness({ client });
+  await harness.run(['status', 'job-1', '--json']);
+  expect(harness.stdoutText()).not.toContain(WRITE_SIGNATURE);
+  expect(JSON.parse(harness.stdoutText().trim())).toEqual({ ok: true, job: REDACTED_STATUS });
+});
+
+test("a failed request's response body reaches the --json document, and its reason the error line", async () => {
+  const body = { error_code: '403003', message: 'Api Key is invalid' };
+  const failure = new AudioVideoError({
+    message: 'Request to https://audio-video-api.adobe.io/v1/status/job-1 failed with status 403.',
+    code: 'http_403',
+    status: 403,
+    items: [body],
+  });
+  const client = createFakeClient({ status: vi.fn(async () => Promise.reject(failure)) });
+
+  const human = createHarness({ client });
+  await human.run(['status', 'job-1']);
+  expect(human.stderrText()).toBe(
+    'Error: Request to https://audio-video-api.adobe.io/v1/status/job-1 failed with status 403. ' +
+      'Reason: 403003: Api Key is invalid\nCode: http_403\n',
+  );
+
+  const json = createHarness({ client });
+  await json.run(['status', 'job-1', '--json']);
+  expect(JSON.parse(json.stdoutText().trim())).toEqual({
+    ok: false,
+    error: { code: 'http_403', message: failure.message, items: [body] },
+  });
+  expect(json.exit).toHaveBeenCalledExactlyOnceWith(5);
+});

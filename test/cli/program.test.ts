@@ -257,3 +257,10 @@ test('createProgram() builds without any options, defaulting to the real process
   const program = createProgram();
   expect(program.name()).toBe('dgr');
 });
+
+test('render --help says --out saves a render with one output', async () => {
+  const harness = createHarness();
+  await harness.run(['render', '--help']);
+  const collapsed = harness.stdoutText().replace(/\s+/g, ' ');
+  expect(collapsed).toContain('--out <path> saves the output of a render with one output');
+});

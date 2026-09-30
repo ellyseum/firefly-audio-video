@@ -8,11 +8,11 @@ not run, until the repository is public and the steps in this section have been 
 
 ### Channels
 
-| Channel              | Publishes when                                                                       | npm dist-tag                                         |
-| -------------------- | ------------------------------------------------------------------------------------ | ---------------------------------------------------- |
-| Pull request preview | every pull request, via `pkg-pr-new.yml` (also gated on the repository being public) | none — installed from a preview URL posted to the PR |
-| `next`               | every push to `main` that passes `verify` and is not itself a release commit         | `next`                                               |
-| `latest`             | merging the release-please pull request, approved by the repository owner            | `latest` (the npm default)                           |
+| Channel              | Publishes when                                                                                                      | npm dist-tag                                         |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| Pull request preview | every pull request, via `pkg-pr-new.yml` (also gated on the repository being public)                                | none — installed from a preview URL posted to the PR |
+| `next`               | every push to `main` that passes `verify` and is not itself a release commit                                        | `next`                                               |
+| `latest`             | merging the release-please pull request, approved by the repository owner, once `verify` passes on the merge commit | `latest` (the npm default)                           |
 
 CI never moves an npm dist-tag itself. After a stable release ships to `latest`, the following
 push to `main` republishes `@next` from that new base.
@@ -53,4 +53,6 @@ npm CLI `>= 11.5.1` and Node `>= 22.14.0`. Both publish jobs read their Node ver
 release-please opens and updates its release pull request using the default `GITHUB_TOKEN`.
 GitHub does not start a new workflow run for an event caused by `GITHUB_TOKEN`, so the checks in
 this workflow and in `quality.yml` do not run again on the release PR — review its diff directly
-before merging it.
+before merging it. Merging it runs `verify` on the merge commit before anything publishes: the
+typecheck, lint, format, build and test gates, the packed-file check, and the runtime smoke run on
+Node 18, 20, 22 and 24. Both publish jobs need `verify`, so a failure there publishes nothing.

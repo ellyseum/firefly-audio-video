@@ -357,6 +357,16 @@ describe('the H.264 rejection message', () => {
     const messages = deviations.map(([, config]) => presetError(() => toEpr(config)).message);
     expect(new Set(messages).size).toBe(messages.length);
   });
+
+  test('a config matching a native preset says so without naming an internal function', () => {
+    const message = presetError(() =>
+      toEpr({ codec: 'h264', resolution: '1920x1080', mode: 'hq' }),
+    ).message;
+    expect(message).toMatch(/^this config matches a native H\.264 preset/);
+    expect(message).not.toMatch(/resolvePreset|toEpr|\(\)/);
+    expect(message).toContain('native presets');
+    expect(message.length).toBeLessThan(500);
+  });
 });
 
 describe('parseEprHeadline', () => {

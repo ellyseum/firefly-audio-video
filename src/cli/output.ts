@@ -1,17 +1,18 @@
 /**
  * The CLI's two result renderers. `--json` prints exactly one JSON document
  * to stdout, success or failure; without it, a command prints its result to
- * stdout in a readable form and an error to stderr. A success value is the
- * command's own product — a URL it staged, a rendered output, a status body
- * — and prints intact: the SDK already redacted anything in it that needed
- * it (an {@link Asset}'s `toJSON()`), and a value a command exists to
- * produce is not scrubbed. A failure's message always goes through the
- * shared redaction: an {@link AudioVideoError}'s is redacted when the error
- * is built, and any other error's is redacted here. An SDK error's advice is
- * restated in the CLI's terms first ({@link cliMessage}).
+ * stdout in a readable form and an error to stderr. A success value prints
+ * as its command hands it over: a value a command exists to produce — a URL
+ * it staged, a rendered output's read URL — is not scrubbed, and `status`
+ * and `cancel` redact the service's body before handing it over, since it
+ * echoes each output's presigned write URL. A failure's message always goes
+ * through the shared redaction: an {@link AudioVideoError}'s is redacted when
+ * the error is built, and any other error's is redacted here. An SDK error's
+ * advice is restated in the CLI's terms first ({@link cliMessage}).
  */
 
 import { AudioVideoError } from '../core/errors.js';
+import { withFailureReason } from '../core/failure-reason.js';
 import { redactValue } from '../core/redact.js';
 import { cliMessage } from './advice.js';
 
@@ -41,39 +42,82 @@ export function printSuccess(
 }
 
 /**
- * Prints a command's failure. `--json` writes
- * `{ ok: false, error: { code, message, jobId?, requestId? } }` to stdout —
- * the job and request IDs an {@link AudioVideoError} carries, when it
- * carries them, so a caller can pass the job to `dgr status`; otherwise the
- * error's code and message go to stderr. Nothing else from the error is
- * printed, and the message is redacted, so a credential passed on the
- * command line or carried in an error's text never reaches either stream.
+ * What a failure concerns beyond the error itself: a job that finished, and
+ * where its output is, when what failed came after it — saving the output.
  */
-export function printFailure(streams: OutputStreams, json: boolean, error: unknown): void {
-  const shape = errorShape(error);
+export interface FailureContext {
+  /** The job that finished, when the error does not name it itself. */
+  readonly jobId?: string;
+  /** The finished output's read URL; printed redacted. */
+  readonly readUrl?: string;
+}
+
+/**
+ * Prints a command's failure. `--json` writes
+ * `{ ok: false, error: { code, message, jobId?, requestId?, readUrl?, items? } }`
+ * to stdout — the job and request IDs an {@link AudioVideoError} carries,
+ * when it carries them, so a caller can pass the job to `dgr status`; the
+ * finished output's redacted read URL, when `context` names one, so it can be
+ * fetched again without rendering again; and the error's `items`, the
+ * service's own reasons. Otherwise the error's message, with the first of
+ * those reasons after it ({@link withFailureReason}), and its code go to
+ * stderr, followed by the job and the read URL when `context` names a
+ * finished output. Nothing else from the error is printed, and all of it is
+ * redacted, so a credential passed on the command line or carried in an
+ * error's text never reaches either stream.
+ */
+export function printFailure(
+  streams: OutputStreams,
+  json: boolean,
+  error: unknown,
+  context: FailureContext = {},
+): void {
+  const shape = errorShape(error, context);
   if (json) {
     writeJsonLine(streams.stdout, { ok: false, error: shape });
     return;
   }
-  streams.stderr.write(`Error: ${shape.message}\n`);
+  streams.stderr.write(`Error: ${withFailureReason(shape.message, shape.items)}\n`);
   streams.stderr.write(`Code: ${shape.code}\n`);
+  if (shape.readUrl !== undefined) {
+    if (shape.jobId !== undefined) streams.stderr.write(`Job: ${shape.jobId}\n`);
+    streams.stderr.write(`Read URL: ${shape.readUrl}\n`);
+  }
 }
 
-/** What a failure prints: its code and message, and the job and request it concerns when known. */
+/**
+ * What a failure prints: its code and message, the job and request it
+ * concerns when known, where a finished output is, and the service's
+ * reasons when it gave any.
+ */
 interface FailureShape {
   code: string;
   message: string;
   jobId?: string;
   requestId?: string;
+  readUrl?: string;
+  /** An {@link AudioVideoError}'s `items`, redacted when the error was built. */
+  items?: unknown[];
 }
 
-function errorShape(error: unknown): FailureShape {
+function errorShape(error: unknown, context: FailureContext): FailureShape {
+  const shape = baseShape(error);
+  const jobId = shape.jobId ?? context.jobId;
+  return {
+    ...shape,
+    ...(jobId !== undefined ? { jobId } : {}),
+    ...(context.readUrl !== undefined ? { readUrl: redactValue(context.readUrl) } : {}),
+  };
+}
+
+function baseShape(error: unknown): FailureShape {
   if (error instanceof AudioVideoError) {
     return {
       code: error.code,
       message: cliMessage(error),
       ...(error.jobId !== undefined ? { jobId: error.jobId } : {}),
       ...(error.requestId !== undefined ? { requestId: error.requestId } : {}),
+      ...(error.items !== undefined ? { items: error.items } : {}),
     };
   }
   if (error instanceof Error) {

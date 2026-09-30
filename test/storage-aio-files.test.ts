@@ -442,6 +442,36 @@ test('init runs once, with the credentials from the options, for every later cal
   expect(loadPeer).not.toHaveBeenCalled();
 });
 
+test("cacheFile reaches init as the Files library's tvm.cacheFile, false turning the cache off", async () => {
+  for (const cacheFile of [false, join(dir, 'tvm-cache.json')] as const) {
+    const module = fakeModule(fakeFiles());
+    const provider = new AioFilesStorageProvider({
+      namespace: 'ns-1',
+      auth: AUTH,
+      module,
+      cacheFile,
+    });
+    await provider.allocateOutput();
+    expect(module.configs).toEqual([{ ow: { namespace: 'ns-1', auth: AUTH }, tvm: { cacheFile } }]);
+  }
+});
+
+test('a cacheFile that is neither a file path nor false throws invalid_argument', () => {
+  for (const cacheFile of ['', ' ', true, 0, null]) {
+    let error: unknown;
+    try {
+      new AioFilesStorageProvider({ cacheFile } as never);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error, String(cacheFile)).toBeInstanceOf(AudioVideoError);
+    expect(error).toMatchObject({
+      code: 'invalid_argument',
+      message: 'AioFilesStorageProvider: cacheFile must be a file path, or false for no cache.',
+    });
+  }
+});
+
 test("a CommonJS module's default export works as the module", async () => {
   const files = fakeFiles();
   const inner = fakeModule(files);

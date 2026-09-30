@@ -35,8 +35,15 @@ export interface AioFilesClient {
 
 /** The part of the `@adobe/aio-lib-files` module {@link AioFilesStorageProvider} calls. */
 export interface AioFilesModule {
-  /** Initializes a `Files` client for the Runtime namespace `config.ow` names. */
-  init(config?: { ow?: { namespace: string; auth: string } }): Promise<AioFilesClient>;
+  /**
+   * Initializes a `Files` client for the Runtime namespace `config.ow` names;
+   * `config.tvm.cacheFile` is where the library caches the credentials its
+   * token service hands out, or `false` for no cache.
+   */
+  init(config?: {
+    ow?: { namespace: string; auth: string };
+    tvm?: { cacheFile?: string | false };
+  }): Promise<AioFilesClient>;
 }
 
 /** Options for {@link AioFilesStorageProvider}. */
@@ -66,9 +73,19 @@ export interface AioFilesStorageProviderOptions {
   expiresIn?: number;
   /**
    * An initialized `Files` client — `await filesLib.init()` — used instead of
-   * initializing one; `namespace` and `auth` are then unused.
+   * initializing one; `namespace`, `auth` and `cacheFile` are then unused.
    */
   files?: AioFilesClient;
+  /**
+   * Where the Files library caches the credentials its token service hands
+   * out: short-lived SAS URLs for the workspace's containers. By default the
+   * library writes them in plain text to `.tvmCache` in the OS temp directory
+   * (`os.tmpdir()`), where anything that can read the file can use them until
+   * they expire. A path names another file; `false` turns the cache off, so
+   * each initialization asks the token service again. Passed to the library
+   * as `tvm.cacheFile`.
+   */
+  cacheFile?: string | false;
   /**
    * The `@adobe/aio-lib-files` module, used instead of importing it at run
    * time. Pass it in bundled code — an App Builder action built with webpack
@@ -110,7 +127,9 @@ const MIN_EXPIRY_SECONDS = 2;
  * or allocates, and `init()` runs once, with the Runtime credentials from the
  * options, else `__OW_NAMESPACE` / `__OW_API_KEY` (inside an action), else
  * `AIO_runtime_namespace` / `AIO_runtime_auth` (what `aio app use` writes).
- * The store belongs to that workspace.
+ * The store belongs to that workspace. The library caches the container SAS
+ * URLs it is given in plain text under the OS temp directory unless
+ * `cacheFile` says otherwise.
  *
  * A client configured with no `storage` uses one of these automatically when
  * the App Builder environment is present — `__OW_NAMESPACE` or
@@ -139,6 +158,7 @@ export class AioFilesStorageProvider implements StorageProvider {
   readonly #expiresIn: number | undefined;
   readonly #injected: AioFilesClient | undefined;
   readonly #module: AioFilesModule | undefined;
+  readonly #cacheFile: string | false | undefined;
   #files: Promise<AioFilesClient> | undefined;
   /**
    * The Runtime auth key this provider uses — the option's, else the one
@@ -155,7 +175,7 @@ export class AioFilesStorageProvider implements StorageProvider {
     if (options === null || typeof options !== 'object') {
       throw invalidOption(`${NAME} expects an options object.`);
     }
-    const { namespace, auth, prefix, expiresIn, files, module } = options;
+    const { namespace, auth, prefix, expiresIn, files, module, cacheFile } = options;
     if ((namespace === undefined) !== (auth === undefined)) {
       throw invalidOption(`${NAME}: pass namespace and auth together, or neither.`);
     }
@@ -170,6 +190,13 @@ export class AioFilesStorageProvider implements StorageProvider {
     if (files !== undefined && typeof files?.generatePresignURL !== 'function') {
       throw invalidOption(`${NAME}: files must be a Files client with generatePresignURL().`);
     }
+    if (
+      cacheFile !== undefined &&
+      cacheFile !== false &&
+      (typeof cacheFile !== 'string' || cacheFile.trim() === '')
+    ) {
+      throw invalidOption(`${NAME}: cacheFile must be a file path, or false for no cache.`);
+    }
     this.#namespace = namespace?.trim();
     this.#auth = auth?.trim();
     this.#resolvedAuth = this.#auth;
@@ -177,6 +204,7 @@ export class AioFilesStorageProvider implements StorageProvider {
     this.#expiresIn = expiresIn === undefined ? undefined : this.#checkExpiry(expiresIn);
     this.#injected = files;
     this.#module = module;
+    this.#cacheFile = cacheFile;
   }
 
   /**
@@ -248,9 +276,10 @@ export class AioFilesStorageProvider implements StorageProvider {
     if (typeof init !== 'function') {
       throw adapterError(`${PEER.specifier} exports an init that is not a function`);
     }
+    const tvm = this.#cacheFile === undefined ? {} : { tvm: { cacheFile: this.#cacheFile } };
     let files: unknown;
     try {
-      files = await (init as AioFilesModule['init'])({ ow });
+      files = await (init as AioFilesModule['init'])({ ow, ...tvm });
     } catch (error) {
       throw adapterError(`Initializing ${PEER.specifier} failed`, error, this.#secrets());
     }

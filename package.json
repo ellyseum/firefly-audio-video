@@ -47,7 +47,7 @@
     }
   },
   "bin": {
-    "dgr": "./dist/cli.cjs"
+    "dgr": "dist/cli.cjs"
   },
   "files": [
     "dist"

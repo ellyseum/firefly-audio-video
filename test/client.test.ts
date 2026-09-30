@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import type { Readable } from 'node:stream';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { inspect } from 'node:util';
-import { afterAll, afterEach, beforeAll, beforeEach, expect, expectTypeOf, test, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, expect, expectTypeOf, test } from 'vitest';
 import { Asset } from '../src/core/asset.js';
 import { AudioVideoError } from '../src/core/errors.js';
 import { HttpClient } from '../src/core/http.js';
@@ -27,12 +27,14 @@ import {
   STORAGE,
   TOKEN,
   at,
+  eventually,
   fakeStorage,
   flush,
   recordingLogger,
   running,
   succeeded,
   succeededWithoutOutputs,
+  trickle,
   until,
   wireOutput,
 } from './support/mock-api.js';
@@ -152,57 +154,6 @@ test('render(spec): 202, then poll, then succeeded, resolves an Asset at the out
   expect(mint?.get('scope')).toBe('openid,AdobeID,firefly_api,ff_apis');
   expect(api.imsRequests()).toHaveLength(1);
 });
-
-/**
- * Answers a GET of `url` through a fetch stub with `chunks` 1 KiB chunks, one
- * every `everyMs`, counting the chunks it has served; every other request
- * goes to the real fetch. `restore` removes the stub.
- */
-function trickle(
-  url: string,
-  chunks: number,
-  everyMs: number,
-): { served: () => number; restore: () => void } {
-  let served = 0;
-  const realFetch = globalThis.fetch;
-  const stub = vi
-    .spyOn(globalThis, 'fetch')
-    .mockImplementation(async (input: string | URL | Request, init?: RequestInit) => {
-      const target =
-        typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-      if (target !== url) return realFetch(input, init);
-      const signal = init?.signal;
-      const body = new ReadableStream<Uint8Array>({
-        async pull(controller) {
-          await sleep(everyMs);
-          if (signal?.aborted) {
-            controller.error(signal.reason);
-            return;
-          }
-          if (served >= chunks) {
-            controller.close();
-            return;
-          }
-          served += 1;
-          controller.enqueue(new Uint8Array(1024));
-        },
-      });
-      return new Response(body, {
-        status: 200,
-        headers: { 'content-length': String(chunks * 1024) },
-      });
-    });
-  return { served: () => served, restore: () => stub.mockRestore() };
-}
-
-/** Resolves once `predicate()` holds, checking every few milliseconds; rejects after `timeoutMs`. */
-async function eventually(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() > deadline) throw new Error('condition not reached in time');
-    await sleep(5);
-  }
-}
 
 test.each(['the caller signal', 'job.cancel()'] as const)(
   "resolveAs: 'stream' stops its download within a chunk or two when %s cancels after the render resolved",

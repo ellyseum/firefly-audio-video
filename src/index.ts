@@ -82,6 +82,14 @@ export type {
   AioFilesModule,
   AioFilesStorageProviderOptions,
 } from './storage/aio-files.js';
+export { AzureBlobStorageProvider } from './storage/azure.js';
+export type {
+  AzureBlobModule,
+  AzureBlobServiceClient,
+  AzureBlobStorageProviderOptions,
+  AzureBlockBlobClient,
+  AzureContainerClient,
+} from './storage/azure.js';
 export { S3StorageProvider } from './storage/s3.js';
 export type {
   S3ClientLike,

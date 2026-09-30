@@ -224,6 +224,11 @@ const STORAGE_PROVIDERS = [
     peer: '@aws-sdk/client-s3',
     options: { bucket: 'runtime-smoke-bucket', region: 'us-east-1' },
   },
+  {
+    name: 'AzureBlobStorageProvider',
+    peer: '@azure/storage-blob',
+    options: { container: 'runtime-smoke', connectionString: 'UseDevelopmentStorage=true' },
+  },
 ];
 
 /** True when `name` resolves from the package being tested — an optional peer that is installed. */

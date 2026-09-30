@@ -79,12 +79,28 @@ export interface AssetReadOptions {
    * waits a short jittered backoff (never more than two seconds), then asks
    * for the bytes still missing with `Range: bytes=<received>-`, made
    * conditional by `If-Range` on the asset being unchanged (its `ETag`, else
-   * its `Last-Modified`). Only a `206` whose `Content-Range` starts exactly
-   * where the download stopped is appended; {@link Asset.stream} and
-   * {@link Asset.save} describe what happens when the server cannot resume. A
-   * status on a retry other than `408`, `429` or a `5xx` fails the download at
-   * once. Defaults to `3`; `0` turns resuming off, so the first interruption
-   * fails the download.
+   * its `Last-Modified`). What the answer to a retry does:
+   *
+   * - A `206` whose `Content-Range` starts exactly where the download stopped,
+   *   and whose total length and validator do not contradict what the
+   *   download already knew, is appended and the download goes on.
+   * - A `416` whose `Content-Range` gives as the complete length both the
+   *   total an earlier response reported and the bytes already delivered
+   *   means nothing is missing: every accessor finishes normally.
+   * - A `200` (the whole asset: it changed, or the server ignores ranges),
+   *   another `2xx`, any other `416`, or a `206` that does not continue where
+   *   the download stopped means the server cannot resume.
+   *   {@link Asset.save} starts over from byte zero in a fresh temp file,
+   *   within the same retry budget: from the `200`'s own body, or with a
+   *   fresh request. {@link Asset.stream} and {@link Asset.buffer} fail with
+   *   `asset_fetch_failed`, since the bytes they have already delivered
+   *   cannot be taken back.
+   * - After a `408`, `429` or `5xx`, the same request is made again after the
+   *   next backoff, spending another retry.
+   * - Any other status fails the download at once, with that status.
+   *
+   * Defaults to `3`; `0` turns resuming off, so the first interruption fails
+   * the download.
    */
   retries?: number;
 }
@@ -247,6 +263,15 @@ export class Asset {
    *
    * @param path - The destination file path.
    * @param options - See {@link AssetReadOptions}.
+   * @throws {@link AudioVideoError} — `code: 'asset_fetch_failed'` — for a
+   *   non-2xx response to the first request, a download that ran out of
+   *   retries or met a status it does not retry, any other fetch failure (a
+   *   malformed URL, a DNS failure), or a failed file-system step — creating
+   *   the directory, creating, writing, closing or replacing the temp file,
+   *   moving it into place — which the message names. The URL is always
+   *   redacted, and the `cause` sanitized.
+   * @throws {@link AudioVideoError} — `code: 'cancelled'` — when
+   *   `options.signal` aborts before or during the download.
    * @throws {@link AudioVideoError} — `code: 'invalid_argument'` — when
    *   `options.retries` is not a non-negative integer.
    */

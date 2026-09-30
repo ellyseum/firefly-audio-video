@@ -60,7 +60,8 @@ export interface LogRecord {
   /**
    * The failure that settled the call, rendered as one redacted
    * `code: message` string, followed by the first reason the service gave
-   * (`Reason: <code>: <message>`, at most 200 characters) when it gave one.
+   * when it gave one: `Reason: <code>: <message>`, or `First reason:` when
+   * it gave several, the reason itself at most 200 characters.
    */
   error?: string;
 }

@@ -1107,7 +1107,8 @@ test('stage without storage rejects invalid_argument naming the option; a failin
     }).stage(Buffer.from('x')),
   );
   expect(failing.code).toBe('storage_failed');
-  expect(failing.cause).toBe(cause);
+  expect(failing.cause).not.toBe(cause);
+  expect((failing.cause as Error).message).toBe('bucket unreachable');
 });
 
 // --- config -------------------------------------------------------------------------------------

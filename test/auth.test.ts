@@ -929,7 +929,7 @@ const THROWING_REPLIES: Array<[label: string, status: number, body: string]> = [
 ];
 
 test.each(THROWING_REPLIES)(
-  'IMS reply %s rejects auth_failed with the provider error as its cause, and caches nothing',
+  'IMS reply %s rejects auth_failed with a copy of the provider error as its cause, and caches nothing',
   async (_label, status, body) => {
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     ims.answer(status, body);

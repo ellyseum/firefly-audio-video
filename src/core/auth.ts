@@ -11,6 +11,7 @@ import {
   type ServerToServerAuthDetails,
 } from '@adobe/firefly-services-common-apis';
 import { AudioVideoError } from './errors.js';
+import { redactError } from './redact.js';
 
 /**
  * Per-call tuning for {@link TokenProvider.getAccessToken}.
@@ -286,9 +287,9 @@ export class ClientCredentialsProvider implements TokenProvider {
    *   call fails outright, or when IMS has not answered this caller within 30
    *   seconds.
    *   The client secret is never included in the thrown error's message;
-   *   when the wrapped provider threw, `.cause` carries its error for
-   *   programmatic inspection and is excluded from every serialized form of
-   *   {@link AudioVideoError} by construction.
+   *   when the wrapped provider threw, `.cause` is a redacted copy of its
+   *   error — never the error itself, which can hold a URL's signature and
+   *   would print whole in Node's crash print for an unhandled rejection.
    * @throws {@link AudioVideoError} with `code: 'cancelled'` when
    *   `opts.signal` has aborted, or aborts before a token is available; a
    *   mint other callers are waiting on carries on for them.
@@ -369,7 +370,7 @@ export class ClientCredentialsProvider implements TokenProvider {
       throw new AudioVideoError({
         message: 'Failed to obtain an access token via client-credentials authentication.',
         code: 'auth_failed',
-        cause,
+        cause: redactError(cause),
       });
     }
   }

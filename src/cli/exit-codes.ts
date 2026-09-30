@@ -33,7 +33,11 @@ export const EXIT_CODES: readonly ExitCodeEntry[] = [
       'a network or HTTP failure: request_failed, request_timeout, http_*, submit_failed, job_poll_failed, asset_fetch_failed or storage_failed',
   },
   { code: 130, meaning: "cancelled by this process's own Ctrl+C" },
-  { code: 1, meaning: 'anything else' },
+  {
+    code: 1,
+    meaning:
+      'anything else, save_failed included: the render finished and its output could not be saved',
+  },
 ] as const;
 
 /** {@link EXIT_CODES}, formatted for `--help`'s epilog. */

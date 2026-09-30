@@ -42,40 +42,75 @@ export function printSuccess(
 }
 
 /**
+ * What a failure concerns beyond the error itself: a job that finished, and
+ * where its output is, when what failed came after it — saving the output.
+ */
+export interface FailureContext {
+  /** The job that finished, when the error does not name it itself. */
+  readonly jobId?: string;
+  /** The finished output's read URL; printed redacted. */
+  readonly readUrl?: string;
+}
+
+/**
  * Prints a command's failure. `--json` writes
- * `{ ok: false, error: { code, message, jobId?, requestId?, items? } }` to
- * stdout — the job and request IDs an {@link AudioVideoError} carries, when
- * it carries them, so a caller can pass the job to `dgr status`, and its
- * `items`, the service's own reasons; otherwise the error's message, with
- * the first of those reasons after it ({@link withFailureReason}), and its
- * code go to stderr. Nothing else from the error is printed, and all of it
- * is redacted, so a credential passed on the command line or carried in an
+ * `{ ok: false, error: { code, message, jobId?, requestId?, readUrl?, items? } }`
+ * to stdout — the job and request IDs an {@link AudioVideoError} carries,
+ * when it carries them, so a caller can pass the job to `dgr status`; the
+ * finished output's redacted read URL, when `context` names one, so it can be
+ * fetched again without rendering again; and the error's `items`, the
+ * service's own reasons. Otherwise the error's message, with the first of
+ * those reasons after it ({@link withFailureReason}), and its code go to
+ * stderr, followed by the job and the read URL when `context` names a
+ * finished output. Nothing else from the error is printed, and all of it is
+ * redacted, so a credential passed on the command line or carried in an
  * error's text never reaches either stream.
  */
-export function printFailure(streams: OutputStreams, json: boolean, error: unknown): void {
-  const shape = errorShape(error);
+export function printFailure(
+  streams: OutputStreams,
+  json: boolean,
+  error: unknown,
+  context: FailureContext = {},
+): void {
+  const shape = errorShape(error, context);
   if (json) {
     writeJsonLine(streams.stdout, { ok: false, error: shape });
     return;
   }
   streams.stderr.write(`Error: ${withFailureReason(shape.message, shape.items)}\n`);
   streams.stderr.write(`Code: ${shape.code}\n`);
+  if (shape.readUrl !== undefined) {
+    if (shape.jobId !== undefined) streams.stderr.write(`Job: ${shape.jobId}\n`);
+    streams.stderr.write(`Read URL: ${shape.readUrl}\n`);
+  }
 }
 
 /**
  * What a failure prints: its code and message, the job and request it
- * concerns when known, and the service's reasons when it gave any.
+ * concerns when known, where a finished output is, and the service's
+ * reasons when it gave any.
  */
 interface FailureShape {
   code: string;
   message: string;
   jobId?: string;
   requestId?: string;
+  readUrl?: string;
   /** An {@link AudioVideoError}'s `items`, redacted when the error was built. */
   items?: unknown[];
 }
 
-function errorShape(error: unknown): FailureShape {
+function errorShape(error: unknown, context: FailureContext): FailureShape {
+  const shape = baseShape(error);
+  const jobId = shape.jobId ?? context.jobId;
+  return {
+    ...shape,
+    ...(jobId !== undefined ? { jobId } : {}),
+    ...(context.readUrl !== undefined ? { readUrl: redactValue(context.readUrl) } : {}),
+  };
+}
+
+function baseShape(error: unknown): FailureShape {
   if (error instanceof AudioVideoError) {
     return {
       code: error.code,

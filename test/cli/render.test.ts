@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
@@ -172,6 +172,64 @@ test('--out --json reports the saved path under output, with the job and its tim
     queueMs: 100,
     renderMs: 900,
     totalMs: 1000,
+  });
+});
+
+test('a save that fails after the render finished exits 1 with save_failed, the job and its redacted read URL', async () => {
+  // A directory where the output file would go: moving the finished file into place fails.
+  const outPath = join(dir, 'out.mp4');
+  mkdirSync(outPath);
+  const render = vi.fn(() =>
+    settledJob({ value: downloadableAsset('bytes') }, { jobId: 'job-1', meta: META }),
+  );
+  const args = ['render', '--template', 't.mogrt', '--preset', 'prores', '--out', outPath];
+
+  const human = createHarness({ client: createFakeClient({ render }) });
+  await human.run(args);
+  expect(human.stderrText()).toMatch(/failed while moving its temporary file into place\.\n/);
+  expect(human.stderrText()).toContain(
+    'Code: save_failed\nJob: job-1\nRead URL: https://out.example.test/render.mp4\n',
+  );
+  expect(human.stderrText()).not.toContain('sig=abc');
+  expect(human.exit).toHaveBeenCalledExactlyOnceWith(1);
+
+  const json = createHarness({ client: createFakeClient({ render }) });
+  await json.run([...args, '--json']);
+  expect(JSON.parse(json.stdoutText().trim())).toEqual({
+    ok: false,
+    error: {
+      code: 'save_failed',
+      message: expect.stringMatching(/failed while moving its temporary file into place\.$/),
+      jobId: 'job-1',
+      readUrl: 'https://out.example.test/render.mp4',
+    },
+  });
+  expect(json.stdoutText()).not.toContain('sig=abc');
+  expect(json.exit).toHaveBeenCalledExactlyOnceWith(1);
+});
+
+test('a render that fails before it finishes carries no read URL', async () => {
+  const outPath = join(dir, 'out.mp4');
+  const failure = new AudioVideoError({
+    message: 'render failed',
+    code: 'job_failed',
+    jobId: 'job-1',
+  });
+  const render = vi.fn(() => settledJob<Asset>({ error: failure }));
+  const harness = createHarness({ client: createFakeClient({ render }) });
+  await harness.run([
+    'render',
+    '--template',
+    't.mogrt',
+    '--preset',
+    'prores',
+    '--out',
+    outPath,
+    '--json',
+  ]);
+  expect(JSON.parse(harness.stdoutText().trim())).toEqual({
+    ok: false,
+    error: { code: 'job_failed', message: 'render failed', jobId: 'job-1' },
   });
 });
 

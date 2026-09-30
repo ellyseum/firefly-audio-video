@@ -1,11 +1,21 @@
-import { expect, test } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, expect, test } from 'vitest';
 import {
   checkPackedFiles,
   extractTrailingJson,
+  hasBuiltDist,
   resolvePublishEntry,
+  runPackDryRun,
 } from '../scripts/verify-pack-contents.mjs';
 
 const PACKAGE_NAME = 'firefly-audio-video';
+
+const tempDirs: string[] = [];
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
 
 const CLEAN_FILES = [
   'LICENSE',
@@ -96,6 +106,21 @@ test('resolvePublishEntry: null and non-object manifests fail without throwing',
   });
 });
 
+// --- hasBuiltDist --------------------------------------------------------
+
+test('hasBuiltDist: false for a directory with no dist/', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pack-contents-'));
+  tempDirs.push(dir);
+  expect(hasBuiltDist(dir)).toBe(false);
+});
+
+test('hasBuiltDist: true once dist/ exists', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pack-contents-'));
+  tempDirs.push(dir);
+  mkdirSync(join(dir, 'dist'));
+  expect(hasBuiltDist(dir)).toBe(true);
+});
+
 // --- checkPackedFiles ---------------------------------------------------------
 
 test('checkPackedFiles: the real packed contract produces zero violations', () => {
@@ -135,4 +160,21 @@ test.each([
 ])('checkPackedFiles: a packed "%s" is forbidden (%s)', (leaked) => {
   const violations = checkPackedFiles([...CLEAN_FILES, leaked]);
   expect(violations.some((v) => v.includes(leaked))).toBe(true);
+});
+
+// --- runPackDryRun -------------------------------------------------------
+
+test('runPackDryRun: succeeds even though this version is already published to npm', () => {
+  const result = runPackDryRun();
+
+  expect(result.error).toBeUndefined();
+  expect(result.status).toBe(0);
+
+  const manifest = extractTrailingJson(result.stdout);
+  const { entry } = resolvePublishEntry(manifest, PACKAGE_NAME);
+  expect(Array.isArray(entry?.files)).toBe(true);
+
+  const paths = (entry?.files as { path: string }[]).map((f) => f.path);
+  expect(paths).toEqual(expect.arrayContaining(['LICENSE', 'README.md', 'package.json']));
+  expect(paths.some((p) => p.startsWith('dist/'))).toBe(true);
 });

@@ -3,7 +3,8 @@
  * one was given (every command test uses this path — nothing here ever
  * builds a real client under test), else a real one built from
  * `--client-id`/`--client-secret`/`--scope` (or their `IMS_OAUTH_S2S_*`
- * environment names) and `--storage`/`--region` (or `DGR_STORAGE`).
+ * environment names) and, for a command that stages files, from
+ * `--storage`/`--region` (or `DGR_STORAGE`).
  */
 
 import { createClient, type Client } from '../dgr/client.js';
@@ -13,17 +14,32 @@ import type { CliRuntime, GlobalOptions } from './runtime.js';
 import { resolveStorage } from './storage.js';
 import { firstNonEmpty } from './util.js';
 
+/** What a command needs from its client beyond credentials. */
+export interface ClientNeeds {
+  /**
+   * Whether the command stages local files or allocates outputs — render,
+   * stage and describe — and so resolves `--storage`/`DGR_STORAGE`. Every
+   * other command ignores both, so a stale value never breaks it.
+   */
+  readonly storage?: boolean;
+}
+
 /**
  * The client `options` names: `runtime.client` if the runtime was given one,
- * else a client built from `options` and `runtime.env`. `--log` routes the
- * SDK's own NDJSON call log to `runtime.stderr`; without it, SDK logging is
- * off, so stdout carries only the command's own result.
+ * else a client built from `options` and `runtime.env`, with storage only
+ * when `needs.storage` asks for it. `--log` routes the SDK's own NDJSON call
+ * log to `runtime.stderr`; without it, SDK logging is off, so stdout carries
+ * only the command's own result.
  *
  * @throws {@link AudioVideoError} `invalid_argument` when no client ID and
- *   secret are configured, or `--storage`/`DGR_STORAGE` names an invalid or
- *   unbuildable storage target.
+ *   secret are configured, or — with `needs.storage` — `--storage`/
+ *   `DGR_STORAGE` names an invalid or unbuildable storage target.
  */
-export function resolveClient(runtime: CliRuntime, options: GlobalOptions): Client {
+export function resolveClient(
+  runtime: CliRuntime,
+  options: GlobalOptions,
+  needs: ClientNeeds = {},
+): Client {
   if (runtime.client !== undefined) return runtime.client;
 
   const clientId = firstNonEmpty(options.clientId, runtime.env.IMS_OAUTH_S2S_CLIENT_ID);
@@ -33,7 +49,8 @@ export function resolveClient(runtime: CliRuntime, options: GlobalOptions): Clie
   }
 
   const scope = firstNonEmpty(options.scope, runtime.env.IMS_OAUTH_S2S_SCOPES);
-  const storageUri = firstNonEmpty(options.storage, runtime.env.DGR_STORAGE);
+  const storageUri =
+    needs.storage === true ? firstNonEmpty(options.storage, runtime.env.DGR_STORAGE) : undefined;
 
   return createClient({
     clientId,

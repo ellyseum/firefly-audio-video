@@ -13,7 +13,7 @@ export function buildStageCommand(runtime: CliRuntime): Command {
     .action(async (file: string, _ownOptions: unknown, self: Command) => {
       const options = self.optsWithGlobals() as GlobalOptions;
       await runCommand(runtime, options.json === true, async () => {
-        const client = resolveClient(runtime, options);
+        const client = resolveClient(runtime, options, { storage: true });
         const url = await client.stage(file);
         return { result: url, json: { url } };
       });

@@ -89,19 +89,38 @@ test('a client-secret value never appears in the missing-credentials message eve
   expect(error.message).not.toContain(SECRET);
 });
 
-test('--storage builds and attaches a storage provider; a bad --storage rejects invalid_argument', async () => {
+test('with storage needed, --storage builds a storage provider and a bad one rejects invalid_argument', async () => {
+  const needs = { storage: true };
   expect(() =>
-    resolveClient(runtimeOf(), { clientId: 'id', clientSecret: 'secret', storage: 'aio-files' }),
+    resolveClient(
+      runtimeOf(),
+      { clientId: 'id', clientSecret: 'secret', storage: 'aio-files' },
+      needs,
+    ),
   ).not.toThrow();
   const error = await rejection(() =>
-    resolveClient(runtimeOf(), { clientId: 'id', clientSecret: 'secret', storage: 'not-a-uri' }),
+    resolveClient(
+      runtimeOf(),
+      { clientId: 'id', clientSecret: 'secret', storage: 'not-a-uri' },
+      needs,
+    ),
   );
   expect(error.code).toBe('invalid_argument');
 });
 
-test('DGR_STORAGE is used when --storage is not given', () => {
-  const runtime = runtimeOf({ env: { DGR_STORAGE: 'aio-files' } });
-  expect(() => resolveClient(runtime, { clientId: 'id', clientSecret: 'secret' })).not.toThrow();
+test('with storage needed, a bad DGR_STORAGE rejects invalid_argument when --storage is not given', async () => {
+  const runtime = runtimeOf({ env: { DGR_STORAGE: 'not-a-uri' } });
+  const error = await rejection(() =>
+    resolveClient(runtime, { clientId: 'id', clientSecret: 'secret' }, { storage: true }),
+  );
+  expect(error.code).toBe('invalid_argument');
+});
+
+test('without storage needed, neither --storage nor DGR_STORAGE is read', () => {
+  const runtime = runtimeOf({ env: { DGR_STORAGE: 'not-a-uri' } });
+  expect(() =>
+    resolveClient(runtime, { clientId: 'id', clientSecret: 'secret', storage: 'not-a-uri' }),
+  ).not.toThrow();
 });
 
 test('--log routes one NDJSON record per call to the runtime stderr stream, never stdout', async () => {

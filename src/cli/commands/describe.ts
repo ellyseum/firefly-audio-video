@@ -14,7 +14,7 @@ export function buildDescribeCommand(runtime: CliRuntime): Command {
     .action(async (template: string, _ownOptions: unknown, self: Command) => {
       const options = self.optsWithGlobals() as GlobalOptions;
       await runCommand(runtime, options.json === true, async () => {
-        const client = resolveClient(runtime, options);
+        const client = resolveClient(runtime, options, { storage: true });
         const source = await resolveTemplateUrl(client, template);
         const description = await client.describe(source);
         return {

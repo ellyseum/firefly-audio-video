@@ -67,7 +67,7 @@ async function runRender(
   try {
     const spec = buildSpec(options);
     const mode = resolveOutputMode(options);
-    const client = resolveClient(runtime, options);
+    const client = resolveClient(runtime, options, { storage: true });
     const job =
       mode.resolveAs === 'file'
         ? client.render(spec, { resolveAs: 'file', savePath: mode.savePath })

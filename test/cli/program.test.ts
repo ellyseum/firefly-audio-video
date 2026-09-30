@@ -54,6 +54,60 @@ test('an unknown option on a subcommand is a commander usage error mapped to exi
   expect(harness.exit).toHaveBeenCalledExactlyOnceWith(2);
 });
 
+const USAGE_ERRORS: Array<[kind: string, args: string[], text: string]> = [
+  [
+    'an unknown option',
+    ['stage', 'x', '--this-flag-does-not-exist'],
+    "unknown option '--this-flag-does-not-exist'",
+  ],
+  ['an unknown command', ['bogus-command'], "unknown command 'bogus-command'"],
+  ['a missing positional', ['stage'], "missing required argument 'file'"],
+];
+
+function stdoutLines(text: string): string[] {
+  return text.split('\n').filter((line) => line !== '');
+}
+
+test.each(USAGE_ERRORS)(
+  "%s in human mode prints commander's text on stderr and nothing on stdout, exiting 2",
+  async (_kind, args, text) => {
+    const harness = createHarness({ client: createFakeClient() });
+    await harness.run(args);
+    expect(harness.stdoutText()).toBe('');
+    expect(harness.stderrText()).toContain(`error: ${text}`);
+    expect(harness.exit).toHaveBeenCalledExactlyOnceWith(2);
+  },
+);
+
+test.each(USAGE_ERRORS)(
+  '%s with --json prints exactly one invalid_argument document on stdout and nothing on stderr, exiting 2',
+  async (_kind, args, text) => {
+    const harness = createHarness({ client: createFakeClient() });
+    await harness.run(['--json', ...args]);
+    const lines = stdoutLines(harness.stdoutText());
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0] ?? '')).toEqual({
+      ok: false,
+      error: { code: 'invalid_argument', message: expect.stringContaining(text) },
+    });
+    expect(harness.stderrText()).toBe('');
+    expect(harness.exit).toHaveBeenCalledExactlyOnceWith(2);
+  },
+);
+
+test('a usage error honors --json given after the subcommand, and not a --json that follows --', async () => {
+  const after = createHarness({ client: createFakeClient() });
+  await after.run(['stage', 'x', '--bogus', '--json']);
+  expect(stdoutLines(after.stdoutText())).toHaveLength(1);
+  expect(after.stderrText()).toBe('');
+
+  const positional = createHarness({ client: createFakeClient() });
+  await positional.run(['bogus-command', '--', '--json']);
+  expect(positional.stdoutText()).toBe('');
+  expect(positional.stderrText()).toContain("error: unknown command 'bogus-command'");
+  expect(positional.exit).toHaveBeenCalledExactlyOnceWith(2);
+});
+
 test('a global option is read the same way whether given before or after the subcommand name', async () => {
   const remote = [{ presetId: 'p' }];
   const before = createHarness({ client: createFakeClient({ listPresets: async () => remote }) });

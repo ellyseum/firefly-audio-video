@@ -2,7 +2,9 @@
  * Builds the `dgr` commander program: a pure factory over a
  * {@link CliRuntime} (the real process by default, or a test's fakes),
  * wired so every exit — a command's own, or commander's own usage errors —
- * goes through `runtime.exit()` rather than a real `process.exit()`.
+ * goes through `runtime.exit()` rather than a real `process.exit()`. With
+ * `--json` in argv, a usage error prints the same one-document failure every
+ * command prints, on stdout, instead of commander's own text on stderr.
  */
 
 import { Command, CommanderError } from 'commander';
@@ -15,8 +17,15 @@ import { buildPresetsCommand } from './commands/presets.js';
 import { buildRenderCommand } from './commands/render.js';
 import { buildStageCommand } from './commands/stage.js';
 import { buildStatusCommand } from './commands/status.js';
+import { invalidArgument } from './errors.js';
 import { exitCodesHelpText } from './exit-codes.js';
+import { printFailure } from './output.js';
 import type { CliEnv, CliRuntime } from './runtime.js';
+
+/** Whether the argv being parsed asks for `--json`; set at the start of every parse. */
+interface ParseState {
+  json: boolean;
+}
 
 /** Everything {@link createProgram} can be given instead of the real process. */
 export interface CreateProgramOptions {
@@ -55,12 +64,17 @@ export function createProgram(options: CreateProgramOptions = {}): Command {
     exit: options.exit ?? ((code: number) => process.exit(code)),
   };
 
+  const parse: ParseState = { json: false };
   const outputConfiguration = {
     writeOut: (text: string) => {
       runtime.stdout.write(text);
     },
     writeErr: (text: string) => {
       runtime.stderr.write(text);
+    },
+    // Commander's usage-error text: with --json the JSON document takes its place.
+    outputError: (text: string, write: (text: string) => void) => {
+      if (!parse.json) write(text);
     },
   };
 
@@ -106,7 +120,7 @@ export function createProgram(options: CreateProgramOptions = {}): Command {
     command.exitOverride();
   }
 
-  wrapParseAsync(program, runtime);
+  wrapParseAsync(program, runtime, parse);
   return program;
 }
 
@@ -115,16 +129,22 @@ export function createProgram(options: CreateProgramOptions = {}): Command {
  * lets commander's `exitOverride` throw escape: a `CommanderError` (usage
  * errors, `--help`, `--version`) maps to its own exit code; anything else —
  * which no command action should let through, since each catches its own
- * errors — reports as exit `1`.
+ * errors — reports as exit `1`. A usage error under `--json` also prints
+ * `{ ok: false, error: { code: 'invalid_argument', message } }` on stdout.
  */
-function wrapParseAsync(program: Command, runtime: CliRuntime): void {
+function wrapParseAsync(program: Command, runtime: CliRuntime, parse: ParseState): void {
   const original = program.parseAsync.bind(program);
   const wrapped: typeof program.parseAsync = async (...args) => {
+    parse.json = wantsJson(args[0] ?? process.argv);
     try {
       await original(...args);
     } catch (error) {
       if (error instanceof CommanderError) {
-        runtime.exit(commanderExitCode(error));
+        const code = commanderExitCode(error);
+        if (code === 2 && parse.json) {
+          printFailure(runtime, true, invalidArgument(usageMessage(error)));
+        }
+        runtime.exit(code);
       } else {
         const message = error instanceof Error ? error.message : String(error);
         runtime.stderr.write(`Error: ${message}\n`);
@@ -140,4 +160,15 @@ function wrapParseAsync(program: Command, runtime: CliRuntime): void {
 function commanderExitCode(error: CommanderError): number {
   const passthrough = new Set(['commander.version', 'commander.help', 'commander.helpDisplayed']);
   return passthrough.has(error.code) ? error.exitCode : 2;
+}
+
+/** True when `argv` passes `--json` ahead of any `--`, after which every token is a positional. */
+function wantsJson(argv: readonly string[]): boolean {
+  const end = argv.indexOf('--');
+  return (end === -1 ? argv : argv.slice(0, end)).includes('--json');
+}
+
+/** Commander's usage-error text without its `error: ` prefix, which the failure document already says. */
+function usageMessage(error: CommanderError): string {
+  return error.message.replace(/^error: /, '').trim();
 }

@@ -1425,11 +1425,16 @@ test("no abort listener is left on the caller's signal, whether the download res
   await new Asset({ url: resuming.url, meta: sampleMeta() }).buffer({ signal: controller.signal });
   expect(getEventListeners(controller.signal, 'abort')).toEqual([]);
 
-  const refusing = await cutOnce(V1, () => ({ ignoreRange: true }));
-  await readFailure(new Asset({ url: refusing.url, meta: sampleMeta() }), 'stream', {
-    signal: controller.signal,
-  });
-  expect(getEventListeners(controller.signal, 'abort')).toEqual([]);
+  // A refused resumption's response is discarded. stream() reaches the caller's
+  // signal through one link of its own, so buffer() is where a request's link
+  // left behind by that discard would show.
+  for (const accessor of ['stream', 'buffer'] as const) {
+    const refusing = await cutOnce(V1, () => ({ ignoreRange: true }));
+    await readFailure(new Asset({ url: refusing.url, meta: sampleMeta() }), accessor, {
+      signal: controller.signal,
+    });
+    expect(getEventListeners(controller.signal, 'abort'), accessor).toEqual([]);
+  }
 
   const exhausted = await rangeServer({ resource: V1, handle: () => ({ cutAfter: 10_000 }) });
   await readFailure(new Asset({ url: exhausted.url, meta: sampleMeta() }), 'save', {

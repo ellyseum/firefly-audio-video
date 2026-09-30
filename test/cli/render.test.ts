@@ -2,9 +2,11 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
+import { createProgram } from '../../src/cli/program.js';
 import { AudioVideoError } from '../../src/core/errors.js';
 import type { JobMeta } from '../../src/core/job.js';
 import type { RenderRequest } from '../../src/dgr/schemas.js';
+import { until } from '../support/mock-api.js';
 import { createFakeClient } from './support/fake-client.js';
 import { createHarness } from './support/harness.js';
 import { cancelledError, deferredJob, settledJob } from './support/job.js';
@@ -21,7 +23,6 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
-  process.removeAllListeners('SIGINT');
 });
 
 function specFile(spec: unknown): string {
@@ -312,10 +313,8 @@ test('Ctrl+C cancels the job exactly once, prints one notice to stderr, and exit
   const harness = createHarness({ client: createFakeClient({ render }) });
 
   const run = harness.run(['render', '--template', 't.mogrt', '--preset', 'prores']);
-  await Promise.resolve();
-  await Promise.resolve();
-  process.emit('SIGINT');
-  await Promise.resolve();
+  await until(() => harness.interruptListeners() === 1);
+  harness.interrupt();
   expect(dj.cancelCalls).toBe(1);
   dj.fail(cancelledError());
   await run;
@@ -332,10 +331,9 @@ test('a second Ctrl+C exits 130 immediately, without waiting for the job to sett
   const harness = createHarness({ client: createFakeClient({ render }) });
 
   const run = harness.run(['render', '--template', 't.mogrt', '--preset', 'prores']);
-  await Promise.resolve();
-  await Promise.resolve();
-  process.emit('SIGINT');
-  process.emit('SIGINT');
+  await until(() => harness.interruptListeners() === 1);
+  harness.interrupt();
+  harness.interrupt();
 
   // The job is still pending — .cancel() never settles it in this test double
   // — yet the second Ctrl+C already forced the exit.
@@ -348,8 +346,64 @@ test('a second Ctrl+C exits 130 immediately, without waiting for the job to sett
   expect(harness.exit).toHaveBeenCalledExactlyOnceWith(130);
 });
 
-test('Ctrl+C with no in-flight job (a synchronous validation failure) leaves no listener registered', async () => {
+test('Ctrl+C with no in-flight job (a synchronous validation failure) never subscribes a listener', async () => {
   const harness = createHarness({ client: createFakeClient({ render: vi.fn() }) });
   await harness.run(['render']); // fails validation before any render() call
-  expect(process.listenerCount('SIGINT')).toBe(0);
+  expect(harness.interruptListeners()).toBe(0);
+  expect(harness.exit).toHaveBeenCalledExactlyOnceWith(2);
+});
+
+test('the Ctrl+C listener is subscribed while the job runs and released once it succeeds', async () => {
+  const dj = deferredJob<string>({ jobId: 'job-1', meta: META });
+  const harness = createHarness({ client: createFakeClient({ render: vi.fn(() => dj.job) }) });
+
+  const run = harness.run(['render', '--template', 't.mogrt', '--preset', 'prores']);
+  await until(() => harness.interruptListeners() === 1);
+  dj.settle('https://out.example.test/render.mp4');
+  await run;
+
+  expect(harness.interruptListeners()).toBe(0);
+  expect(harness.exit).toHaveBeenCalledExactlyOnceWith(0);
+});
+
+test('the Ctrl+C listener is released once the job fails', async () => {
+  const dj = deferredJob<string>({ jobId: 'job-1', meta: META });
+  const harness = createHarness({ client: createFakeClient({ render: vi.fn(() => dj.job) }) });
+
+  const run = harness.run(['render', '--template', 't.mogrt', '--preset', 'prores']);
+  await until(() => harness.interruptListeners() === 1);
+  dj.fail(new AudioVideoError({ message: 'render failed', code: 'job_failed' }));
+  await run;
+
+  expect(harness.interruptListeners()).toBe(0);
+  expect(harness.exit).toHaveBeenCalledExactlyOnceWith(4);
+});
+
+test("by default render listens on the process's SIGINT while the job runs, and stops once it ends", async () => {
+  const baseline = process.listenerCount('SIGINT');
+  const dj = deferredJob<string>({ jobId: 'job-1', meta: META });
+  const exit = vi.fn<(code: number) => void>();
+  const sink = { write: () => true } as unknown as NodeJS.WritableStream;
+  const program = createProgram({
+    client: createFakeClient({ render: vi.fn(() => dj.job) }),
+    env: {},
+    stdout: sink,
+    stderr: sink,
+    exit,
+  });
+
+  const run = program.parseAsync(['render', '--template', 't.mogrt', '--preset', 'prores'], {
+    from: 'user',
+  });
+  try {
+    await until(() => process.listenerCount('SIGINT') === baseline + 1);
+    process.emit('SIGINT');
+    expect(dj.cancelCalls).toBe(1);
+  } finally {
+    dj.fail(cancelledError());
+    await run;
+  }
+
+  expect(process.listenerCount('SIGINT')).toBe(baseline);
+  expect(exit).toHaveBeenCalledExactlyOnceWith(130);
 });

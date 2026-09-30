@@ -20,7 +20,7 @@ import { buildStatusCommand } from './commands/status.js';
 import { invalidArgument } from './errors.js';
 import { exitCodesHelpText } from './exit-codes.js';
 import { printFailure } from './output.js';
-import type { CliEnv, CliRuntime } from './runtime.js';
+import type { CliEnv, CliRuntime, InterruptSource } from './runtime.js';
 
 /** Whether the argv being parsed asks for `--json`; set at the start of every parse. */
 interface ParseState {
@@ -36,6 +36,8 @@ export interface CreateProgramOptions {
   stderr?: NodeJS.WritableStream;
   /** Replaces `process.exit`. Called exactly once per invocation. */
   exit?: (code: number) => void;
+  /** Subscribes to Ctrl+C for as long as `render` runs. Defaults to the process's `SIGINT`. */
+  onInterrupt?: InterruptSource;
 }
 
 const EPILOG = [
@@ -62,6 +64,7 @@ export function createProgram(options: CreateProgramOptions = {}): Command {
     stdout: options.stdout ?? process.stdout,
     stderr: options.stderr ?? process.stderr,
     exit: options.exit ?? ((code: number) => process.exit(code)),
+    onInterrupt: options.onInterrupt ?? onProcessSigint,
   };
 
   const parse: ParseState = { json: false };
@@ -122,6 +125,14 @@ export function createProgram(options: CreateProgramOptions = {}): Command {
 
   wrapParseAsync(program, runtime, parse);
   return program;
+}
+
+/** Subscribes `listener` to the process's `SIGINT`; the returned function unsubscribes it. */
+function onProcessSigint(listener: () => void): () => void {
+  process.on('SIGINT', listener);
+  return () => {
+    process.removeListener('SIGINT', listener);
+  };
 }
 
 /**

@@ -58,7 +58,7 @@ async function runRender(
     exited = true;
     runtime.exit(code);
   };
-  const onSigint = (): void => {
+  const onCtrlC = (): void => {
     sigintCount += 1;
     if (sigintCount === 1) {
       runtime.stderr.write('Cancelling the render...\n');
@@ -68,6 +68,7 @@ async function runRender(
     }
   };
 
+  let stopListening = (): void => undefined;
   try {
     const spec = buildSpec(options);
     const mode = resolveOutputMode(options);
@@ -76,7 +77,7 @@ async function runRender(
       mode.resolveAs === 'file'
         ? client.render(spec, { resolveAs: 'file', savePath: mode.savePath })
         : client.render(spec, { resolveAs: 'url' });
-    process.on('SIGINT', onSigint);
+    stopListening = runtime.onInterrupt(onCtrlC);
     const output = await job;
     printSuccess(runtime, json, output, {
       jobId: job.jobId,
@@ -92,7 +93,7 @@ async function runRender(
     printFailure(runtime, json, error);
     doExit(exitCodeForError(error, { cancelledByUser }));
   } finally {
-    process.removeListener('SIGINT', onSigint);
+    stopListening();
   }
 }
 

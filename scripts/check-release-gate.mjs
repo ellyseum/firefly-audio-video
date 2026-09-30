@@ -15,6 +15,7 @@
  *    `publish-next` jobs, and both of them declare it.
  *  - `publish-latest`'s `if:` requires `release_created == 'true'` AND
  *    (not OR) `vars.PUBLISH_ENABLED == 'true'`.
+ *  - `publish-latest`'s `needs:` includes `verify`.
  *  - `publish-latest` declares `environment: release`.
  *  - `publish-next`'s `if:` requires `vars.PUBLISH_ENABLED == 'true'` and
  *    the not-a-release-commit check (`release_created != 'true'`).
@@ -26,6 +27,12 @@
  *    trusted publishing adds it automatically once configured, but a
  *    publish authenticated by the bootstrap token alone must not ship
  *    without it.
+ *  - `verify`, which both publish jobs need, runs every quality gate
+ *    (typecheck, lint, format check, build, test), the packed-file check
+ *    (`scripts/verify-pack-contents.mjs`), and `scripts/runtime-smoke.mjs`
+ *    under each Node major from the engines floor through the current LTS —
+ *    18, 20, 22 and 24 — each set by a `setup-node` `node-version:` step
+ *    before the smoke run.
  *
  * Usage: `node scripts/check-release-gate.mjs [path-to-release.yml]`
  */
@@ -220,6 +227,46 @@ function secretsReferenced(lines) {
   return [...names];
 }
 
+/** The commands `verify` must run before either publish job may start, each named in its violation. */
+const VERIFY_COMMANDS = [
+  { label: 'npm run typecheck', pattern: /\bnpm run typecheck\b/ },
+  { label: 'npm run lint', pattern: /\bnpm run lint\b/ },
+  { label: 'npm run format:check', pattern: /\bnpm run format:check\b/ },
+  { label: 'npm run build', pattern: /\bnpm run build\b/ },
+  { label: 'npm test', pattern: /\bnpm (?:run )?test\b/ },
+  {
+    label: 'node scripts/verify-pack-contents.mjs',
+    pattern: /\bnode scripts\/verify-pack-contents\.mjs\b/,
+  },
+];
+
+/** The Node majors `verify` must smoke-test the built package on: the engines floor through the current LTS. */
+const RUNTIME_SMOKE_MAJORS = ['18', '20', '22', '24'];
+
+/**
+ * Each Node major a job runs `scripts/runtime-smoke.mjs` under: the value of
+ * the last `node-version:` line above each smoke run, or none for a run
+ * after a `node-version-file:` step. Comment lines are skipped.
+ */
+function runtimeSmokeMajors(lines) {
+  const majors = new Set();
+  let current;
+  for (const line of lines) {
+    if (isBlankOrComment(line)) {
+      continue;
+    }
+    const version = line.match(/^\s*node-version:\s*['"]?(\d+)['"]?\s*$/);
+    if (version) {
+      current = version[1];
+    } else if (/^\s*node-version-file:/.test(line)) {
+      current = undefined;
+    } else if (/\bnode scripts\/runtime-smoke\.mjs\b/.test(line) && current !== undefined) {
+      majors.add(current);
+    }
+  }
+  return majors;
+}
+
 /** Every trimmed line invoking `npm publish` without `--provenance`, in a job's body. */
 function npmPublishLinesWithoutProvenance(lines) {
   return lines
@@ -285,6 +332,13 @@ export function checkReleaseGate(text) {
   if (!latest) {
     push('publish-latest-if', 'job "publish-latest" is missing from the workflow');
   } else {
+    const needs = findNeedsList(latest);
+    if (!needs.includes('verify')) {
+      push(
+        'publish-latest-needs-verify',
+        `needs: must include "verify", found: ${JSON.stringify(needs)}`,
+      );
+    }
     const expr = findIfExpression(latest);
     if (!expr) {
       push('publish-latest-if', 'publish-latest has no if: condition');
@@ -344,6 +398,27 @@ export function checkReleaseGate(text) {
         'publish-next-environment',
         `environment must be "npm-next", found: ${JSON.stringify(env)}`,
       );
+    }
+  }
+
+  const verify = jobs.get('verify');
+  if (!verify) {
+    push('verify-coverage', 'job "verify" is missing from the workflow');
+  } else {
+    const commands = verify.filter((line) => !isBlankOrComment(line));
+    for (const { label, pattern } of VERIFY_COMMANDS) {
+      if (!commands.some((line) => pattern.test(line))) {
+        push('verify-coverage', `verify does not run ${label}`);
+      }
+    }
+    const smoked = runtimeSmokeMajors(verify);
+    for (const major of RUNTIME_SMOKE_MAJORS) {
+      if (!smoked.has(major)) {
+        push(
+          'verify-coverage',
+          `verify does not run scripts/runtime-smoke.mjs on Node ${major} (a setup-node step with node-version: ${major} before it)`,
+        );
+      }
     }
   }
 

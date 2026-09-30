@@ -10,6 +10,7 @@ import type { Asset, AssetReadOptions } from '../core/asset.js';
 import { AudioVideoError } from '../core/errors.js';
 import type { JobMeta, JobStatusLike, PollInterval } from '../core/job.js';
 import { rejectedJob, type JobHandle } from '../core/pooled-job.js';
+import { anySignal } from '../core/signals.js';
 import { PRESET_NAMES } from '../presets/names.js';
 import type { Client, RenderJob } from './client.js';
 import { Preset, toPreset, type PresetInput, type ResizeTarget } from './preset.js';
@@ -320,7 +321,7 @@ class FluentRender implements Omit<RenderBuilder, PresetName> {
     const signals = [this.#reading.signal, this.#options.signal, options?.signal].filter(
       (signal): signal is AbortSignal => signal !== undefined,
     );
-    return { signal: AbortSignal.any(signals) };
+    return { signal: anySignal(signals) };
   }
 
   static {

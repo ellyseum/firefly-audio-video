@@ -15,6 +15,7 @@
 import { AudioVideoError } from './errors.js';
 import type { AsyncJob, JobMeta } from './job.js';
 import type { PoolBackend } from './pool.js';
+import { anySignal } from './signals.js';
 
 /**
  * A running call: awaitable like a promise (`await job`, `job.then()`,
@@ -195,7 +196,7 @@ export class PooledJob<J, T> implements JobHandle<T> {
     if (admitted === SKIPPED) throw beforeStart.reason;
     const { signal } = options;
     const finishSignal = signal
-      ? AbortSignal.any([this.#finishing.signal, signal])
+      ? anySignal([this.#finishing.signal, signal])
       : this.#finishing.signal;
     return options.finish(admitted.value, finishSignal);
   }

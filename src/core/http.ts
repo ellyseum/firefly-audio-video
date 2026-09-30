@@ -11,6 +11,7 @@
 import type { TokenProvider } from './auth.js';
 import { AudioVideoError } from './errors.js';
 import { redactError, redactUrl } from './redact.js';
+import { linkSignals } from './signals.js';
 
 /** @internal The default host every {@link HttpClient} targets unless {@link HttpClientOptions.host} overrides it. */
 export const DEFAULT_HOST = 'https://audio-video-api.adobe.io';
@@ -49,11 +50,11 @@ export interface HttpClientOptions {
  */
 export interface HttpRequestInit {
   /**
-   * Combined, via `AbortSignal.any`, with this client's own per-attempt
-   * `AbortSignal.timeout` — aborting this signal aborts the in-flight fetch
-   * (and, if it fires during a 429 backoff wait, cancels that wait too)
-   * regardless of which attempt is in progress; the request then rejects
-   * with `code: 'cancelled'`.
+   * Combined with this client's own per-attempt timeout — aborting this
+   * signal aborts the in-flight fetch (and, if it fires during a 429 backoff
+   * wait, cancels that wait too) regardless of which attempt is in progress;
+   * the request then rejects with `code: 'cancelled'`. The listener each
+   * attempt adds to it is removed when that attempt ends.
    */
   signal?: AbortSignal;
   /**
@@ -180,7 +181,9 @@ export class HttpClient {
 
     for (let attempt = 0; ;) {
       const timeoutSignal = AbortSignal.timeout(DEFAULT_ATTEMPT_TIMEOUT_MS);
-      const signal = init.signal ? AbortSignal.any([timeoutSignal, init.signal]) : timeoutSignal;
+      const link =
+        init.signal === undefined ? undefined : linkSignals([timeoutSignal, init.signal]);
+      const signal = link?.signal ?? timeoutSignal;
 
       try {
         const res = await fetch(url, {
@@ -217,6 +220,8 @@ export class HttpClient {
       } catch (error) {
         if (error instanceof AudioVideoError) throw error;
         throw requestFailure(error, url, init.signal, timeoutSignal);
+      } finally {
+        link?.release();
       }
     }
   }

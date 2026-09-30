@@ -186,10 +186,11 @@ export class Asset {
    * {@link AssetReadOptions.retries} describes, so the reader sees one
    * unbroken byte sequence. Bytes already emitted cannot be taken back, so a
    * server that cannot resume — it answers the `Range` request with `200`
-   * (the asset changed, or it ignores ranges), with `416`, or with a
-   * `Content-Range` that does not continue where the stream stopped — ends the
-   * stream with an `asset_fetch_failed` error saying the download could not be
-   * resumed, rather than repeating bytes from the start.
+   * (the asset changed, or it ignores ranges), with a `416` that does not show
+   * the download already complete, or with a `Content-Range` that does not
+   * continue where the stream stopped — ends the stream with an
+   * `asset_fetch_failed` error saying the download could not be resumed,
+   * rather than repeating bytes from the start.
    *
    * @param options - See {@link AssetReadOptions}.
    * @returns A readable byte stream over the asset's bytes.
@@ -232,9 +233,10 @@ export class Asset {
    *
    * A body cut off mid-transfer resumes as {@link AssetReadOptions.retries}
    * describes. When the server cannot resume — it answers the `Range` request
-   * with `200`, with `416`, or with a `Content-Range` that does not continue
-   * where the download stopped — the download starts over from byte zero in a
-   * fresh temp file, the partial one deleted, within the same retry budget.
+   * with `200`, with a `416` that does not show the download already complete,
+   * or with a `Content-Range` that does not continue where the download
+   * stopped — the download starts over from byte zero in a fresh temp file,
+   * the partial one deleted, within the same retry budget.
    *
    * @param path - The destination file path.
    * @param options - See {@link AssetReadOptions}.
@@ -303,7 +305,7 @@ export class Asset {
    * generator; aborted by `plan.signal`, which rejects `cancelled`; or cut
    * off — a transport error, or a clean end short of the length the response
    * reported — which hands over to `#recover` for the response to read on
-   * from.
+   * from, or for the finding that nothing is missing.
    */
   async *#download(plan: DownloadPlan): AsyncGenerator<Buffer> {
     const { signal } = plan;
@@ -330,7 +332,9 @@ export class Asset {
           ),
         };
       }
-      attempt = await this.#recover(state, plan, interruption.cause);
+      const next = await this.#recover(state, plan, interruption.cause);
+      if (next === undefined) return;
+      attempt = next;
     }
   }
 
@@ -366,15 +370,17 @@ export class Asset {
    * {@link resumptionVerdict}), or — when the server cannot resume and the
    * read may start over (`plan.restart` is set, or nothing has been delivered
    * yet) — a complete response from byte zero, with `state` reset to match.
-   * Every re-request spends one of `plan.retries` and waits its backoff
-   * first. A server that cannot resume fails a read that may not start over at
-   * once, as does a status other than `408`, `429` or a `5xx`.
+   * Resolves `undefined` instead when the answer is a `416` showing every byte
+   * already delivered. Every re-request spends one of `plan.retries` and
+   * waits its backoff first. A server that cannot resume fails a read that
+   * may not start over at once, as does a status other than `408`, `429` or a
+   * `5xx`.
    */
   async #recover(
     state: DownloadState,
     plan: DownloadPlan,
     interruption: unknown,
-  ): Promise<Attempt> {
+  ): Promise<Attempt | undefined> {
     const { signal, retries } = plan;
     const mayRestart = plan.restart !== undefined || state.offset === 0;
     let resume = state.resumable && state.offset > 0;
@@ -400,6 +406,10 @@ export class Asset {
       }
       const { res } = attempt;
       const verdict = resume ? resumptionVerdict(res, state) : restartVerdict(res);
+      if (verdict.kind === 'complete') {
+        await discard(attempt);
+        return undefined;
+      }
       if (verdict.kind === 'continue') {
         state.total ??= verdict.total;
         return attempt;
@@ -590,14 +600,16 @@ interface Failure {
 
 /**
  * What the response to a re-request lets a download do next: `continue` —
- * append its body, a `206` picking up at the offset; `restart` — start over
- * with it, a complete response from byte zero; `refused` — start over with a
- * fresh request, since it cannot continue at the offset (a `416`, a
+ * append its body, a `206` picking up at the offset; `complete` — finish, a
+ * `416` showing every byte already delivered; `restart` — start over with it,
+ * a complete response from byte zero; `refused` — start over with a fresh
+ * request, since it cannot continue at the offset (any other `416`, a
  * misaligned or changed `206`); `retry` — try again after a `408`, `429` or
  * `5xx`; `fatal` — fail the download on any other status.
  */
 type Verdict =
   | { kind: 'continue'; total: number | undefined }
+  | { kind: 'complete' }
   | { kind: 'restart'; reason: string }
   | { kind: 'refused'; reason: string }
   | { kind: 'retry' }
@@ -732,10 +744,26 @@ function resumptionVerdict(res: Response, state: DownloadState): Verdict {
     };
   }
   if (status === 416) {
+    if (completedBy416(headers, state)) return { kind: 'complete' };
     return { kind: 'refused', reason: 'the server answered 416 Range Not Satisfiable' };
   }
   if (res.ok) return { kind: 'refused', reason: `the server answered ${status}, not 206` };
   return retryableStatus(status) ? { kind: 'retry' } : { kind: 'fatal' };
+}
+
+/**
+ * Whether a `416` to a resumption shows the download already holds every
+ * byte: its `Content-Range` is the unsatisfied-range form, giving a complete
+ * length and no range, and that length is both the one an earlier response
+ * reported and the number of bytes delivered. A body cut off after its last
+ * byte, before its end was seen, is resumed at exactly that length.
+ */
+function completedBy416(headers: Headers, state: DownloadState): boolean {
+  // bytes */<complete length>
+  const match = /^bytes\s+\*\/(\d+)$/i.exec(headers.get('content-range')?.trim() ?? '');
+  if (match === null) return false;
+  const length = Number(match[1]);
+  return state.total !== undefined && length === state.total && length === state.offset;
 }
 
 /** What the response to a fresh request from byte zero lets the download do. */

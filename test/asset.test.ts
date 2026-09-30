@@ -1591,6 +1591,94 @@ test('a cut after save() starts over resumes the new version from its own offset
 });
 
 /**
+ * An asset whose first response delivers the first `delivered` bytes of
+ * `full` and then resets — reporting `full`'s length only when `reportLength`
+ * is set — whose resumption gets a `416` giving `completeLength` as the
+ * complete length, and whose later plain requests get the whole of `full`.
+ * Records each request's headers.
+ */
+function resetThen416(options: {
+  full: Buffer;
+  delivered: number;
+  reportLength: boolean;
+  completeLength: number;
+}): { asset: Asset; requests: Array<Record<string, string>> } {
+  const { full, delivered, reportLength, completeLength } = options;
+  const requests: Array<Record<string, string>> = [];
+  const asset = new Asset({
+    url: 'https://x/out.bin',
+    meta: sampleMeta(),
+    fetch: async (_url, init) => {
+      const headers = init?.headers ?? {};
+      requests.push(headers);
+      if (requests.length === 1) {
+        const length = reportLength ? { 'content-length': String(full.length) } : {};
+        return new Response(resettingBody([full.subarray(0, delivered)], new Error('reset')), {
+          headers: { ...length, etag: '"v1"' },
+        });
+      }
+      if (headers.Range !== undefined) {
+        return new Response(null, {
+          status: 416,
+          headers: { 'content-range': `bytes */${completeLength}` },
+        });
+      }
+      return new Response(full, { headers: { etag: '"v1"' } });
+    },
+  });
+  return { asset, requests };
+}
+
+test.each<Accessor>(['stream', 'save', 'buffer'])(
+  'a 416 giving exactly the length already delivered completes %s() without downloading again',
+  async (accessor) => {
+    // Every byte arrives, then the connection resets before the body's end is seen.
+    const full = BODY.subarray(0, 1_000);
+    const { asset, requests } = resetThen416({
+      full,
+      delivered: 1_000,
+      reportLength: true,
+      completeLength: 1_000,
+    });
+
+    const bytes = await readThrough(asset, accessor);
+
+    expect(sha256(bytes)).toBe(sha256(full));
+    expect(requests).toEqual([{}, { Range: 'bytes=1000-', 'If-Range': '"v1"' }]);
+  },
+);
+
+test.each([
+  [
+    'no length was known before it',
+    { full: BODY.subarray(0, 1_000), reportLength: false, completeLength: 1_000 },
+  ],
+  [
+    'its length differs from the one the first response reported',
+    { full: BODY.subarray(0, 2_000), reportLength: true, completeLength: 1_000 },
+  ],
+  [
+    'its length differs from the bytes delivered',
+    { full: BODY.subarray(0, 2_000), reportLength: true, completeLength: 2_000 },
+  ],
+])(
+  'a 416 proves nothing when %s: buffer() rejects and save() starts over, as for any other 416',
+  async (_case, options) => {
+    const refused = resetThen416({ ...options, delivered: 1_000 });
+    const err = await readFailure(refused.asset, 'buffer');
+    expect(err.code).toBe('asset_fetch_failed');
+    expect(err.status).toBe(416);
+    expect(err.message).toContain('could not be resumed, because the server answered 416');
+    expect(refused.requests).toHaveLength(2);
+
+    const restarted = resetThen416({ ...options, delivered: 1_000 });
+    const bytes = await readThrough(restarted.asset, 'save');
+    expect(sha256(bytes)).toBe(sha256(options.full));
+    expect(restarted.requests).toEqual([{}, { Range: 'bytes=1000-', 'If-Range': '"v1"' }, {}]);
+  },
+);
+
+/**
  * A fetch stub whose first response is a content-encoded body that is cut off
  * only once its first chunk has been delivered — `delivered()` fires the cut
  * — and whose later responses carry the whole of `BODY`. Records each

@@ -19,6 +19,7 @@ import {
   fourccValue,
   parseEprHeadline,
   presetIdFor,
+  readParams,
   toEpr,
 } from '../src/presets/epr.js';
 
@@ -497,6 +498,174 @@ describe('parseEprHeadline against every proven sample', () => {
     expect(headline.matchSource).toBe(true);
     expect(headline.bitDepth).toBeUndefined();
   });
+});
+
+/**
+ * The reading `readParams` performs, stated as regexes, with a count of the
+ * elements skipped for repeating an identifier already read. The regexes
+ * backtrack quadratically on crafted input, so they are only ever fed short
+ * strings.
+ */
+function regexReadParams(
+  xml: string,
+): [params: Map<string, { value?: string; arbData?: string }>, repeats: number] {
+  const params = new Map<string, { value?: string; arbData?: string }>();
+  let repeats = 0;
+  for (const [block] of xml.matchAll(
+    /<ExporterParam ObjectID="\d+"[^>]*>[\s\S]*?<\/ExporterParam>/g,
+  )) {
+    const id = /<ParamIdentifier>([^<]*)<\/ParamIdentifier>/.exec(block)?.[1];
+    if (id === undefined) continue;
+    if (params.has(id)) {
+      repeats += 1;
+      continue;
+    }
+    const value = /<ParamValue>([^<]*)<\/ParamValue>/.exec(block)?.[1];
+    const arbData = /<ParamArbData[^>]*>([^<]*)<\/ParamArbData>/.exec(block)?.[1];
+    params.set(id, {
+      ...(value === undefined ? {} : { value }),
+      ...(arbData === undefined ? {} : { arbData }),
+    });
+  }
+  return [params, repeats];
+}
+
+/** A seeded PRNG (mulberry32), so every generated case reproduces. */
+function seeded(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** Milliseconds per call of `fn`: calls repeat until 25 ms have passed, so a fast call still measures. */
+function msPerCall(fn: () => unknown): number {
+  let calls = 0;
+  const started = performance.now();
+  let elapsed: number;
+  do {
+    fn();
+    calls += 1;
+    elapsed = performance.now() - started;
+  } while (elapsed < 25);
+  return elapsed / calls;
+}
+
+describe('reading parameters from an .epr', () => {
+  test('the first element per identifier wins; a malformed start tag or an unclosed element is skipped', () => {
+    const xml = [
+      '<ExporterParam ObjectID="1"><ParamIdentifier>A</ParamIdentifier><ParamValue>1</ParamValue>',
+      '<ParamArbData Encoding="base64" Checksum="9">QQ==</ParamArbData></ExporterParam>',
+      '<ExporterParam ObjectID="2"><ParamIdentifier>A</ParamIdentifier><ParamValue>2</ParamValue></ExporterParam>',
+      '<ExporterParam ObjectID="x"><ParamIdentifier>B</ParamIdentifier></ExporterParam>',
+      '<ExporterParam ObjectID="3" Extra="y"><ParamIdentifier>C</ParamIdentifier>',
+      '<ParamArbData<ParamArbData>kept</ParamArbData></ExporterParam>',
+      '<ExporterParam ObjectID="4"><ParamIdentifier>D</ParamIdentifier><ParamValue>open',
+    ].join('\r\n');
+    expect(readParams(xml)).toEqual(
+      new Map([
+        ['A', { value: '1', arbData: 'QQ==' }],
+        ['C', { arbData: 'kept' }],
+      ]),
+    );
+  });
+
+  test('reads exactly what the regex statement of the same grammar reads, across generated fragments', () => {
+    const fragments = [
+      '<ExporterParam ObjectID="',
+      '<ExporterParam ObjectID="7">',
+      '<ExporterParam ObjectID="12" Class="x">',
+      '<ExporterParam ObjectID="">',
+      '<ExporterParam ObjectID="3x">',
+      '</ExporterParam>',
+      '<ExporterParam ObjectID="5"><ParamIdentifier>A</ParamIdentifier><ParamValue>2</ParamValue></ExporterParam>',
+      '<ExporterParam ObjectID="6"><ParamIdentifier>B</ParamIdentifier><ParamArbData>z</ParamArbData></ExporterParam>',
+      '7',
+      '"',
+      '>',
+      '<',
+      '\r\n',
+      '<ParamIdentifier>A</ParamIdentifier>',
+      '<ParamIdentifier>B</ParamIdentifier>',
+      '<ParamIdentifier>',
+      '</ParamIdentifier>',
+      '<ParamValue>1</ParamValue>',
+      '<ParamValue>',
+      '</ParamValue>',
+      '<ParamArbData Encoding="base64" Checksum="9">QQ==</ParamArbData>',
+      '<ParamArbData>x</ParamArbData>',
+      '<ParamArbData',
+      '<ParamArbData a>',
+      '</ParamArbData>',
+      '<ParamArbDataX>y</ParamArbData>',
+    ];
+    const random = seeded(20260930);
+    const reached = { params: 0, value: 0, arbData: 0, repeatedId: 0 };
+    for (let n = 0; n < 4000; n += 1) {
+      let xml = '';
+      const length = 1 + Math.floor(random() * 40);
+      for (let i = 0; i < length; i += 1) {
+        xml += fragments[Math.floor(random() * fragments.length)];
+      }
+      const [expected, repeats] = regexReadParams(xml);
+      expect(readParams(xml), JSON.stringify(xml)).toEqual(expected);
+      const readings = [...expected.values()];
+      if (expected.size > 0) reached.params += 1;
+      if (readings.some((reading) => reading.value !== undefined)) reached.value += 1;
+      if (readings.some((reading) => reading.arbData !== undefined)) reached.arbData += 1;
+      if (repeats > 0) reached.repeatedId += 1;
+    }
+    // The generated inputs reach every part of the reading, not just empty maps.
+    expect(reached.params).toBeGreaterThan(1500);
+    expect(reached.value).toBeGreaterThan(1000);
+    expect(reached.arbData).toBeGreaterThan(1000);
+    expect(reached.repeatedId).toBeGreaterThan(700);
+  });
+
+  const N = 4000;
+
+  test.each([
+    [
+      'a repeated <ExporterParam ObjectID="9"> start tag',
+      (n: number) => `<PremiereData Version="3">${'<ExporterParam ObjectID="9">'.repeat(n)}`,
+    ],
+    [
+      'one parameter holding a repeated <ParamArbData',
+      (n: number) =>
+        '<PremiereData Version="3"><ExporterParam ObjectID="9">' +
+        '<ParamIdentifier>ADBEVideoMatchSource</ParamIdentifier>' +
+        `${'<ParamArbData'.repeat(n)}</ExporterParam>`,
+    ],
+  ])(
+    'parses %s in time linear in its count',
+    (_shape, crafted) => {
+      const small = crafted(N);
+      const large = crafted(4 * N);
+      expect(parseEprHeadline(small)).toEqual({});
+      expect(parseEprHeadline(large)).toEqual({});
+      let smallMs = Number.POSITIVE_INFINITY;
+      let largeMs = Number.POSITIVE_INFINITY;
+      for (let round = 0; round < 3; round += 1) {
+        smallMs = Math.min(
+          smallMs,
+          msPerCall(() => parseEprHeadline(small)),
+        );
+        largeMs = Math.min(
+          largeMs,
+          msPerCall(() => parseEprHeadline(large)),
+        );
+      }
+      const timing = `${N} -> ${4 * N} repetitions: ${smallMs.toFixed(3)} ms -> ${largeMs.toFixed(3)} ms`;
+      // 4x the input takes about 4x the time when the parse is linear, about 16x when quadratic.
+      expect.soft(largeMs / smallMs, timing).toBeLessThan(8);
+      expect.soft(largeMs, timing).toBeLessThan(100);
+    },
+    60_000,
+  );
 });
 
 describe('templates and helpers', () => {

@@ -1,0 +1,35 @@
+name: codeql
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '27 3 * * 0'
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: analyze (javascript-typescript)
+    # Code scanning is free on a public repository; on a private one it needs
+    # GitHub Advanced Security, which this repository does not have while it
+    # is still private, so the job stays off until the flip.
+    if: github.event.repository.private == false
+    runs-on: ubuntu-latest
+    # A job-level permissions block replaces the workflow-level default for
+    # that job rather than adding to it, so contents: read is restated here
+    # alongside the one write CodeQL's own upload needs.
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          languages: javascript-typescript
+          build-mode: none
+      - uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          category: '/language:javascript-typescript'

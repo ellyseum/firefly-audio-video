@@ -312,9 +312,12 @@ without calling the storage provider.
 A `429` is retried with backoff, honoring `Retry-After` up to 60 s and otherwise exponential with
 jitter, up to `retry: { maxRetries }` times (default `5`). Cancelling while a submit is retrying
 rejects the call at once; its slot stays held until that submit has settled — at most the 30 s
-attempt timeout, never a further retry — and any cancel request has been sent, so a second call
-still respects `concurrency`. The pool counts per process: several processes sharing one credential
-coordinate through a `PoolBackend` of your own, passed as `pool`.
+attempt timeout, never a further retry — and any cancel request has completed, so a second call
+still respects `concurrency`. The cancel request retries a `429` like any other, so sustained
+`429`s stretch the hold: derived from the retry limits, the worst case with the default
+`maxRetries` is 8 min 30 s — 30 s for the submit, then 6 attempts of up to 30 s and 5 waits of up
+to 60 s. The pool counts per process: several processes sharing one credential coordinate through
+a `PoolBackend` of your own, passed as `pool`.
 
 ## Downloads
 
@@ -474,16 +477,18 @@ The first Ctrl+C cancels the job; a second exits at once.
 
 `--json` prints exactly one JSON document on stdout, success or failure, usage errors included:
 `{ "ok": true, ... }` with the command's fields, or
-`{ "ok": false, "error": { "code", "message", "jobId"?, "requestId"? } }`.
+`{ "ok": false, "error": { "code", "message", "jobId"?, "requestId"?, "readUrl"?, "items"? } }`:
+`jobId` once the service has accepted the job, `items` holding the service's reasons, and `readUrl`
+when a save fails after a successful render — the output's read URL, without its signature.
 
-| Command            | `--json` fields                                                                                 |
-| ------------------ | ----------------------------------------------------------------------------------------------- |
-| `render`           | `jobId`, `output` (a string, or an array for several outputs), `queueMs`, `renderMs`, `totalMs` |
-| `describe`         | `controls`, `fonts`                                                                             |
-| `presets`          | `presets`                                                                                       |
-| `status`, `cancel` | `job`, redacted — it echoes each output's presigned write URL otherwise                         |
-| `stage`            | `url`                                                                                           |
-| `encode`           | `native` for a config that renders natively, `xml`, or `path` with `--out`                      |
+| Command            | `--json` fields                                                                                                                     |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `render`           | `jobId`, `output` (a string, or an array for several outputs), `queueMs`, `renderMs`, `totalMs`; a failed save adds `error.readUrl` |
+| `describe`         | `controls`, `fonts`                                                                                                                 |
+| `presets`          | `presets`                                                                                                                           |
+| `status`, `cancel` | `job`, redacted — it echoes each output's presigned write URL otherwise                                                             |
+| `stage`            | `url`                                                                                                                               |
+| `encode`           | `native` for a config that renders natively, `xml`, or `path` with `--out`                                                          |
 
 `--log` writes the SDK's NDJSON records to stderr; without it the CLI writes none, so stdout carries
 only the result.
@@ -496,8 +501,11 @@ Credentials come from `IMS_OAUTH_S2S_CLIENT_ID`, `IMS_OAUTH_S2S_CLIENT_SECRET` a
 `--client-id`, `--client-secret` and `--scope`. Prefer the environment: a value on the command line
 is visible to other processes on the machine. Surrounding whitespace is trimmed, so a trailing
 newline from an environment file is not part of the credential; whitespace or a control character
-anywhere else in a value is refused with `invalid_argument` without echoing it, and a scope list
-with spaces in it gets a hint to separate scopes with commas instead.
+anywhere else in the client ID or secret is refused with `invalid_argument` without echoing it. A
+scope list may be separated by commas or spaces, or be a JSON array: the CLI, like
+`createClient({ scope })`, sends IMS the comma-separated form. A `ClientCredentialsProvider` built
+directly refuses a space inside `scope` with `invalid_argument` and a hint to separate scopes with
+commas.
 
 `render`, `describe` and `stage` stage through `--storage <uri>`, or `DGR_STORAGE`:
 

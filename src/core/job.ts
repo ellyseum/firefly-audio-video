@@ -119,8 +119,10 @@ export interface RunJobOptions<T> {
   /**
    * Called once per poll with the raw status body, the terminal poll included. On
    * the terminal poll it runs after the outcome and `meta` have been derived, so
-   * nothing it does to the body changes them. An error it throws is the caller's
-   * own: it rejects the job exactly as thrown, never wrapped.
+   * nothing it does to the body changes them. If it throws, the job rejects
+   * `callback_failed` with the thrown value as `cause` — once the service has
+   * been sent the best-effort cancel request {@link AsyncJob.cancel} sends,
+   * when the poll was not the terminal one.
    */
   onProgress?: (status: JobStatusLike) => void;
   /**
@@ -233,16 +235,17 @@ const POLL_RETRY_MAX_MS = 30_000;
  * `job.cancel()`). It settles exactly once — with the capability's mapped result
  * when the job reaches a successful terminal state, or with an
  * {@link AudioVideoError} whose `code` is `job_failed`, `job_poll_failed`,
- * `submit_failed`, `cancelled` or `job_timeout` — or, when a submit or a final
- * poll failure was already one (a `404`, say — repeating the request cannot
- * change it), that same error unchanged.
+ * `submit_failed`, `callback_failed`, `cancelled` or `job_timeout` — or, when
+ * a submit or a final poll failure was already one (a `404`, say — repeating
+ * the request cannot change it), that same error unchanged.
  *
  * `util.inspect` / `console.log` print only `{ jobId, state }` — never a URL or a
  * status body — so a job can be logged freely.
  *
  * A job is a promise in this respect too: one that is never awaited (or given a
  * rejection handler) and ends in `job_failed`, `job_poll_failed`, `submit_failed`,
- * `job_timeout` or a service-side cancellation is an unhandled rejection. Only a
+ * `callback_failed`, `job_timeout` or a service-side cancellation is an
+ * unhandled rejection. Only a
  * job cancelled through {@link AsyncJob.cancel} or `signal` carries a handler of
  * its own.
  *
@@ -500,6 +503,10 @@ export class AsyncJob<T> implements PromiseLike<T> {
  *   on the client's own host, never to the refused URL; the job rejects once
  *   that request has been attempted, and a failed cancel request never replaces
  *   the `invalid_response`;
+ * - rejects `callback_failed`, with the thrown value as `cause`, when
+ *   `opts.onProgress` throws — on a poll that was not the terminal one, once
+ *   the service has been sent the best-effort cancel request, since nothing
+ *   polls the job after that;
  * - rejects `submit_failed`, with the rejection as `cause`, when the submit call
  *   rejects with anything other than an {@link AudioVideoError}; a submit
  *   rejecting with one (`http_429`, an auth failure, …) rejects the job with that
@@ -632,7 +639,13 @@ async function pollUntilTerminal<T>(
     const status = asStatusBody(response.body);
     const outcome = terminalOutcome(status, jobId);
     if (outcome !== undefined) ctx.setMeta(outcome.meta);
-    opts.onProgress?.(status);
+    try {
+      opts.onProgress?.(status);
+    } catch (error) {
+      // Nothing polls a job after this, so one still running is asked to stop.
+      if (outcome === undefined) await ctx.cancelRemote();
+      throw callbackFailure(jobId, outcome !== undefined, error);
+    }
 
     if (outcome !== undefined) {
       if (outcome.failure !== undefined) throw outcome.failure;
@@ -851,6 +864,24 @@ function submitFailure(cause: unknown): AudioVideoError {
   return new AudioVideoError({
     message: `${describeJob(undefined)} could not be submitted: ${describeFailure(cause)}.`,
     code: 'submit_failed',
+    cause,
+  });
+}
+
+/**
+ * The error a job rejects with when its `onProgress` callback throws, on the
+ * job's final status (`terminal`) or while it was still running. `cause` is
+ * the thrown value exactly as given, by design: it is the caller's own value,
+ * handed back to the caller, and `cause` never reaches a log record or a
+ * serialized form of the error.
+ */
+function callbackFailure(jobId: string, terminal: boolean, cause: unknown): AudioVideoError {
+  return new AudioVideoError({
+    message: terminal
+      ? `The onProgress callback threw on job ${jobId}'s final status.`
+      : `The onProgress callback threw while job ${jobId} was running; the service was asked to stop the job.`,
+    code: 'callback_failed',
+    jobId,
     cause,
   });
 }

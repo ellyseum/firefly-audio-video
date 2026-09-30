@@ -40,7 +40,11 @@ export interface RenderBuilderOptions {
    * `cancelled` with the abort reason as `cause`.
    */
   signal?: AbortSignal;
-  /** Called once per status poll with the raw status body, the terminal poll included. */
+  /**
+   * Called once per status poll with the raw status body, the terminal poll
+   * included. If it throws, the render rejects `callback_failed` with the
+   * thrown value as `cause`, and a job still running is asked to stop.
+   */
   onProgress?: (status: JobStatusLike) => void;
   /**
    * Milliseconds between status polls — a constant, or a function of the

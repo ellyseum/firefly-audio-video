@@ -190,6 +190,33 @@ test('onProgress is called with each status poll, terminal included', async () =
   expect(seen).toEqual(['running', 'succeeded']);
 });
 
+test('an onProgress that throws stops the render on the service and rejects callback_failed with that error as cause', async () => {
+  api.submit(['job-cb']);
+  api.status('job-cb', () => running('job-cb'));
+  api.cancel('job-cb');
+  const logger = recordingLogger();
+  const bug = new Error('progress UI broke');
+  let polls = 0;
+
+  const error = await rejection(
+    client({ logging: logger }).render(singleSpec(), {
+      pollIntervalMs: 0,
+      onProgress: () => {
+        polls += 1;
+        if (polls === 2) throw bug;
+      },
+    }),
+  );
+
+  expect(error.code).toBe('callback_failed');
+  expect(error.cause).toBe(bug);
+  expect(error.jobId).toBe('job-cb');
+  expect(api.count('PUT', '/v1/cancel/job-cb')).toBe(1);
+  expect(logger.records.map((record) => [record.level, record.msg])).toEqual([
+    ['error', 'render failed'],
+  ]);
+});
+
 // --- render: several outputs ---------------------------------------------------------
 
 test('two outputs whose wire entries arrive reversed, indexes as strings, resolve Asset[] in spec order with their own timing', async () => {

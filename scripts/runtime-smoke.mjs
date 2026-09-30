@@ -16,6 +16,7 @@
  */
 
 import { Console } from 'node:console';
+import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
@@ -318,6 +319,23 @@ else console.error('not ok - [esm] behaviour checks skipped: the ESM entry did n
 if (!cjs || !esm) failures += 1;
 
 globalThis.fetch = realFetch;
+
+const version = cjs?.VERSION ?? esm?.VERSION;
+await check('dist/cli.cjs --version prints the package VERSION and exits 0', () => {
+  if (version === undefined)
+    throw new Error('no loaded entry exposed a VERSION to compare against');
+  const result = spawnSync(process.execPath, [join(distDir, 'cli.cjs'), '--version'], {
+    encoding: 'utf8',
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`exited ${result.status}, stderr: ${result.stderr}`);
+  }
+  const printed = result.stdout.trim();
+  if (printed !== version) {
+    throw new Error(`expected VERSION ${version}, got ${JSON.stringify(printed)}`);
+  }
+});
 
 console.log(
   `runtime-smoke: ${failures === 0 ? 'all checks passed' : `${failures} check group(s) failed`}`,

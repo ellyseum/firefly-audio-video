@@ -101,14 +101,17 @@ export type PollInterval = number | ((elapsedMs: number) => number);
 export interface RunJobOptions<T> {
   /**
    * Issues the capability's request and returns the accepted job's ID and status
-   * URL. It is not handed the job's abort signal: a cancel during submission lets
-   * the request complete, so the job the service accepted is known by ID and is
-   * sent the cancel request — aborting the request would leave that job running
-   * unseen. Never retried: a failing submit rejects the job with the error it
-   * threw when that error is already an {@link AudioVideoError} (a caller matches
-   * on its code), or with one wrapping it (`code: 'submit_failed'`) otherwise.
+   * URL. `stop` aborts when the job is cancelled or times out: the request must
+   * then stop wherever nothing is in flight — before an attempt is sent, while it
+   * waits to retry after a `429`, which created no job — and reject, but never
+   * abort an attempt already sent. That attempt is seen through, so a job the
+   * service accepted is known by ID and is sent the cancel request; aborting it
+   * would leave that job running unseen. Never retried here: a failing submit
+   * rejects the job with the error it threw when that error is already an
+   * {@link AudioVideoError} (a caller matches on its code), or with one wrapping
+   * it (`code: 'submit_failed'`) otherwise.
    */
-  submit: () => Promise<JobSubmission>;
+  submit: (stop: AbortSignal) => Promise<JobSubmission>;
   /** Builds the job's result from a successful terminal status body and its derived timing. */
   mapResult: (terminal: JobStatusLike, meta: JobMeta) => T;
   /**
@@ -336,6 +339,19 @@ export class AsyncJob<T> implements PromiseLike<T> {
     return this.#meta;
   }
 
+  /**
+   * @internal Resolves, never rejects, once the job has settled and so has
+   * everything it asked of the service: its submit request, and the cancel
+   * request a cancelled job sends once that submit shows a job to cancel. A
+   * job cancelled mid-submit settles at once but drains only then.
+   */
+  get drained(): Promise<void> {
+    return this.#promise.then(noop, noop).then(async () => {
+      await this.#jobIdKnown.promise;
+      await this.#remoteCancel;
+    });
+  }
+
   /** Attaches fulfillment/rejection handlers to the job's settlement; `await job` works through this. */
   then<TResult1 = T, TResult2 = never>(
     onfulfilled?: ((value: T) => TResult1 | PromiseLike<TResult1>) | null,
@@ -364,9 +380,10 @@ export class AsyncJob<T> implements PromiseLike<T> {
    *
    * A submit request still in flight is left to complete rather than aborted, so
    * the job the service accepted is known by ID and the cancel request reaches it;
-   * this promise resolves once that request has been attempted (or once a failed
-   * submit has shown there is nothing to cancel). Calling this on an
-   * already-settled job, or a second time, is a no-op.
+   * a submit waiting to retry after a `429`, which created no job, stops instead.
+   * This promise resolves once the cancel request has been attempted (or once a
+   * failed or stopped submit has shown there is nothing to cancel). Calling this
+   * on an already-settled job, or a second time, is a no-op.
    */
   cancel(): Promise<void> {
     return this.#cancelWith(ABORT_CANCELLED);
@@ -595,7 +612,7 @@ async function pollUntilTerminal<T>(
   const startedAt = Date.now();
 
   signal.throwIfAborted();
-  const submission = opts.submit().catch((err: unknown) => {
+  const submission = opts.submit(signal).catch((err: unknown) => {
     throw submitFailure(err);
   });
   const { jobId, statusUrl } = await ctx.trackSubmission(submission);

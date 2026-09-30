@@ -19,6 +19,7 @@ import {
 } from '../src/dgr/client.js';
 import { encode, presets } from '../src/dgr/preset.js';
 import type { RenderRequest, RenderRequestOutput } from '../src/dgr/schemas.js';
+import { deferred } from './support/fake-ims.js';
 import {
   API,
   CREATED,
@@ -755,6 +756,111 @@ test('with concurrency 2, five renders never have more than two submitted jobs u
   }
   expect(maxUnfinished).toBe(2);
   expect(timeline.filter((event) => event.startsWith('submit:'))).toHaveLength(5);
+});
+
+test('at concurrency 1, cancelling a render while its submit waits out a 429 stops the submit, which created no job', async () => {
+  const pool = new InMemoryPool({ concurrency: 1 });
+  const timeline: string[] = [];
+  api.agent
+    .get(API)
+    .intercept({
+      path: '/v1/templates/render',
+      method: 'POST',
+      headers: { 'x-api-key': 'client-a' },
+    })
+    .reply(
+      429,
+      () => {
+        timeline.push('submit A: 429');
+        return { error: 'rate_limit' };
+      },
+      { headers: { 'retry-after': '0.2' } },
+    )
+    .persist();
+  api.agent
+    .get(API)
+    .intercept({
+      path: '/v1/templates/render',
+      method: 'POST',
+      headers: { 'x-api-key': 'client-b' },
+    })
+    .reply(202, () => {
+      timeline.push('submit B');
+      return { jobId: 'job-b', statusUrl: `${API}/v1/status/job-b` };
+    });
+  api.status('job-b', () => running('job-b'));
+  api.cancel('job-b');
+
+  const a = client({ clientId: 'client-a', pool }).render(singleSpec(), { pollIntervalMs: 1_000 });
+  const b = client({ clientId: 'client-b', pool }).render(singleSpec(), { pollIntervalMs: 1_000 });
+  await until(() => timeline.length === 1);
+
+  await a.cancel();
+  expect((await rejection(a)).code).toBe('cancelled');
+  await until(() => timeline.includes('submit B'));
+  // Three times the wait A's retry was due after: a submit still retrying would have sent it.
+  await sleep(600);
+  expect(timeline).toEqual(['submit A: 429', 'submit B']);
+
+  await b.cancel();
+  await rejection(b);
+});
+
+test('at concurrency 1, cancelling a render whose submit is in flight cancels the job it creates before the next render submits', async () => {
+  const pool = new InMemoryPool({ concurrency: 1 });
+  const timeline: string[] = [];
+  const held = deferred();
+  api.agent
+    .get(API)
+    .intercept({
+      path: '/v1/templates/render',
+      method: 'POST',
+      headers: { 'x-api-key': 'client-a' },
+    })
+    .reply(202, async () => {
+      timeline.push('submit A sent');
+      await held.promise;
+      timeline.push('submit A answered');
+      return { jobId: 'job-a', statusUrl: `${API}/v1/status/job-a` };
+    });
+  api.agent
+    .get(API)
+    .intercept({ path: '/v1/cancel/job-a', method: 'PUT' })
+    .reply(202, () => {
+      timeline.push('cancel job-a');
+      return { jobId: 'job-a', status: 'canceling' };
+    });
+  api.agent
+    .get(API)
+    .intercept({
+      path: '/v1/templates/render',
+      method: 'POST',
+      headers: { 'x-api-key': 'client-b' },
+    })
+    .reply(202, () => {
+      timeline.push('submit B');
+      return { jobId: 'job-b', statusUrl: `${API}/v1/status/job-b` };
+    });
+  api.status('job-b', () => running('job-b'));
+  api.cancel('job-b');
+
+  const a = client({ clientId: 'client-a', pool }).render(singleSpec(), { pollIntervalMs: 1_000 });
+  const b = client({ clientId: 'client-b', pool }).render(singleSpec(), { pollIntervalMs: 1_000 });
+  await until(() => timeline.includes('submit A sent'));
+
+  const cancelling = a.cancel();
+  expect((await rejection(a)).code).toBe('cancelled');
+  for (let turn = 0; turn < 20; turn += 1) await flush();
+  // A still holds the slot: its submit has not answered, so B has not submitted.
+  expect(timeline).toEqual(['submit A sent']);
+
+  held.resolve();
+  await cancelling;
+  await until(() => timeline.includes('submit B'));
+  expect(timeline).toEqual(['submit A sent', 'submit A answered', 'cancel job-a', 'submit B']);
+
+  await b.cancel();
+  await rejection(b);
 });
 
 test('cancel() before pool admission submits nothing and rejects cancelled; the slot it never used stays free', async () => {

@@ -3,7 +3,8 @@
  * concurrency pool behind the method surface `createClient()` returns — the
  * surface the top-level functions reach through the default client.
  * `render()` and `describe()` run every job inside the client's pool, from
- * staging its inputs until the job settles; `status()`, `cancel()`,
+ * staging its inputs until the job — its submit and any cancel request
+ * included — has settled; `status()`, `cancel()`,
  * `listPresets()` and `stage()` run outside it. Every public call emits
  * exactly one log record when it settles.
  */
@@ -638,7 +639,7 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
           const body = await materializeDescribe(prepared, this.#storage, signal);
           return () =>
             runJob(this.#http, {
-              submit: () => this.#submit(DESCRIBE_PATH, body),
+              submit: (stop) => this.#submit(DESCRIBE_PATH, body, stop),
               mapResult: (terminal) => describeResult(terminal),
               onProgress: progress.onProgress,
               ...jobTuning(options),
@@ -802,7 +803,7 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
       const { body, outputs } = await materializeRender(prepared, this.#storage, signal);
       return () =>
         runJob(this.#http, {
-          submit: () => this.#submit(RENDER_PATH, body),
+          submit: (stop) => this.#submit(RENDER_PATH, body, stop),
           mapResult: (terminal, meta) => renderAssets(terminal, meta, outputs),
           onProgress: progress.onProgress,
           ...jobTuning(options),
@@ -813,10 +814,12 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
   /**
    * Submits a job and returns its ID and status URL. The service's `202` body
    * carries `jobId`, `statusUrl` and `cancelUrl`; the cancel request goes to
-   * `/v1/cancel/{jobId}`, which is what `cancelUrl` names.
+   * `/v1/cancel/{jobId}`, which is what `cancelUrl` names. `stop` ends the
+   * submit wherever no attempt is in flight — a `429` created no job — and
+   * never aborts one already sent.
    */
-  async #submit(path: string, body: unknown): Promise<JobSubmission> {
-    const res = await this.#http.request<unknown>('POST', path, body);
+  async #submit(path: string, body: unknown, stop: AbortSignal): Promise<JobSubmission> {
+    const res = await this.#http.request<unknown>('POST', path, body, { stopSignal: stop });
     const { jobId, statusUrl } = isRecord(res.body) ? res.body : {};
     if (typeof jobId !== 'string' || jobId === '' || typeof statusUrl !== 'string' || !statusUrl) {
       throw new AudioVideoError({

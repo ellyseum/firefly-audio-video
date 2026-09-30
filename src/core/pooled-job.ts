@@ -10,8 +10,9 @@
  * nothing a call does while holding one asks the pool for another, so a full
  * pool can never deadlock on its own callers. Cancelling before the job has
  * started submits nothing and frees any slot the call holds; cancelling after
- * delegates to the job. Capability-neutral: nothing here knows what a job
- * produces.
+ * delegates to the job, and a job cancelled while its submit is still in
+ * flight keeps the slot until that submit has answered and the cancel request
+ * has been sent. Capability-neutral: nothing here knows what a job produces.
  */
 
 import { AudioVideoError } from './errors.js';
@@ -46,9 +47,12 @@ export interface JobHandle<T> extends PromiseLike<T> {
    * the slot — nothing is submitted, an upload in progress is told to stop,
    * the slot is released, and the call rejects at once with `code: 'cancelled'`.
    * Once the job has been submitted, polling stops and the service is asked
-   * to stop the job (best-effort); the call rejects `cancelled`. While a
-   * finished job's result is being downloaded, the download is aborted.
-   * Calling this on a settled call, or a second time, is a no-op.
+   * to stop the job (best-effort); the call rejects `cancelled`. A submit
+   * waiting to retry after a `429` stops; one in flight is seen through and
+   * the job it creates is asked to stop, and the call's pool slot stays held
+   * until then, so the pool still bounds the jobs running on the service.
+   * While a finished job's result is being downloaded, the download is
+   * aborted. Calling this on a settled call, or a second time, is a no-op.
    */
   cancel(): Promise<void>;
   /** Attaches a rejection handler to the call's settlement. */
@@ -131,7 +135,8 @@ type CallState = 'pending' | 'fulfilled' | 'rejected' | 'cancelled';
 /**
  * @internal The {@link JobHandle} {@link runPooledJob} returns. Holds its pool
  * slot from the moment the call is admitted, through staging, until the job
- * settles, whether it resolves or rejects — or until a cancel before the job
+ * has drained — settled, whether it resolves or rejects, with its submit
+ * answered and any cancel request sent — or until a cancel before the job
  * starts, or a failed stage, frees it.
  */
 export class PooledJob<J, T> implements JobHandle<T> {
@@ -223,9 +228,48 @@ export class PooledJob<J, T> implements JobHandle<T> {
     const beforeStart = this.#beforeStart.signal;
     beforeStart.throwIfAborted();
     const stage = await untilAborted(Promise.resolve().then(options.prepare), beforeStart);
-    const admitted = await untilAborted(
-      options.pool.run(async () => {
-        if (beforeStart.aborted) return SKIPPED;
+    const { admission, released } = this.#admit(options.pool, stage);
+    const admitted = await untilAborted(admission, beforeStart);
+    if (admitted === SKIPPED) throw beforeStart.reason;
+    const value = await admitted.job;
+    // Finishing runs outside the slot; a job that settled with nothing left on the service frees it at once.
+    await released;
+    const { signal } = options;
+    if (signal === undefined) return options.finish(value, this.#finishing.signal);
+    // Released once finish settles: the caller's signal can outlive this call by far.
+    const link = linkSignals([this.#finishing.signal, signal]);
+    try {
+      return await options.finish(value, link.signal);
+    } finally {
+      link.release();
+    }
+  }
+
+  /**
+   * Asks `pool` for a slot, then stages and starts the job in it. `admission`
+   * resolves with the job the moment it has started — or with {@link SKIPPED}
+   * when the call was cancelled first — and rejects with a failed stage, or a
+   * pool that fails the task. `released` settles as the slot does, and the
+   * slot is held until the job has drained: a job cancelled mid-submit keeps
+   * it until that submit has answered and any cancel request has been sent,
+   * so a cancelled call never leaves a job running outside the pool.
+   */
+  #admit(
+    pool: PoolBackend,
+    stage: StageJob<J>,
+  ): {
+    admission: Promise<{ job: AsyncJob<J> } | typeof SKIPPED>;
+    released: Promise<unknown>;
+  } {
+    const beforeStart = this.#beforeStart.signal;
+    const admission = deferred<{ job: AsyncJob<J> } | typeof SKIPPED>();
+    const released = pool.run(async (): Promise<void> => {
+      if (beforeStart.aborted) {
+        admission.resolve(SKIPPED);
+        return;
+      }
+      let job: AsyncJob<J>;
+      try {
         const start = await untilAborted(
           Promise.resolve().then(() => {
             beforeStart.throwIfAborted();
@@ -234,21 +278,20 @@ export class PooledJob<J, T> implements JobHandle<T> {
           beforeStart,
         );
         // A cancel can land after the stage resolved and before this line runs.
-        if (beforeStart.aborted) return SKIPPED;
-        return { value: await this.#start(start) };
-      }),
-      beforeStart,
-    );
-    if (admitted === SKIPPED) throw beforeStart.reason;
-    const { signal } = options;
-    if (signal === undefined) return options.finish(admitted.value, this.#finishing.signal);
-    // Released once finish settles: the caller's signal can outlive this call by far.
-    const link = linkSignals([this.#finishing.signal, signal]);
-    try {
-      return await options.finish(admitted.value, link.signal);
-    } finally {
-      link.release();
-    }
+        if (beforeStart.aborted) {
+          admission.resolve(SKIPPED);
+          return;
+        }
+        job = this.#start(start);
+      } catch (error) {
+        admission.reject(error);
+        return;
+      }
+      admission.resolve({ job });
+      await job.drained;
+    });
+    released.catch(admission.reject);
+    return { admission: admission.promise, released };
   }
 
   #start(start: StartJob<J>): AsyncJob<J> {
@@ -282,8 +325,8 @@ export class PooledJob<J, T> implements JobHandle<T> {
 /**
  * @internal Starts a call that runs its job inside `options.pool`: prepares it
  * at once, waits for a slot, stages and starts the job in the slot, holds the
- * slot until the job settles, then finishes the call outside the slot.
- * Returns the handle immediately.
+ * slot until the job has drained, then finishes the call outside the slot.
+ * The call settles as soon as the job does. Returns the handle immediately.
  *
  * @typeParam J - The job's own result type.
  * @typeParam T - The call's value, produced from `J` by `options.finish`.
@@ -345,6 +388,21 @@ function untilAborted<V>(promise: Promise<V>, signal: AbortSignal): Promise<V> {
     signal.addEventListener('abort', onAbort, { once: true });
     void promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
   });
+}
+
+/** A promise and the functions that settle it, for an outcome decided elsewhere. */
+function deferred<V>(): {
+  promise: Promise<V>;
+  resolve: (value: V) => void;
+  reject: (reason: unknown) => void;
+} {
+  let resolve!: (value: V) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<V>((settle, fail) => {
+    resolve = settle;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
 }
 
 function noop(): undefined {

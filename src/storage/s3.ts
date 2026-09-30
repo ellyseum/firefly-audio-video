@@ -235,7 +235,7 @@ export class S3StorageProvider implements StorageProvider {
     input: StageInput,
     opts: { key?: string; contentType?: string; expiresIn?: number; signal?: AbortSignal } = {},
   ): Promise<string> {
-    const body = await uploadBody(input, NAME);
+    const body = await uploadBody(input, NAME, this.#secrets);
     const key = objectKey(this.#prefix, opts.key, 'staged', body);
     const expiresIn = this.#expiry(opts.expiresIn, READ_EXPIRY_SECONDS);
     const contentType = checkContentType(opts.contentType);
@@ -319,7 +319,7 @@ export class S3StorageProvider implements StorageProvider {
     contentType: string | undefined,
     signal: AbortSignal | undefined,
   ): Promise<void> {
-    const payload = await putPayload(body);
+    const payload = await putPayload(body, this.#secrets);
     try {
       const command = new sdk.PutObjectCommand({
         Bucket: this.#bucket,
@@ -407,12 +407,17 @@ function checkContentType(value: unknown): string | undefined {
   throw invalidOption(`${NAME}: contentType must be a non-empty string when provided.`);
 }
 
-/** What a `PutObject` sends for `body`: a file streams from disk with its length, anything else goes as bytes. */
+/**
+ * What a `PutObject` sends for `body`: a file streams from disk with its
+ * length, anything else goes as bytes. A stream that fails while it is read
+ * is reported scrubbed of `secrets`.
+ */
 async function putPayload(
   body: UploadBody,
+  secrets: readonly string[],
 ): Promise<{ Body: Buffer | Readable; ContentLength: number }> {
   if (body.kind === 'file') return { Body: createReadStream(body.path), ContentLength: body.size };
-  const bytes = body.kind === 'buffer' ? body.data : await readAll(body.stream);
+  const bytes = body.kind === 'buffer' ? body.data : await readAll(body.stream, secrets);
   return { Body: bytes, ContentLength: bytes.length };
 }
 

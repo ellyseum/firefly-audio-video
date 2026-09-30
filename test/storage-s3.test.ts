@@ -27,6 +27,26 @@ vi.mock('../src/storage/peer.js', async (importOriginal) => {
   };
 });
 
+/**
+ * What the next `stat` calls do, in order: an error to reject with, or
+ * `undefined` to pass the call through to the file system — as every call
+ * does once the queue is empty. A file that is found and then cannot be read
+ * is `[undefined, error]`.
+ */
+const statFailures = vi.hoisted((): Array<Error | undefined> => []);
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    stat: (async (...args: Parameters<typeof actual.stat>) => {
+      const failure = statFailures.shift();
+      if (failure !== undefined) throw failure;
+      return actual.stat(...args);
+    }) as typeof actual.stat,
+  };
+});
+
 const BUCKET = 'fav-bucket';
 const AWS_ENV = [
   'AWS_ACCESS_KEY_ID',
@@ -65,6 +85,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  statFailures.length = 0;
   vi.unstubAllEnvs();
   vi.mocked(loadPeer).mockReset();
   vi.mocked(loadPeer).mockImplementation(() =>
@@ -654,6 +675,40 @@ test('a presign or client construction failure quoting the credentials has them 
     'Creating the S3 client failed: invalid configuration: REDACTED with REDACTED',
   );
   for (const error of [signing, creating]) {
+    const printed = everythingPrinted(error);
+    for (const value of CREDENTIAL_VALUES) expect(printed).not.toContain(value);
+  }
+});
+
+test('a file or a stream that fails while it is read has the credentials scrubbed from the failure', async () => {
+  const quoted = CREDENTIAL_VALUES.join(':');
+  const client = fakeClient();
+  const provider = new S3StorageProvider({
+    bucket: BUCKET,
+    credentials: CREDENTIALS,
+    client,
+    presigner: fakePresigner().module,
+    s3: s3Module(client).module,
+  });
+
+  // The file is found, then reading its size fails.
+  statFailures.push(undefined, Object.assign(new Error(`stat of ${quoted}`), { code: 'EACCES' }));
+  const file = await rejection(provider.stageRead(logo));
+  expect(file.message).toBe('Reading the input file failed: stat of REDACTED:REDACTED:REDACTED');
+
+  const breaking = new Readable({
+    read() {
+      this.destroy(new Error(`stream broke near ${quoted}`));
+    },
+  });
+  const stream = await rejection(provider.stageRead(breaking));
+  expect(stream.message).toBe(
+    'Reading the input stream failed: stream broke near REDACTED:REDACTED:REDACTED',
+  );
+
+  expect(client.sent).toEqual([]);
+  for (const error of [file, stream]) {
+    expect(error.code).toBe('storage_failed');
     const printed = everythingPrinted(error);
     for (const value of CREDENTIAL_VALUES) expect(printed).not.toContain(value);
   }

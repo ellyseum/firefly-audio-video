@@ -177,7 +177,10 @@ export class Asset {
    * fetch failure — a non-2xx response, a malformed URL, a DNS failure, an
    * abort — surfaces as an `'error'` event carrying the same
    * {@link AudioVideoError} {@link Asset.buffer} would throw, never as an
-   * unhandled rejection.
+   * unhandled rejection. Destroying the stream — directly, or through
+   * `pipeline()` when the destination fails — ends the download at once: a
+   * request in flight is aborted, a wait before a retry is cut short, and no
+   * further request is made.
    *
    * Range-backed: a body cut off mid-transfer continues from the next byte as
    * {@link AssetReadOptions.retries} describes, so the reader sees one
@@ -194,7 +197,24 @@ export class Asset {
    *   when `options.retries` is not a non-negative integer.
    */
   stream(options: AssetReadOptions = {}): Readable {
-    return Readable.from(this.#download(readPlan(options)), { objectMode: false });
+    const plan = readPlan(options);
+    const destroyed = new AbortController();
+    const link = linkSignals(
+      plan.signal === undefined ? [destroyed.signal] : [plan.signal, destroyed.signal],
+    );
+    const bytes = Readable.from(this.#download({ ...plan, signal: link.signal }), {
+      objectMode: false,
+    });
+    // Readable.from's own destroy asks the generator to return, which takes
+    // effect only at its next yield: after a backoff, and after the request
+    // that follows it. Aborting the download here ends either at once.
+    const destroyDownload = bytes._destroy.bind(bytes);
+    bytes._destroy = (error, callback) => {
+      destroyed.abort(error ?? new Error('The stream was destroyed.'));
+      destroyDownload(error, callback);
+    };
+    bytes.once('close', link.release);
+    return bytes;
   }
 
   /**

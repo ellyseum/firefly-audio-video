@@ -1365,6 +1365,37 @@ test('an abort during the backoff makes save() reject cancelled, sending no furt
   expect(getEventListeners(controller.signal, 'abort')).toEqual([]);
 });
 
+test('destroying stream() during a backoff ends the download: no further request, no timer, no open connection', async () => {
+  vi.spyOn(Math, 'random').mockReturnValue(0.999); // the first retry waits just under 250 ms
+  const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+  const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout');
+  // The backoff's timer, set for 0.999 × 250 ms; undici's own timers use other delays.
+  const backoffTimer = (): NodeJS.Timeout | undefined => {
+    const index = setTimeoutSpy.mock.calls.findIndex(
+      ([, ms]) => Math.abs((ms ?? 0) - 249.75) < 0.01,
+    );
+    return index === -1 ? undefined : (setTimeoutSpy.mock.results[index]?.value as NodeJS.Timeout);
+  };
+  const timers = (): number =>
+    process.getActiveResourcesInfo().filter((type) => type === 'Timeout').length;
+  const server = await cutOnce(V1);
+  const asset = new Asset({ url: server.url, meta: sampleMeta() });
+  const idleTimers = timers();
+
+  const stream = asset.stream();
+  const closed = new Promise<void>((resolve) => stream.once('close', resolve));
+  stream.resume();
+  await waitFor(() => server.cuts() === 1 && backoffTimer() !== undefined);
+  stream.destroy();
+  await closed;
+
+  expect(clearTimeoutSpy).toHaveBeenCalledWith(backoffTimer());
+  expect(timers()).toBeLessThanOrEqual(idleTimers);
+  await new Promise((resolve) => setTimeout(resolve, 250 + 2_000));
+  expect(server.requests).toHaveLength(1);
+  await server.idle();
+}, 10_000);
+
 test("no abort listener is left on the caller's signal, whether the download resumed or could not", async () => {
   const controller = new AbortController();
 
@@ -1727,6 +1758,45 @@ test.each<Accessor>(['stream', 'save', 'buffer'])(
     expect(requests).toBe(2);
   },
 );
+
+test('destroying stream() while a re-request is pending aborts that request', async () => {
+  let requests = 0;
+  let pending: AbortSignal | undefined;
+  const asset = new Asset({
+    url: 'https://x/out.bin',
+    meta: sampleMeta(),
+    fetch: (_url, init) => {
+      requests += 1;
+      if (requests === 1) {
+        return Promise.resolve(
+          fakeResponse(resettingBody([Buffer.from('partial')], new Error('reset'))),
+        );
+      }
+      // A re-request whose response never arrives: it settles only through its signal.
+      pending = init?.signal;
+      return new Promise<Response>((_resolve, reject) => {
+        pending?.addEventListener('abort', () => reject(pending?.reason as Error), { once: true });
+      });
+    },
+  });
+
+  const stream = asset.stream();
+  const closed = new Promise<void>((resolve) => stream.once('close', resolve));
+  stream.resume();
+  await waitFor(() => requests === 2);
+  stream.destroy();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    closed,
+    new Promise((resolve) => {
+      timer = setTimeout(resolve, 1_000);
+    }),
+  ]);
+  clearTimeout(timer);
+
+  expect(pending?.aborted).toBe(true);
+  expect(requests).toBe(2);
+});
 
 test.each([-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, '3'])(
   'retries: %s is refused with invalid_argument before any request',

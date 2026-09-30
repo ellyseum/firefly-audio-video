@@ -1,4 +1,4 @@
-export const VERSION = '0.1.0'; // x-release-please-version
+export { VERSION } from './version.js';
 
 export {
   configure,

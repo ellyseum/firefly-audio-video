@@ -1,5 +1,6 @@
 import { expect, test } from 'vitest';
 import { brandClass, sharedKey } from '../src/core/brand.js';
+import { VERSION } from '../src/version.js';
 
 /** Two unrelated classes branded under one name — what two copies of the package hold. */
 function copies(): { One: new () => object; Two: new () => object } {
@@ -41,6 +42,8 @@ test('a prototype is not an instance of its own class, as with an ordinary insta
   expect(Two.prototype instanceof One).toBe(false);
 });
 
-test('the shared key is the symbol Symbol.for registers, the same in every copy', () => {
-  expect(sharedKey('defaultClient')).toBe(Symbol.for('firefly-audio-video.defaultClient'));
+test('the shared key is the symbol Symbol.for registers under the package version, the same in every copy of that version', () => {
+  expect(sharedKey('defaultClient')).toBe(
+    Symbol.for(`firefly-audio-video@${VERSION}.defaultClient`),
+  );
 });

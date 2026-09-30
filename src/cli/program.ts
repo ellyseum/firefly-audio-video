@@ -10,7 +10,7 @@
 
 import { Command, CommanderError } from 'commander';
 import { redactValue } from '../core/redact.js';
-import { VERSION } from '../index.js';
+import { VERSION } from '../version.js';
 import type { Client } from '../dgr/client.js';
 import { buildCancelCommand } from './commands/cancel.js';
 import { buildDescribeCommand } from './commands/describe.js';

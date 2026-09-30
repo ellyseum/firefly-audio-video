@@ -5,23 +5,28 @@
  * of every class, so a plain `instanceof` is false for an instance the other
  * copy made. A branded class marks its prototype with a `Symbol.for` key,
  * which every copy resolves to the same symbol, and answers `instanceof` by
- * that mark.
+ * that mark. The key carries the package version: the builds of one version
+ * share it, and a copy of another installed version, whose classes and
+ * default client may differ, keys its own.
  */
 
+import { VERSION } from '../version.js';
+
 /**
- * @internal The `Symbol.for` key this package registers under `name`, the
- * same symbol in every copy of the package a process loads.
+ * @internal The `Symbol.for` key this package registers under `name`: the
+ * same symbol in every copy of this version of the package a process loads,
+ * and a different one in a copy of any other version.
  */
 export function sharedKey(name: string): symbol {
-  return Symbol.for(`firefly-audio-video.${name}`);
+  return Symbol.for(`firefly-audio-video@${VERSION}.${name}`);
 }
 
 /**
  * @internal Brands `ctor` as `name`: an instance of it that any copy of this
- * package made passes `instanceof ctor`. A subclass keeps the ordinary
- * prototype-chain check, so `instanceof Subclass` still passes only for
- * instances of that subclass, and a prototype is never an instance of its own
- * class.
+ * version of the package made passes `instanceof ctor`. A subclass keeps the
+ * ordinary prototype-chain check, so `instanceof Subclass` still passes only
+ * for instances of that subclass, and a prototype is never an instance of its
+ * own class.
  */
 export function brandClass(ctor: abstract new (...args: never[]) => unknown, name: string): void {
   const mark = sharedKey(name);

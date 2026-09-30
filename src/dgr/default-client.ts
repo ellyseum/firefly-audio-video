@@ -34,7 +34,8 @@ import type { RenderRequest } from './schemas.js';
  * and the key, registered with `Symbol.for`, is the same in both: a client
  * `configure()` installs through either build is the one top-level calls
  * through the other use, rather than one the other build creates from the
- * environment.
+ * environment. The key carries the package version, so a copy of another
+ * installed version keeps a default client of its own.
  */
 const DEFAULT_CLIENT = sharedKey('defaultClient');
 
@@ -45,7 +46,8 @@ type DefaultClientSlot = { [key: symbol]: unknown };
  * checked at once; the last call wins, and a job already running keeps the
  * client it started on. Use {@link createClient} instead for several
  * credentials, or inside a library. Both of the package's builds share it:
- * installed through one, it serves top-level calls through the other.
+ * installed through one, it serves top-level calls through the other. A copy
+ * of another installed version of the package keeps its own.
  *
  * @param config - See {@link ClientConfig}.
  * @throws {@link AudioVideoError} `invalid_argument` for an invalid config;

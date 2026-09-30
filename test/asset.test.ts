@@ -110,12 +110,25 @@ function multiChunkBody(chunks: readonly Uint8Array[]): ReadableStream<Uint8Arra
   });
 }
 
-/** A `ReadableStream` that enqueues each of `chunks`, then errors instead of closing — a mid-download reset. */
+/**
+ * A `ReadableStream` that delivers each of `chunks`, then errors instead of
+ * closing — a mid-download reset. The error waits until the reader has taken
+ * every chunk and asked for more, then one turn of the event loop longer: an
+ * error raised any sooner discards the chunks still queued, and none of them
+ * would reach the reader.
+ */
 function resettingBody(chunks: readonly Uint8Array[], error: Error): ReadableStream<Uint8Array> {
+  const pending = [...chunks];
   return new ReadableStream<Uint8Array>({
-    start(controller) {
-      for (const chunk of chunks) controller.enqueue(chunk);
-      controller.error(error);
+    pull(controller) {
+      const chunk = pending.shift();
+      if (chunk !== undefined) {
+        controller.enqueue(chunk);
+        return undefined;
+      }
+      return new Promise<void>((resolve) => setImmediate(resolve)).then(() =>
+        controller.error(error),
+      );
     },
   });
 }
@@ -1397,6 +1410,29 @@ test('a body that ends cleanly but short of its Content-Length resumes like a cu
   expect(requests).toEqual([{}, { Range: 'bytes=1000-', 'If-Range': '"v1"' }]);
 });
 
+test.each<Accessor>(['stream', 'save', 'buffer'])(
+  'a body cut before its first byte makes %s() start over with a plain request',
+  async (accessor) => {
+    const requests: Array<Record<string, string>> = [];
+    const asset = new Asset({
+      url: 'https://x/out.bin',
+      meta: sampleMeta(),
+      fetch: async (_url, init) => {
+        requests.push(init?.headers ?? {});
+        return requests.length === 1
+          ? new Response(resettingBody([], new Error('reset')), { headers: { etag: '"v1"' } })
+          : fakeResponse(BODY);
+      },
+    });
+
+    const bytes = await readThrough(asset, accessor);
+
+    expect(sha256(bytes)).toBe(sha256(BODY));
+    // With nothing delivered there is no offset to resume from.
+    expect(requests).toEqual([{}, {}]);
+  },
+);
+
 /**
  * A fetch stub whose first response is a content-encoded body that is cut off
  * only once its first chunk has been delivered — `delivered()` fires the cut
@@ -1469,13 +1505,13 @@ test('each retry first waits a uniform fraction of a doubling delay, capped at 2
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
   const random = vi.spyOn(Math, 'random');
   for (const fraction of [0.5, 0.5, 0.5, 0.5, 0.999]) random.mockReturnValueOnce(fraction);
-  let requests = 0;
+  const requests: Array<Record<string, string>> = [];
   const asset = new Asset({
     url: 'https://x/out.bin',
     meta: sampleMeta(),
-    fetch: async () => {
-      requests += 1;
-      return requests === 1
+    fetch: async (_url, init) => {
+      requests.push(init?.headers ?? {});
+      return requests.length === 1
         ? fakeResponse(resettingBody([Buffer.from('partial')], new Error('reset')))
         : fakeResponse('busy', 503);
     },
@@ -1486,16 +1522,18 @@ test('each retry first waits a uniform fraction of a doubling delay, capped at 2
   // min(2 s, 250 ms × 2^(retry − 1)) × the fraction drawn for that retry.
   for (const delayMs of [125, 250, 500, 1_000, 1_998]) {
     await until(() => vi.getTimerCount() === 1);
-    const before = requests;
+    const before = requests.length;
     await vi.advanceTimersByTimeAsync(delayMs - 1);
     await flush();
-    expect(requests, `no request before ${delayMs} ms`).toBe(before);
+    expect(requests.length, `no request before ${delayMs} ms`).toBe(before);
     await vi.advanceTimersByTimeAsync(1);
-    await until(() => requests === before + 1);
+    await until(() => requests.length === before + 1);
   }
   const err = await reading;
   expect(err).toMatchObject({ code: 'asset_fetch_failed', status: 503 });
   expect((err as AudioVideoError).message).toContain('and 5 retries did not complete it.');
+  // Every retry asks for the bytes after the seven already delivered.
+  expect(requests).toEqual([{}, ...Array.from({ length: 5 }, () => ({ Range: 'bytes=7-' }))]);
 });
 
 test('an abort during the backoff ends the wait at once, clearing its timer and every listener it added', async () => {

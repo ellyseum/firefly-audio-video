@@ -15,7 +15,7 @@ import type { RenderRequest } from '../../dgr/schemas.js';
 import { resolveClient } from '../client.js';
 import { invalidArgument } from '../errors.js';
 import { exitCodeForError } from '../exit-codes.js';
-import { printFailure, printSuccess, type FailureContext } from '../output.js';
+import { printFailure, printSuccess } from '../output.js';
 import type { CliRuntime, GlobalOptions } from '../runtime.js';
 import { buildRenderRequestFromFlags, readSpecFile, type RenderFlags } from '../spec.js';
 
@@ -79,8 +79,10 @@ async function runRender(
   let cancelRequest: Promise<void> = Promise.resolve();
   // Stops the save of a finished output; a job that has settled ignores its own cancel().
   const saving = new AbortController();
-  // The finished job and its output, once a failure can only concern saving that output.
-  let finished: FailureContext | undefined;
+  // The render once started: a failure after the service accepts it names its job.
+  let started: { readonly jobId: string | undefined } | undefined;
+  // The finished output's read URL, once a failure can only concern saving that output.
+  let readUrl: string | undefined;
   let stopListening = (): void => undefined;
   try {
     const spec = buildSpec(options);
@@ -88,6 +90,7 @@ async function runRender(
     if (mode.resolveAs === 'file') requireOneOutput(spec);
     const client = resolveClient(runtime, options, { storage: true });
     const job = client.render(spec);
+    started = job;
     stopListening = runtime.onInterrupt(() => {
       if (!interrupted) {
         interrupted = true;
@@ -104,7 +107,7 @@ async function runRender(
     let output: string | string[];
     if (mode.resolveAs === 'file') {
       const asset = onlyOutput(assets);
-      finished = { jobId: job.jobId, readUrl: asset.toJSON().url };
+      readUrl = asset.toJSON().url;
       await asset.save(mode.savePath, { signal: saving.signal });
       output = mode.savePath;
     } else {
@@ -122,7 +125,7 @@ async function runRender(
   } catch (error) {
     const cancelledByUser =
       interrupted && error instanceof AudioVideoError && error.code === 'cancelled';
-    printFailure(runtime, json, error, finished);
+    printFailure(runtime, json, error, { jobId: started?.jobId, readUrl });
     if (interrupted) await settledWithin(cancelRequest, CANCEL_REQUEST_WAIT_MS);
     doExit(exitCodeForError(error, { cancelledByUser }));
   } finally {

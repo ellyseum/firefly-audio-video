@@ -74,6 +74,39 @@ test('failure maps to the invalid_preset family, exit 2', async () => {
   expect(harness.exit).toHaveBeenCalledExactlyOnceWith(2);
 });
 
+/** A client whose describe the service accepted as job-DESCRIBE-1 and whose poll then failed, the error not naming the job. */
+function acceptedThenRefused(): ReturnType<typeof createFakeClient> {
+  const failure = new AudioVideoError({
+    message: 'describe status refused',
+    code: 'http_403',
+    status: 403,
+  });
+  return createFakeClient({
+    describe: vi.fn(() =>
+      settledJob<TemplateDescription>({ error: failure }, { jobId: 'job-DESCRIBE-1' }),
+    ),
+  });
+}
+
+test('the --json failure document names a describe job the service accepted, from the handle when the error does not', async () => {
+  const harness = createHarness({ client: acceptedThenRefused() });
+  await harness.run(['describe', 'https://example.test/t.mogrt', '--json']);
+  expect(JSON.parse(harness.stdoutText().trim())).toEqual({
+    ok: false,
+    error: { code: 'http_403', message: 'describe status refused', jobId: 'job-DESCRIBE-1' },
+  });
+  expect(harness.exit).toHaveBeenCalledExactlyOnceWith(5);
+});
+
+test('human mode prints Job: for a describe job the service accepted, from the handle when the error does not name it', async () => {
+  const harness = createHarness({ client: acceptedThenRefused() });
+  await harness.run(['describe', 'https://example.test/t.mogrt']);
+  expect(harness.stderrText()).toBe(
+    'Error: describe status refused\nCode: http_403\nJob: job-DESCRIBE-1\n',
+  );
+  expect(harness.exit).toHaveBeenCalledExactlyOnceWith(5);
+});
+
 test('a missing template argument is a commander usage error, exit 2', async () => {
   const harness = createHarness({ client: createFakeClient() });
   await harness.run(['describe']);

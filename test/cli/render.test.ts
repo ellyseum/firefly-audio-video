@@ -476,6 +476,39 @@ test('the --json failure document carries the job and request IDs the error has'
   expect(harness.exit).toHaveBeenCalledExactlyOnceWith(4);
 });
 
+/** A status poll's 403 that does not name its job, which only the render's handle knows. */
+const POLL_REFUSED = new AudioVideoError({
+  message: 'Request to https://audio-video-api.adobe.io/v1/status/job-ACCEPTED-1 failed.',
+  code: 'http_403',
+  status: 403,
+});
+
+/** A client whose render the service accepted as job-ACCEPTED-1 and which then failed with {@link POLL_REFUSED}. */
+function acceptedThenRefused(): ReturnType<typeof createFakeClient> {
+  return createFakeClient({
+    render: vi.fn(() => settledJob<string>({ error: POLL_REFUSED }, { jobId: 'job-ACCEPTED-1' })),
+  });
+}
+
+test('the --json failure document names a job the service accepted, from the handle when the error does not', async () => {
+  const harness = createHarness({ client: acceptedThenRefused() });
+  await harness.run(['render', '--template', 't.mogrt', '--preset', 'prores', '--json']);
+  expect(JSON.parse(harness.stdoutText().trim())).toEqual({
+    ok: false,
+    error: { code: 'http_403', message: POLL_REFUSED.message, jobId: 'job-ACCEPTED-1' },
+  });
+  expect(harness.exit).toHaveBeenCalledExactlyOnceWith(5);
+});
+
+test('human mode prints Job: for a job the service accepted, from the handle when the error does not name it', async () => {
+  const harness = createHarness({ client: acceptedThenRefused() });
+  await harness.run(['render', '--template', 't.mogrt', '--preset', 'prores']);
+  expect(harness.stderrText()).toBe(
+    `Error: ${POLL_REFUSED.message}\nCode: http_403\nJob: job-ACCEPTED-1\n`,
+  );
+  expect(harness.exit).toHaveBeenCalledExactlyOnceWith(5);
+});
+
 /** A failed job's items, as the SDK builds them from the status body's `outputs[].errors`. */
 const MISSING_FONT_ITEMS = [
   {
@@ -505,7 +538,8 @@ test("a failed job's first reason follows the message on the error line", async 
   expect(harness.stderrText()).toBe(
     'Error: Job job-1 failed: errors on output 0. Reason: missing_font: ' +
       'The template uses font AdobeClean-Bold, which must be uploaded with the render.\n' +
-      'Code: job_failed\n',
+      'Code: job_failed\n' +
+      'Job: job-1\n',
   );
   expect(harness.exit).toHaveBeenCalledExactlyOnceWith(4);
 });
@@ -616,7 +650,7 @@ test('Ctrl+C cancels the job once and exits 130 only after its cancel request ha
   await run;
 
   expect(harness.stderrText()).toBe(
-    'Cancelling the render...\nError: The job was cancelled.\nCode: cancelled\n',
+    'Cancelling the render...\nError: The job was cancelled.\nCode: cancelled\nJob: job-1\n',
   );
   expect(harness.exit).toHaveBeenCalledExactlyOnceWith(130);
   expect(harness.forceExit).not.toHaveBeenCalled();

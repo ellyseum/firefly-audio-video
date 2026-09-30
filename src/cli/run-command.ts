@@ -6,7 +6,7 @@
  */
 
 import { exitCodeForError } from './exit-codes.js';
-import { printFailure, printSuccess } from './output.js';
+import { printFailure, printSuccess, type FailureContext } from './output.js';
 import type { CliRuntime } from './runtime.js';
 
 /** What a command's own logic resolves with: the human-mode value, and the `--json` fields. */
@@ -15,18 +15,28 @@ export interface CommandOutcome {
   readonly json: Record<string, unknown>;
 }
 
-/** Runs `action`, prints its outcome, and sets the exit code — success or failure, exactly once. */
+/**
+ * Runs `action`, prints its outcome, and sets the exit code — success or
+ * failure, exactly once. A failure prints with `context()`, read once
+ * `action` has failed: what the failure concerns beyond the error, such as
+ * the job the action started.
+ */
 export async function runCommand(
   runtime: CliRuntime,
   json: boolean,
   action: () => Promise<CommandOutcome>,
+  context: () => FailureContext = noContext,
 ): Promise<void> {
   try {
     const outcome = await action();
     printSuccess(runtime, json, outcome.result, outcome.json);
     runtime.exit(0);
   } catch (error) {
-    printFailure(runtime, json, error);
+    printFailure(runtime, json, error, context());
     runtime.exit(exitCodeForError(error));
   }
+}
+
+function noContext(): FailureContext {
+  return {};
 }

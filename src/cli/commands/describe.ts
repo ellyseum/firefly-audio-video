@@ -17,14 +17,23 @@ export function buildDescribeCommand(runtime: CliRuntime): Command {
     .argument('<template>', 'the template — an http(s) URL or a local file')
     .action(async (template: string, _ownOptions: unknown, self: Command) => {
       const options = self.optsWithGlobals() as GlobalOptions;
-      await runCommand(runtime, options.json === true, async () => {
-        const client = resolveClient(runtime, options, { storage: true });
-        const description = await client.describe(template);
-        return {
-          result: description,
-          json: { controls: description.controls, fonts: description.fonts },
-        };
-      });
+      // The describe once started: a failure after the service accepts it names its job.
+      let started: { readonly jobId: string | undefined } | undefined;
+      await runCommand(
+        runtime,
+        options.json === true,
+        async () => {
+          const client = resolveClient(runtime, options, { storage: true });
+          const job = client.describe(template);
+          started = job;
+          const description = await job;
+          return {
+            result: description,
+            json: { controls: description.controls, fonts: description.fonts },
+          };
+        },
+        () => ({ jobId: started?.jobId }),
+      );
     });
   return command;
 }

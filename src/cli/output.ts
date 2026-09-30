@@ -42,11 +42,12 @@ export function printSuccess(
 }
 
 /**
- * What a failure concerns beyond the error itself: a job that finished, and
- * where its output is, when what failed came after it — saving the output.
+ * What a failure concerns beyond the error itself: the job, once the service
+ * has accepted it, and the finished output's read URL when what failed was
+ * saving that output.
  */
 export interface FailureContext {
-  /** The job that finished, when the error does not name it itself. */
+  /** The job the service accepted, printed when the error does not name it itself. */
   readonly jobId?: string;
   /** The finished output's read URL; printed redacted. */
   readonly readUrl?: string;
@@ -61,10 +62,10 @@ export interface FailureContext {
  * fetched again without rendering again; and the error's `items`, the
  * service's own reasons. Otherwise the error's message, with the first of
  * those reasons after it ({@link withFailureReason}), and its code go to
- * stderr, followed by the job and the read URL when `context` names a
- * finished output. Nothing else from the error is printed, and all of it is
- * redacted, so a credential passed on the command line or carried in an
- * error's text never reaches either stream.
+ * stderr, followed by the job whenever it is known and the read URL when
+ * `context` names a finished output. Nothing else from the error is printed,
+ * and all of it is redacted, so a credential passed on the command line or
+ * carried in an error's text never reaches either stream.
  */
 export function printFailure(
   streams: OutputStreams,
@@ -79,10 +80,8 @@ export function printFailure(
   }
   streams.stderr.write(`Error: ${withFailureReason(shape.message, shape.items)}\n`);
   streams.stderr.write(`Code: ${shape.code}\n`);
-  if (shape.readUrl !== undefined) {
-    if (shape.jobId !== undefined) streams.stderr.write(`Job: ${shape.jobId}\n`);
-    streams.stderr.write(`Read URL: ${shape.readUrl}\n`);
-  }
+  if (shape.jobId !== undefined) streams.stderr.write(`Job: ${shape.jobId}\n`);
+  if (shape.readUrl !== undefined) streams.stderr.write(`Read URL: ${shape.readUrl}\n`);
 }
 
 /**

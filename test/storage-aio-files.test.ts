@@ -201,6 +201,27 @@ test('a file is uploaded from disk under a key that keeps its name', async () =>
   expect(puts[0]?.headers['content-type']).toBeUndefined();
 });
 
+test('stageRead hands its signal to the upload: once it has aborted, nothing reaches the store and the reason is the rejection', async () => {
+  blobStore();
+  const files = fakeFiles();
+  const controller = new AbortController();
+  const reason = new AudioVideoError({
+    message: 'The job was cancelled before it was submitted.',
+    code: 'cancelled',
+  });
+  controller.abort(reason);
+
+  const error = await rejection(
+    new AioFilesStorageProvider({ files }).stageRead(Buffer.from('x'), {
+      signal: controller.signal,
+    }),
+  );
+
+  expect(error).toBe(reason);
+  expect(puts).toEqual([]);
+  expect(files.calls.map((call) => call.options.permissions)).toEqual(['rw']);
+});
+
 test('a Readable is read in full and uploaded in one PUT', async () => {
   blobStore();
   const files = fakeFiles();
@@ -299,6 +320,21 @@ test('a refused PUT rejects storage_failed with its status and error code, never
   expect(everythingPrinted(error)).not.toMatch(/SIG_/);
 });
 
+test.each([200, 204, 307])(
+  'a PUT answered %i is refused storage_failed naming the status: only 201 means the blob was created',
+  async (status) => {
+    blobStore(status, status === 307 ? { location: `${BLOB}/fav/elsewhere` } : {});
+    const files = fakeFiles();
+    const error = await rejection(
+      new AioFilesStorageProvider({ files }).stageRead(Buffer.from('x')),
+    );
+    expect(error.code).toBe('storage_failed');
+    expect(error.message).toBe(`Uploading the object failed with status ${status}.`);
+    expect(puts).toHaveLength(1);
+    expect(files.calls.map((call) => call.options.permissions)).toEqual(['rw']);
+  },
+);
+
 test('a PUT that fails in transit rejects storage_failed, and no SAS survives anywhere in the error or its causes', async () => {
   agent
     .get(BLOB)
@@ -329,6 +365,68 @@ test('a failing presign rejects storage_failed with its reason, redacted', async
     new AioFilesStorageProvider({ files: { generatePresignURL: async () => '' } }).allocateOutput(),
   );
   expect(empty.message).toBe('generatePresignURL() resolved without a URL.');
+});
+
+test('a presign failure quoting the Runtime auth key comes out scrubbed, whether the key came from the options or the environment', async () => {
+  const quoting: AioFilesClient = {
+    generatePresignURL: () => Promise.reject(new Error(`TVM refused auth ${AUTH} for this key`)),
+  };
+  const fromOptions = await rejection(
+    new AioFilesStorageProvider({
+      namespace: 'ns',
+      auth: AUTH,
+      module: fakeModule(quoting),
+    }).allocateOutput(),
+  );
+  vi.stubEnv('__OW_NAMESPACE', 'action-ns');
+  vi.stubEnv('__OW_API_KEY', AUTH);
+  const fromEnvironment = await rejection(
+    new AioFilesStorageProvider({ module: fakeModule(quoting) }).stageRead(Buffer.from('x')),
+  );
+
+  expect(fromOptions.message).toBe(
+    'Presigning write access to the object failed: TVM refused auth REDACTED for this key',
+  );
+  expect(fromEnvironment.message).toBe(
+    'Presigning read-write access to the object failed: TVM refused auth REDACTED for this key',
+  );
+  for (const error of [fromOptions, fromEnvironment]) {
+    expect(error.code).toBe('storage_failed');
+    expect(everythingPrinted(error)).not.toContain('RUNTIME_AUTH_SECRET_VALUE');
+  }
+});
+
+test('an upload failing in transit, or a stream failing while it is read, has the Runtime auth key scrubbed too', async () => {
+  agent
+    .get(BLOB)
+    .intercept({ path: (path) => path.startsWith('/fav/'), method: 'PUT' })
+    .replyWithError(new Error(`socket closed while sending for ${AUTH}`));
+  const transit = await rejection(
+    new AioFilesStorageProvider({
+      namespace: 'ns',
+      auth: AUTH,
+      module: fakeModule(fakeFiles()),
+    }).stageRead(Buffer.from('x')),
+  );
+  const broken = new Readable({
+    read() {
+      this.destroy(new Error(`stream broke near ${AUTH}`));
+    },
+  });
+  const stream = await rejection(
+    new AioFilesStorageProvider({ namespace: 'ns', auth: AUTH, files: fakeFiles() }).stageRead(
+      broken,
+    ),
+  );
+
+  expect(transit.message.startsWith('Uploading the object failed before a response arrived')).toBe(
+    true,
+  );
+  expect(stream.message).toBe('Reading the input stream failed: stream broke near REDACTED');
+  for (const error of [transit, stream]) {
+    expect(error.code).toBe('storage_failed');
+    expect(everythingPrinted(error)).not.toContain('RUNTIME_AUTH_SECRET_VALUE');
+  }
 });
 
 // --- init, credentials, and loading the SDK ---------------------------------------------
@@ -462,6 +560,23 @@ test('a missing @adobe/aio-lib-files rejects missing_peer_dependency naming the 
   expect(error.code).toBe('missing_peer_dependency');
   expect(error.message).toContain('`npm install @adobe/aio-lib-files`');
   expect(error.message).toContain('pass the module as the module option instead');
+});
+
+test('an installed @adobe/aio-lib-files that fails to load names the module option, with the loader error as text', async () => {
+  const actual =
+    await vi.importActual<typeof import('../src/storage/peer.js')>('../src/storage/peer.js');
+  vi.mocked(loadPeer).mockImplementation((peer: Peer) =>
+    actual.loadPeer(peer, () => Promise.reject(new TypeError('the sandbox refused import()'))),
+  );
+  const error = await rejection(
+    new AioFilesStorageProvider({ namespace: 'ns', auth: AUTH }).stageRead(Buffer.from('x')),
+  );
+  expect(error.code).toBe('storage_failed');
+  expect(error.message).toBe(
+    'Loading @adobe/aio-lib-files for AioFilesStorageProvider failed (TypeError: the sandbox ' +
+      'refused import()). Pass the module as the module option instead: a module passed in ' +
+      'needs no run-time import.',
+  );
 });
 
 /** Every common printed form of a value: `inspect`, `String`, `JSON.stringify`, a spread copy, and what `console.log` writes. */

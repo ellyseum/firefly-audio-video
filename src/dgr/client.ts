@@ -3,8 +3,8 @@
  * concurrency pool behind the method surface `createClient()` returns — the
  * surface the top-level functions reach through the default client.
  * `render()` and `describe()` run every job inside the client's pool, from
- * the submit until the job settles; `status()`, `cancel()`, `listPresets()`,
- * `stage()` and every storage call run outside it. Every public call emits
+ * staging its inputs until the job settles; `status()`, `cancel()`,
+ * `listPresets()` and `stage()` run outside it. Every public call emits
  * exactly one log record when it settles.
  */
 
@@ -35,6 +35,7 @@ import {
   runPooledJob,
   type JobHandle,
   type PooledJobOutcome,
+  type StageJob,
 } from '../core/pooled-job.js';
 import { normalizeAsset, type StageInput, type StorageProvider } from '../core/storage.js';
 import { appBuilderStorage } from '../storage/aio-files.js';
@@ -45,8 +46,9 @@ import {
   type RenderBuilderOptions,
 } from './builder.js';
 import {
-  describeBody,
   describeResult,
+  materializeDescribe,
+  prepareDescribe,
   type DescribeInput,
   type TemplateDescription,
 } from './describe.js';
@@ -61,9 +63,13 @@ import {
   renderAssets,
   type FluentRenderInput,
   type PreparedRender,
-  type TemplateSource,
 } from './render.js';
-import type { PresetRefInput, RenderRequest, RenderRequestOutput } from './schemas.js';
+import type {
+  PresetRefInput,
+  RenderRequest,
+  RenderRequestOutput,
+  TemplateSource,
+} from './schemas.js';
 
 /**
  * The handle `render()` and `describe()` return: awaitable like a promise,
@@ -143,16 +149,30 @@ export interface ClientConfig {
   logging?: LoggingOption;
   /**
    * Uploads what DGR must read from a URL, and allocates the locations it
-   * writes to: a spec's `source`, `assets` and `{ url }` presets given as a
-   * file, a `Buffer` or a `Readable`; generated `.epr` presets; `stage()`
-   * inputs; and every output with no `destination`, fluent renders included.
-   * Without it, any of those rejects `invalid_argument`; http(s) URLs never
-   * need it.
+   * writes to: a spec's `source`, `assets` and `{ url }` presets, and the
+   * template of a fluent `render(source)` or a `describe()`, given as a file,
+   * a `Buffer` or a `Readable`; generated `.epr` presets; `stage()` inputs;
+   * and every output with no `destination`, fluent renders included. Without
+   * it, any of those rejects `invalid_argument`; http(s) URLs never need it.
+   *
+   * Staging holds the job's pool slot: a render's or describe's uploads,
+   * generated `.epr` files and output allocations run once the job is
+   * admitted, just before its submit, so a staged URL is fresh when DGR is
+   * sent it however long the job queued. `AioFilesStorageProvider` and `S3StorageProvider` read a
+   * `Readable` into memory before uploading it — the store needs its length —
+   * so pass a file path to stream a large input from disk. Only the calls
+   * holding a slot stage, so at most `concurrency` calls hold such bytes in
+   * memory at once.
    *
    * Omitted, a client in an App Builder environment — `__OW_NAMESPACE` or
    * `AIO_runtime_namespace` set — uses an `AioFilesStorageProvider`, and any
    * other client has none. A `storage` given here always wins; pass a
-   * `PassthroughStorageProvider` for a client that must never upload.
+   * `PassthroughStorageProvider` for a client that must never upload. That
+   * automatic provider imports `@adobe/aio-lib-files` by name at run time,
+   * which cannot reach a package webpack has bundled into the action: a
+   * webpack-bundled action passes
+   * `new AioFilesStorageProvider({ module: files })` here, with
+   * `import * as files from '@adobe/aio-lib-files'`.
    */
   storage?: StorageProvider;
   /**
@@ -275,12 +295,17 @@ export interface PresetSummary {
 export interface Client {
   /**
    * Starts a fluent render of the template at `source` — see
-   * {@link RenderBuilder}. Nothing is submitted until the builder is awaited
-   * or one of its terminals (`buffer()`, `stream()`, `save()`) is called.
+   * {@link RenderBuilder}. `source` takes every form a spec's `source` does,
+   * read the same way: an http(s) URL is used as it is; a file path, a
+   * `file:` URL, a `Buffer` or a `Readable` is uploaded through `storage`
+   * once the render holds its pool slot; anything else rejects
+   * `invalid_argument`. Nothing is submitted until the builder is awaited or
+   * one of its terminals (`buffer()`, `stream()`, `save()`) is called.
    *
    * @example
    * ```ts
    * await client.render(templateUrl).prores4444xq.alpha().save('./out.mov');
+   * await client.render('./capsule.mogrt').prores.save('./out.mov');
    * ```
    */
   render(source: TemplateSource, options?: RenderBuilderOptions): RenderBuilder;
@@ -304,12 +329,14 @@ export interface Client {
    * `destination` without one; for an output with no `destination`, the read
    * URL `storage` allocated), nothing downloaded yet.
    *
-   * The job runs inside this client's pool from the submit until it settles.
    * Every preset is resolved first — a native match becomes a `presetId`,
    * anything else a generated `.epr` staged through `storage` — and every
-   * `source`, `assets` entry or `{ url }` preset given as a file, a `Buffer`
-   * or a `Readable` is uploaded through `storage`; storage calls run before
-   * the job takes its slot. The service's `202` carries the
+   * input is checked before the job asks for a slot. The job then runs inside
+   * this client's pool from staging until it settles: every `source`,
+   * `assets` entry or `{ url }` preset given as a file, a `Buffer` or a
+   * `Readable` is uploaded through `storage`, and every output with no
+   * `destination` allocated, once the job holds its slot and just before the
+   * submit. The service's `202` carries the
    * `jobId`, `statusUrl` and `cancelUrl`; `statusUrl` is polled until the job
    * is terminal. Every render submit answers with `Retry-After: 1`, `202`
    * included, and only a `429` is retried, so an accepted submit is never
@@ -363,7 +390,11 @@ export interface Client {
   ): RenderJob<Asset | Asset[] | string | Buffer | Readable>;
   /**
    * Describes a template: submits a describe job, runs it inside this client's
-   * pool, and resolves with the template's editable controls and fonts.
+   * pool, and resolves with the template's editable controls and fonts. The
+   * template takes every form a render spec's `source` does, read the same
+   * way: an http(s) URL is used as it is; a file path, a `file:` URL, a
+   * `Buffer` or a `Readable` is uploaded through `storage` once the job holds
+   * its pool slot; anything else rejects `invalid_argument`.
    *
    * @example
    * ```ts
@@ -588,15 +619,18 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
     return runPooledJob<TemplateDescription, TemplateDescription>({
       pool: this.#pool,
       ...(options.signal !== undefined ? { signal: options.signal } : {}),
-      prepare: () => {
-        const body = describeBody(input);
-        return () =>
-          runJob(this.#http, {
-            submit: () => this.#submit(DESCRIBE_PATH, body),
-            mapResult: (terminal) => describeResult(terminal),
-            onProgress: progress.onProgress,
-            ...jobTuning(options),
-          });
+      prepare: async () => {
+        const prepared = await prepareDescribe(input, this.#storage);
+        return async (signal) => {
+          const body = await materializeDescribe(prepared, this.#storage, signal);
+          return () =>
+            runJob(this.#http, {
+              submit: () => this.#submit(DESCRIBE_PATH, body),
+              mapResult: (terminal) => describeResult(terminal),
+              onProgress: progress.onProgress,
+              ...jobTuning(options),
+            });
+        };
       },
       finish: (description) => description,
       onSettle: (outcome, job) => {
@@ -699,7 +733,7 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
       ...(options.signal !== undefined ? { signal: options.signal } : {}),
       prepare: async () => {
         prepared = await prepareFluent(input, this.#storage);
-        return this.#renderStarter(prepared, options, progress);
+        return this.#renderStage(prepared, options, progress);
       },
       finish: (assets) => onlyAsset(assets),
       onSettle: (outcome, job) => this.#logRender(outcome, job, prepared, progress.last),
@@ -721,7 +755,7 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
               `${prepared.outputs.length}: resolve each asset yourself.`,
           );
         }
-        return this.#renderStarter(prepared, options, progress);
+        return this.#renderStage(prepared, options, progress);
       },
       finish: (assets, signal) => {
         if (assets.length !== 1) return assets;
@@ -739,23 +773,26 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
   }
 
   /**
-   * Stages the render's deferred `.epr` files and allocates its outputs —
-   * before the job takes a pool slot — and resolves with the function that
-   * submits it once it holds one.
+   * A render's work inside its pool slot: uploads its inputs, stages its
+   * generated `.epr` files and allocates its outputs once the job holds the
+   * slot — `signal` aborts them — then resolves with the function that
+   * submits it.
    */
-  async #renderStarter(
+  #renderStage(
     prepared: PreparedRender,
     options: RenderOptions | RenderBuilderOptions,
     progress: StatusTracker,
-  ): Promise<() => AsyncJob<Asset[]>> {
-    const { body, outputs } = await materializeRender(prepared, this.#storage);
-    return () =>
-      runJob(this.#http, {
-        submit: () => this.#submit(RENDER_PATH, body),
-        mapResult: (terminal, meta) => renderAssets(terminal, meta, outputs),
-        onProgress: progress.onProgress,
-        ...jobTuning(options),
-      });
+  ): StageJob<Asset[]> {
+    return async (signal) => {
+      const { body, outputs } = await materializeRender(prepared, this.#storage, signal);
+      return () =>
+        runJob(this.#http, {
+          submit: () => this.#submit(RENDER_PATH, body),
+          mapResult: (terminal, meta) => renderAssets(terminal, meta, outputs),
+          onProgress: progress.onProgress,
+          ...jobTuning(options),
+        });
+    };
   }
 
   /**

@@ -116,6 +116,11 @@ const MIN_EXPIRY_SECONDS = 2;
  * the App Builder environment is present — `__OW_NAMESPACE` or
  * `AIO_runtime_namespace` is set. An explicit `storage` always wins;
  * configure a `PassthroughStorageProvider` to keep a client from uploading.
+ * The provider chosen automatically imports `@adobe/aio-lib-files` by name at
+ * run time, which cannot reach a package webpack has bundled into the action,
+ * so a webpack-bundled action configures its storage itself and passes the
+ * module: `new AioFilesStorageProvider({ module: files })`, with
+ * `import * as files from '@adobe/aio-lib-files'`.
  *
  * A `Readable` is read into memory before its upload, which needs the length
  * first; stage a large file by its path instead.
@@ -135,6 +140,11 @@ export class AioFilesStorageProvider implements StorageProvider {
   readonly #injected: AioFilesClient | undefined;
   readonly #module: AioFilesModule | undefined;
   #files: Promise<AioFilesClient> | undefined;
+  /**
+   * The Runtime auth key this provider uses — the option's, else the one
+   * `init()` was given — scrubbed from every failure the provider reports.
+   */
+  #resolvedAuth: string | undefined;
 
   /**
    * @param options - See {@link AioFilesStorageProviderOptions}.
@@ -162,6 +172,7 @@ export class AioFilesStorageProvider implements StorageProvider {
     }
     this.#namespace = namespace?.trim();
     this.#auth = auth?.trim();
+    this.#resolvedAuth = this.#auth;
     this.#prefix = keyPrefix(prefix, NAME);
     this.#expiresIn = expiresIn === undefined ? undefined : this.#checkExpiry(expiresIn);
     this.#injected = files;
@@ -171,6 +182,8 @@ export class AioFilesStorageProvider implements StorageProvider {
   /**
    * Uploads `input` to a new object — or the object `opts.key` names under
    * the prefix — and resolves with a presigned URL DGR can read it from.
+   * `opts.signal` goes to the upload's `fetch`, which stops when it aborts
+   * and rejects with its reason; presigning takes no signal.
    *
    * @throws {@link AudioVideoError} `invalid_argument` for an input that is
    *   not a local file, a `Buffer` or a `Readable`, or an invalid option;
@@ -180,17 +193,17 @@ export class AioFilesStorageProvider implements StorageProvider {
    */
   async stageRead(
     input: StageInput,
-    opts: { key?: string; contentType?: string; expiresIn?: number } = {},
+    opts: { key?: string; contentType?: string; expiresIn?: number; signal?: AbortSignal } = {},
   ): Promise<string> {
-    const body = await uploadBody(input, NAME);
+    const body = await uploadBody(input, NAME, this.#secrets());
     const key = objectKey(this.#prefix, opts.key, 'staged', body);
     const expiresIn = this.#expiry(opts.expiresIn, READ_EXPIRY_SECONDS);
     const contentType = checkContentType(opts.contentType);
-    const payload = await payloadOf(body);
+    const payload = await payloadOf(body, this.#secrets());
     const files = await this.#client();
-    const uploadUrl = await presign(files, key, 'rw', expiresIn);
-    await putBlob(uploadUrl, payload, contentType);
-    return presign(files, key, 'r', expiresIn);
+    const uploadUrl = await presign(files, key, 'rw', expiresIn, this.#secrets());
+    await putBlob(uploadUrl, payload, contentType, opts.signal, this.#secrets());
+    return presign(files, key, 'r', expiresIn, this.#secrets());
   }
 
   /**
@@ -207,9 +220,14 @@ export class AioFilesStorageProvider implements StorageProvider {
     const key = objectKey(this.#prefix, opts.key, 'outputs');
     const expiresIn = this.#expiry(opts.expiresIn, OUTPUT_EXPIRY_SECONDS);
     const files = await this.#client();
-    const writeUrl = await presign(files, key, 'w', expiresIn);
-    const readUrl = await presign(files, key, 'r', expiresIn);
+    const writeUrl = await presign(files, key, 'w', expiresIn, this.#secrets());
+    const readUrl = await presign(files, key, 'r', expiresIn, this.#secrets());
     return { writeUrl, readUrl };
+  }
+
+  /** The credentials a failure this provider reports is scrubbed of: the Runtime auth key, once known. */
+  #secrets(): readonly string[] {
+    return this.#resolvedAuth === undefined ? [] : [this.#resolvedAuth];
   }
 
   /** The `Files` client: the one given, or one initialized on first use — again after a failed attempt. */
@@ -224,6 +242,7 @@ export class AioFilesStorageProvider implements StorageProvider {
 
   async #init(): Promise<AioFilesClient> {
     const ow = runtimeCredentials(this.#namespace, this.#auth);
+    this.#resolvedAuth = ow.auth;
     const module = this.#module ?? (await loadPeer(PEER));
     const init = exportOf(module, 'init', PEER);
     if (typeof init !== 'function') {
@@ -233,7 +252,7 @@ export class AioFilesStorageProvider implements StorageProvider {
     try {
       files = await (init as AioFilesModule['init'])({ ow });
     } catch (error) {
-      throw adapterError(`Initializing ${PEER.specifier} failed`, error, [ow.auth]);
+      throw adapterError(`Initializing ${PEER.specifier} failed`, error, this.#secrets());
     }
     if (typeof (files as Partial<AioFilesClient> | null)?.generatePresignURL !== 'function') {
       throw adapterError(`${PEER.specifier} init() resolved without a Files client`);
@@ -253,7 +272,10 @@ export class AioFilesStorageProvider implements StorageProvider {
 /**
  * @internal The storage a client uses when none is configured: an
  * {@link AioFilesStorageProvider} when the App Builder environment is present
- * (`__OW_NAMESPACE` or `AIO_runtime_namespace` set), else none.
+ * (`__OW_NAMESPACE` or `AIO_runtime_namespace` set), else none. It is given
+ * no `module`, so it imports `@adobe/aio-lib-files` by name at run time; a
+ * webpack-bundled action, where that import cannot reach the bundled
+ * package, configures a provider with `module` itself instead.
  */
 export function appBuilderStorage(
   env: NodeJS.ProcessEnv = process.env,
@@ -297,17 +319,21 @@ function checkContentType(value: unknown): string | undefined {
   throw invalidOption(`${NAME}: contentType must be a non-empty string when provided.`);
 }
 
-/** The bytes an upload sends: a file as a Blob read from disk where the runtime can (else in memory), a stream read in full. */
-async function payloadOf(body: UploadBody): Promise<Blob | Buffer> {
+/**
+ * The bytes an upload sends: a file as a Blob read from disk where the
+ * runtime can (else in memory), a stream read in full. A failure is scrubbed
+ * of `secrets`.
+ */
+async function payloadOf(body: UploadBody, secrets: readonly string[]): Promise<Blob | Buffer> {
   if (body.kind === 'buffer') return body.data;
-  if (body.kind === 'stream') return readAll(body.stream);
+  if (body.kind === 'stream') return readAll(body.stream, secrets);
   const openAsBlob = (fs as { openAsBlob?: (path: string) => Promise<Blob> }).openAsBlob;
   try {
     return typeof openAsBlob === 'function'
       ? await openAsBlob(body.path)
       : await readFile(body.path);
   } catch (error) {
-    throw adapterError('Reading the input file failed', error);
+    throw adapterError('Reading the input file failed', error, secrets);
   }
 }
 
@@ -317,11 +343,13 @@ const ACCESS: Record<'r' | 'w' | 'rw', string> = {
   rw: 'read-write',
 };
 
+/** A presigned URL of `key` with `permissions`; a failure is scrubbed of `secrets`. */
 async function presign(
   files: AioFilesClient,
   key: string,
   permissions: 'r' | 'w' | 'rw',
   expiresIn: number,
+  secrets: readonly string[],
 ): Promise<string> {
   let url: unknown;
   try {
@@ -331,7 +359,11 @@ async function presign(
       urlType: 'external',
     });
   } catch (error) {
-    throw adapterError(`Presigning ${ACCESS[permissions]} access to the object failed`, error);
+    throw adapterError(
+      `Presigning ${ACCESS[permissions]} access to the object failed`,
+      error,
+      secrets,
+    );
   }
   if (typeof url !== 'string' || url === '') {
     throw adapterError('generatePresignURL() resolved without a URL');
@@ -339,11 +371,17 @@ async function presign(
   return url;
 }
 
-/** `PUT`s `payload` to a presigned Azure blob URL as a block blob; anything but `201` is a failure. */
+/**
+ * `PUT`s `payload` to a presigned Azure blob URL as a block blob, stopping
+ * when `signal` aborts; anything but `201` is a failure, scrubbed of
+ * `secrets` when it carries a cause.
+ */
 async function putBlob(
   url: string,
   payload: Blob | Buffer,
   contentType: string | undefined,
+  signal: AbortSignal | undefined,
+  secrets: readonly string[],
 ): Promise<void> {
   let res: Response;
   try {
@@ -355,9 +393,10 @@ async function putBlob(
       },
       body: payload,
       redirect: 'manual',
+      ...(signal !== undefined ? { signal } : {}),
     });
   } catch (error) {
-    throw adapterError('Uploading the object failed before a response arrived', error);
+    throw adapterError('Uploading the object failed before a response arrived', error, secrets);
   }
   try {
     await res.body?.cancel();

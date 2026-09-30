@@ -1,5 +1,5 @@
 /**
- * The ambient concurrency pool every job in this SDK runs inside, submit
+ * The ambient concurrency pool every job in this SDK runs inside, staging
  * through settle — not just its HTTP calls. It bounds how many jobs share one
  * credential at once, the quantity the API's rate limit responds to. A
  * caller brings their own loop (`Promise.all`, a `for` loop, a stream) and

@@ -1,15 +1,17 @@
 /**
- * Runs one job inside a {@link PoolBackend} slot, submit through settle, and
+ * Runs one job inside a {@link PoolBackend} slot, staging through settle, and
  * hands the caller a single handle for the whole call. A call moves through
- * four phases: preparing (validation, normalization and any staging of inputs
- * — all before a slot is requested), queued (waiting for a slot), running (the
- * slot is held from the submit until the job settles), and finishing (the slot
- * is released and the job's result becomes the call's value, e.g. by
- * downloading it). Only the job itself occupies a slot: nothing a call does
- * while holding one asks the pool for another, so a full pool can never
- * deadlock on its own callers. Cancelling before the job has started submits
- * nothing; cancelling after delegates to the job. Capability-neutral: nothing
- * here knows what a job produces.
+ * five phases: preparing (validation, normalization and classification —
+ * cheap, no network, before a slot is requested), queued (waiting for a
+ * slot), staging (the slot is held while the job's uploads and presigns run),
+ * running (the slot is still held, from the submit until the job settles),
+ * and finishing (the slot is released and the job's result becomes the
+ * call's value, e.g. by downloading it). Only the job itself occupies a slot:
+ * nothing a call does while holding one asks the pool for another, so a full
+ * pool can never deadlock on its own callers. Cancelling before the job has
+ * started submits nothing and frees any slot the call holds; cancelling after
+ * delegates to the job. Capability-neutral: nothing here knows what a job
+ * produces.
  */
 
 import { AudioVideoError } from './errors.js';
@@ -35,12 +37,13 @@ export interface JobHandle<T> extends PromiseLike<T> {
   ): Promise<TResult1 | TResult2>;
   /**
    * Cancels the call. Before the job has been submitted — while the call is
-   * validating or staging its inputs, or queued for a pool slot — nothing is
-   * submitted and the call rejects at once with `code: 'cancelled'`. Once the
-   * job has been submitted, polling stops and the service is asked to stop the
-   * job (best-effort); the call rejects `cancelled`. While a finished job's
-   * result is being downloaded, the download is aborted. Calling this on a
-   * settled call, or a second time, is a no-op.
+   * validating its inputs, queued for a pool slot, or staging its inputs in
+   * the slot — nothing is submitted, an upload in progress is told to stop,
+   * the slot is released, and the call rejects at once with `code: 'cancelled'`.
+   * Once the job has been submitted, polling stops and the service is asked
+   * to stop the job (best-effort); the call rejects `cancelled`. While a
+   * finished job's result is being downloaded, the download is aborted.
+   * Calling this on a settled call, or a second time, is a no-op.
    */
   cancel(): Promise<void>;
   /** Attaches a rejection handler to the call's settlement. */
@@ -54,19 +57,46 @@ export interface JobHandle<T> extends PromiseLike<T> {
 /** @internal How a call settled, as reported to {@link PooledJobOptions.onSettle}. */
 export type PooledJobOutcome<T> = { ok: true; value: T } | { ok: false; error: unknown };
 
-/** @internal What {@link runPooledJob} needs to drive one call. */
+/**
+ * @internal Starts a call's job. It must start the job without awaiting
+ * anything: the job exists from the moment it returns, so a cancel that
+ * arrives after it has run reaches the job, which asks the service to stop.
+ */
+export type StartJob<J> = () => AsyncJob<J>;
+
+/**
+ * @internal A call's work inside its slot, before the submit: everything that
+ * uploads or presigns for the job, resolving with the {@link StartJob} that
+ * submits it. `signal` aborts when the call is cancelled, or the caller's
+ * signal aborts, before the job starts — pass it to every transport. The call
+ * stops waiting on this work the moment `signal` aborts, whether or not the
+ * work stops, so work that ignores `signal` never holds the slot.
+ */
+export type StageJob<J> = (signal: AbortSignal) => Promise<StartJob<J>> | StartJob<J>;
+
+/**
+ * @internal What {@link runPooledJob} needs to drive one call. The phases run
+ * in this order: `prepare` before the call asks for a slot; then, once the
+ * slot is held, the {@link StageJob} `prepare` resolves with; then the
+ * {@link StartJob} that stage resolves with, which starts the job; then, once
+ * the job has settled and released the slot, `finish`.
+ */
 export interface PooledJobOptions<J, T> {
   /** The pool the job runs in. */
   pool: PoolBackend;
   /**
    * Everything that happens before the call asks for a slot — validation,
-   * normalization, staging inputs — resolving with the function that starts
-   * the job. That function is called once the slot is held, and only if the
-   * call has not been cancelled; it must start the job without awaiting
-   * anything, and must never call the pool itself. A rejection here settles
-   * the call without entering the pool.
+   * normalization and classification, cheap and with no network — resolving
+   * with the call's {@link StageJob}. A rejection here settles the call
+   * without entering the pool. The stage runs once the slot is held, and only
+   * if the call has not been cancelled: a cancel, or the caller's signal
+   * aborting, while it runs rejects the call `cancelled`, submits nothing and
+   * releases the slot for the next queued call; a rejection from it settles
+   * the call and releases the slot too. The {@link StartJob} it resolves with
+   * runs straight after, still in the slot and only if the call is still not
+   * cancelled. Neither may call the pool itself.
    */
-  prepare: () => Promise<() => AsyncJob<J>> | (() => AsyncJob<J>);
+  prepare: () => Promise<StageJob<J>> | StageJob<J>;
   /**
    * Turns the job's result into the call's value once the job has released
    * its slot. `signal` aborts if the call is cancelled, or
@@ -74,10 +104,11 @@ export interface PooledJobOptions<J, T> {
    */
   finish: (value: J, signal: AbortSignal) => Promise<T> | T;
   /**
-   * The caller's signal. Aborting it before the job has started rejects the
-   * call `cancelled`, with the abort reason as `cause`, and submits nothing.
-   * Once the job has started, the job observes the signal itself — the start
-   * function passes it to the job runner.
+   * The caller's signal. Aborting it before the job has started — while the
+   * call is preparing, queued or staging — rejects the call `cancelled`, with
+   * the abort reason as `cause`, and submits nothing. Once the job has
+   * started, the job observes the signal itself — the start function passes
+   * it to the job runner.
    */
   signal?: AbortSignal;
   /**
@@ -94,8 +125,9 @@ type CallState = 'pending' | 'fulfilled' | 'rejected' | 'cancelled';
 
 /**
  * @internal The {@link JobHandle} {@link runPooledJob} returns. Holds its pool
- * slot from the moment the job is admitted until the job settles, whether it
- * resolves or rejects.
+ * slot from the moment the call is admitted, through staging, until the job
+ * settles, whether it resolves or rejects — or until a cancel before the job
+ * starts, or a failed stage, frees it.
  */
 export class PooledJob<J, T> implements JobHandle<T> {
   readonly #promise: Promise<T>;
@@ -185,9 +217,18 @@ export class PooledJob<J, T> implements JobHandle<T> {
   async #run(options: PooledJobOptions<J, T>): Promise<T> {
     const beforeStart = this.#beforeStart.signal;
     beforeStart.throwIfAborted();
-    const start = await untilAborted(Promise.resolve().then(options.prepare), beforeStart);
+    const stage = await untilAborted(Promise.resolve().then(options.prepare), beforeStart);
     const admitted = await untilAborted(
       options.pool.run(async () => {
+        if (beforeStart.aborted) return SKIPPED;
+        const start = await untilAborted(
+          Promise.resolve().then(() => {
+            beforeStart.throwIfAborted();
+            return stage(beforeStart);
+          }),
+          beforeStart,
+        );
+        // A cancel can land after the stage resolved and before this line runs.
         if (beforeStart.aborted) return SKIPPED;
         return { value: await this.#start(start) };
       }),
@@ -201,7 +242,7 @@ export class PooledJob<J, T> implements JobHandle<T> {
     return options.finish(admitted.value, finishSignal);
   }
 
-  #start(start: () => AsyncJob<J>): AsyncJob<J> {
+  #start(start: StartJob<J>): AsyncJob<J> {
     this.#job = start();
     return this.#job;
   }
@@ -231,9 +272,9 @@ export class PooledJob<J, T> implements JobHandle<T> {
 
 /**
  * @internal Starts a call that runs its job inside `options.pool`: prepares it
- * at once, waits for a slot, starts the job, holds the slot until the job
- * settles, then finishes the call outside the slot. Returns the handle
- * immediately.
+ * at once, waits for a slot, stages and starts the job in the slot, holds the
+ * slot until the job settles, then finishes the call outside the slot.
+ * Returns the handle immediately.
  *
  * @typeParam J - The job's own result type.
  * @typeParam T - The call's value, produced from `J` by `options.finish`.

@@ -99,11 +99,15 @@ export class MockApi {
   /**
    * A submit endpoint answering `202 { jobId, statusUrl, cancelUrl }` with
    * `Retry-After` on every response, as the live API does. Job IDs come from
-   * `jobIds` in order.
+   * `jobIds` in order; `onSubmit` sees each one with the parsed request body.
    */
   submit(
     jobIds: string[],
-    opts: { path?: string; retryAfter?: string; onSubmit?: (jobId: string) => void } = {},
+    opts: {
+      path?: string;
+      retryAfter?: string;
+      onSubmit?: (jobId: string, body: Record<string, unknown>) => void;
+    } = {},
   ): void {
     const path = opts.path ?? '/v1/templates/render';
     let next = 0;
@@ -113,10 +117,10 @@ export class MockApi {
       .reply(
         202,
         async (reply) => {
-          await this.#record(API, reply);
+          const call = await this.#record(API, reply);
           const jobId = jobIds[Math.min(next, jobIds.length - 1)] ?? 'job';
           next += 1;
-          opts.onSubmit?.(jobId);
+          opts.onSubmit?.(jobId, JSON.parse(call.body) as Record<string, unknown>);
           return {
             jobId,
             statusUrl: `${API}/v1/status/${jobId}`,
@@ -200,15 +204,17 @@ export class MockApi {
       .persist();
   }
 
-  /** Records one request an interceptor answered. */
-  async #record(origin: string, opts: ReplyOptions): Promise<void> {
-    this.calls.push({
+  /** Records one request an interceptor answered, and returns the record. */
+  async #record(origin: string, opts: ReplyOptions): Promise<RecordedCall> {
+    const call: RecordedCall = {
       origin,
       method: opts.method,
       path: opts.path,
       headers: (opts.headers ?? {}) as Record<string, string>,
       body: await readBody(opts.body),
-    });
+    };
+    this.calls.push(call);
+    return call;
   }
 }
 

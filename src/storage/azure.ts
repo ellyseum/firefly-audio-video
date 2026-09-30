@@ -22,22 +22,22 @@ import {
 export interface AzureBlockBlobClient {
   /** The blob's URL. */
   readonly url: string;
-  /** Uploads bytes held in memory. */
+  /** Uploads bytes held in memory; `abortSignal` stops it. */
   uploadData(
     data: Buffer,
-    options?: { blobHTTPHeaders?: { blobContentType?: string } },
+    options?: { blobHTTPHeaders?: { blobContentType?: string }; abortSignal?: AbortSignal },
   ): Promise<unknown>;
-  /** Uploads a file from disk, in blocks. */
+  /** Uploads a file from disk, in blocks; `abortSignal` stops it. */
   uploadFile(
     filePath: string,
-    options?: { blobHTTPHeaders?: { blobContentType?: string } },
+    options?: { blobHTTPHeaders?: { blobContentType?: string }; abortSignal?: AbortSignal },
   ): Promise<unknown>;
-  /** Uploads a stream of unknown length, in blocks. */
+  /** Uploads a stream of unknown length, in blocks; `abortSignal` stops it. */
   uploadStream(
     stream: Readable,
     bufferSize?: number,
     maxConcurrency?: number,
-    options?: { blobHTTPHeaders?: { blobContentType?: string } },
+    options?: { blobHTTPHeaders?: { blobContentType?: string }; abortSignal?: AbortSignal },
   ): Promise<unknown>;
   /** The blob's URL with a SAS signed by the account key. */
   generateSasUrl(options: {
@@ -75,7 +75,9 @@ export interface AzureBlobStorageProviderOptions {
   container: string;
   /**
    * A connection string holding the account key (`AccountName=…;AccountKey=…`,
-   * or `UseDevelopmentStorage=true` for Azurite); never logged or thrown.
+   * or `UseDevelopmentStorage=true` for Azurite); never logged or thrown. One
+   * holding a `SharedAccessSignature` and no `AccountKey` is refused: every
+   * URL this provider returns is signed with the key.
    */
   connectionString?: string;
   /** The storage account's name: 3 to 24 lowercase letters and digits. Pass it with `accountKey`. */
@@ -143,9 +145,11 @@ interface AzureSdk {
 /**
  * Stages through an Azure Blob Storage container:
  *
- * - `stageRead` uploads the input as a block blob — a `Buffer` in one call,
- *   a file from disk and a `Readable` in blocks, neither read into memory
- *   whole — then returns the blob's URL with a read-only SAS.
+ * - `stageRead` signs a read-only SAS for a new blob, then uploads the input
+ *   to it as a block blob — a `Buffer` in one call, a file from disk and a
+ *   `Readable` in blocks, neither read into memory whole — and returns the
+ *   signed URL. Signing comes first so that a client which cannot sign fails
+ *   before anything is written.
  * - `allocateOutput` signs two SAS URLs for one blob: create and write, which
  *   DGR renders into, and read, which the asset is read from.
  *
@@ -214,6 +218,13 @@ export class AzureBlobStorageProvider implements StorageProvider {
     if (connectionString !== undefined && !isFilled(connectionString)) {
       throw invalidOption(`${NAME}: connectionString must be a non-empty string.`);
     }
+    if (connectionString !== undefined && holdsSasWithoutKey(connectionString)) {
+      throw invalidOption(
+        `${NAME}: connectionString holds a shared access signature and no account key, and ` +
+          'every URL this provider returns is signed with the account key: pass a connection ' +
+          'string that holds the key, or accountName with accountKey.',
+      );
+    }
     if (endpoint !== undefined && !account) {
       throw invalidOption(`${NAME}: endpoint goes with accountName and accountKey.`);
     }
@@ -238,16 +249,20 @@ export class AzureBlobStorageProvider implements StorageProvider {
 
   /**
    * Uploads `input` to a new blob — or the blob `opts.key` names under the
-   * prefix — and resolves with its URL carrying a read-only SAS.
+   * prefix — and resolves with its URL carrying a read-only SAS. The SAS is
+   * signed before the upload, so a client that cannot sign fails with
+   * nothing written, and its lifetime counts from the start of the upload.
+   * `opts.signal` goes to the upload as the SDK's `abortSignal`, which stops
+   * it when it aborts; signing takes no signal.
    *
    * @throws {@link AudioVideoError} `invalid_argument` for an input that is
    *   not a local file, a `Buffer` or a `Readable`, or an invalid option;
    *   `missing_peer_dependency` when `@azure/storage-blob` cannot be
-   *   imported; `storage_failed` when the upload or signing fails.
+   *   imported; `storage_failed` when signing or the upload fails.
    */
   async stageRead(
     input: StageInput,
-    opts: { key?: string; contentType?: string; expiresIn?: number } = {},
+    opts: { key?: string; contentType?: string; expiresIn?: number; signal?: AbortSignal } = {},
   ): Promise<string> {
     const body = await uploadBody(input, NAME);
     const key = objectKey(this.#prefix, opts.key, 'staged', body);
@@ -255,8 +270,9 @@ export class AzureBlobStorageProvider implements StorageProvider {
     const contentType = checkContentType(opts.contentType);
     const sdk = await this.#load();
     const blob = this.#blob(sdk, key);
-    await this.#upload(blob, body, contentType);
-    return this.#sign(sdk, blob, 'r', expiresIn);
+    const url = await this.#sign(sdk, blob, 'r', expiresIn);
+    await this.#upload(blob, body, contentType, opts.signal);
+    return url;
   }
 
   /**
@@ -348,14 +364,17 @@ export class AzureBlobStorageProvider implements StorageProvider {
     }
   }
 
-  /** Uploads `body` to `blob`: a Buffer in one call, a file or a stream in blocks. */
+  /** Uploads `body` to `blob`, stopped by `signal`: a Buffer in one call, a file or a stream in blocks. */
   async #upload(
     blob: AzureBlockBlobClient,
     body: UploadBody,
     contentType: string | undefined,
+    signal: AbortSignal | undefined,
   ): Promise<void> {
-    const options =
-      contentType !== undefined ? { blobHTTPHeaders: { blobContentType: contentType } } : {};
+    const options = {
+      ...(contentType !== undefined ? { blobHTTPHeaders: { blobContentType: contentType } } : {}),
+      ...(signal !== undefined ? { abortSignal: signal } : {}),
+    };
     try {
       if (body.kind === 'buffer') await blob.uploadData(body.data, options);
       else if (body.kind === 'file') await blob.uploadFile(body.path, options);
@@ -430,17 +449,30 @@ function accountConnectionString(name: unknown, key: unknown, endpoint: unknown)
   return `DefaultEndpointsProtocol=${new URL(url).protocol.slice(0, -1)};${account};BlobEndpoint=${url}`;
 }
 
-/** The secret values a connection string holds: its account key and any SAS. */
-function connectionStringSecrets(connectionString: string): string[] {
-  return connectionString.split(';').flatMap((part) => {
+/** A connection string's non-empty `name=value` fields, each name lowercased. */
+function connectionStringFields(connectionString: string): Array<[name: string, value: string]> {
+  return connectionString.split(';').flatMap((part): Array<[string, string]> => {
     const at = part.indexOf('=');
     if (at <= 0) return [];
-    const name = part.slice(0, at).trim().toLowerCase();
     const value = part.slice(at + 1).trim();
-    return (name === 'accountkey' || name === 'sharedaccesssignature') && value !== ''
-      ? [value]
-      : [];
+    return value === '' ? [] : [[part.slice(0, at).trim().toLowerCase(), value]];
   });
+}
+
+/** The secret values a connection string holds: its account key and any SAS. */
+function connectionStringSecrets(connectionString: string): string[] {
+  return connectionStringFields(connectionString)
+    .filter(([name]) => name === 'accountkey' || name === 'sharedaccesssignature')
+    .map(([, value]) => value);
+}
+
+/**
+ * True for a connection string holding a SAS and no account key: a client
+ * built from it can upload but can never sign the URLs this provider returns.
+ */
+function holdsSasWithoutKey(connectionString: string): boolean {
+  const names = new Set(connectionStringFields(connectionString).map(([name]) => name));
+  return names.has('sharedaccesssignature') && !names.has('accountkey');
 }
 
 function isFilled(value: unknown): value is string {

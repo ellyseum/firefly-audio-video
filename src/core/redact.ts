@@ -374,8 +374,11 @@ const MAX_CAUSE_DEPTH = 4;
  * or number), its message run through {@link redactValue}, and — to a depth
  * of four — its own `cause` copied the same way. The original is never kept:
  * a transport error can still hold an unredacted URL in its message or its
- * cause. A value that is not an `Error` becomes one from its string form.
- * Never throws.
+ * cause. Any error-shaped value is read this way — an object with a string
+ * `message`, or an object the runtime brands as an error — so an error made
+ * in another realm (a `vm` context, a test runner's sandbox) keeps its name
+ * and code even though it is not an `instanceof Error` here. Any other value
+ * becomes an `Error` from its string form. Never throws.
  *
  * @param error - Whatever was thrown or rejected.
  * @returns A new `Error` safe to keep as a `cause`.
@@ -389,17 +392,39 @@ export function redactError(error: unknown): Error {
 function redactErrorAt(error: unknown, depth: number): Error {
   let copy: Error;
   try {
-    if (!(error instanceof Error)) return new Error(redactValue(String(error)));
-    copy = new Error(redactValue(String(error.message)));
-    copy.name = String(error.name);
-    const { code, cause } = error as Error & { code?: unknown };
-    if (typeof code === 'string' || typeof code === 'number') {
-      (copy as Error & { code?: string | number }).code = code;
+    const fields = errorFields(error);
+    if (fields === undefined) return new Error(redactValue(String(error)));
+    copy = new Error(redactValue(fields.message));
+    if (fields.name !== undefined) copy.name = fields.name;
+    if (fields.code !== undefined) (copy as Error & { code?: string | number }).code = fields.code;
+    if (fields.cause !== undefined && depth < MAX_CAUSE_DEPTH) {
+      copy.cause = redactErrorAt(fields.cause, depth + 1);
     }
-    if (cause !== undefined && depth < MAX_CAUSE_DEPTH)
-      copy.cause = redactErrorAt(cause, depth + 1);
   } catch {
     return new Error('[Unreadable error]');
   }
   return copy;
+}
+
+/**
+ * The `message`, `name`, `code` and `cause` of an error-shaped value — an
+ * object with a string `message`, or one `Object.prototype.toString` brands
+ * `[object Error]` in whatever realm made it — or `undefined` for anything
+ * else. Reads each field once; a throwing getter throws.
+ */
+function errorFields(
+  value: unknown,
+): { message: string; name?: string; code?: string | number; cause?: unknown } | undefined {
+  if (value === null || (typeof value !== 'object' && typeof value !== 'function')) {
+    return undefined;
+  }
+  const { message, name, code, cause } = value as Record<string, unknown>;
+  const branded = Object.prototype.toString.call(value) === '[object Error]';
+  if (typeof message !== 'string' && !branded) return undefined;
+  return {
+    message: String(message ?? ''),
+    ...(typeof name === 'string' ? { name } : {}),
+    ...(typeof code === 'string' || typeof code === 'number' ? { code } : {}),
+    ...(cause !== undefined ? { cause } : {}),
+  };
 }

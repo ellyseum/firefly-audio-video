@@ -1,4 +1,5 @@
 import { inspect } from 'node:util';
+import { runInNewContext } from 'node:vm';
 import { expect, test } from 'vitest';
 import { redactError, redactUrl, redactHeaders, redactValue } from '../src/core/redact.js';
 import { AudioVideoError, type AudioVideoErrorOptions } from '../src/core/errors.js';
@@ -442,6 +443,35 @@ test('redactError: a numeric code is kept, the cause chain stops after four leve
   expect(fromString).toBeInstanceOf(Error);
   expect(fromString.message).toBe('boom at https://x.blob/f');
   expect(redactError(Symbol('reason')).message).toBe('Symbol(reason)');
+});
+
+test('redactError: an error from another realm keeps its name, code, redacted message and cause chain', () => {
+  const foreign: unknown = runInNewContext(
+    'const inner = new Error("inner reaching https://x.blob/g?sig=VM_INNER_SIG");' +
+      'const e = new RangeError("reset reaching https://x.blob/f?sig=VM_OUTER_SIG", { cause: inner });' +
+      'e.code = "E_VM_REALM"; e',
+  );
+  expect(foreign instanceof Error).toBe(false);
+
+  const copy = redactError(foreign);
+
+  expect(copy).toBeInstanceOf(Error);
+  expect(copy.name).toBe('RangeError');
+  expect((copy as Error & { code?: unknown }).code).toBe('E_VM_REALM');
+  expect(copy.message).toBe('reset reaching https://x.blob/f');
+  expect(copy.cause).toBeInstanceOf(Error);
+  expect((copy.cause as Error).message).toBe('inner reaching https://x.blob/g');
+  expect(inspect(copy, { depth: null })).not.toMatch(/VM_OUTER_SIG|VM_INNER_SIG/);
+});
+
+test('redactError: a plain object shaped like an error is read as one', () => {
+  const copy = redactError({
+    name: 'LoaderError',
+    code: 'E_SHAPED',
+    message: 'failed at https://x.blob/f?sig=SHAPED_SIG',
+  });
+  expect(copy).toMatchObject({ name: 'LoaderError', code: 'E_SHAPED' });
+  expect(copy.message).toBe('failed at https://x.blob/f');
 });
 
 test('redactError: never throws, even for an error whose properties throw', () => {

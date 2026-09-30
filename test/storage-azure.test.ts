@@ -280,6 +280,23 @@ test('a Readable uploads in blocks as the stream it is, never read into memory f
   expect(stream.readableEnded).toBe(false);
 });
 
+test('stageRead hands its signal to every kind of upload as the abortSignal', async () => {
+  const { provider, uploads } = fakeProvider();
+  const controller = new AbortController();
+  const { signal } = controller;
+  await provider.stageRead(Buffer.from('x'), { signal, contentType: 'image/png' });
+  await provider.stageRead(logo, { signal });
+  await provider.stageRead(Readable.from([Buffer.from('x')]), { signal });
+  expect(uploads.map(({ method }) => method)).toEqual(['uploadData', 'uploadFile', 'uploadStream']);
+  expect(uploads[0]?.options).toEqual({
+    blobHTTPHeaders: { blobContentType: 'image/png' },
+    abortSignal: signal,
+  });
+  for (const upload of uploads) {
+    expect((upload.options as { abortSignal?: unknown }).abortSignal).toBe(signal);
+  }
+});
+
 // --- allocateOutput ---------------------------------------------------------------------
 
 test('allocateOutput signs a create-and-write SAS and a read SAS for one blob, for 24 hours, and uploads nothing', async () => {
@@ -393,20 +410,82 @@ test('with the real SDK, offline: an account name, key and endpoint sign for tha
   expect(write.searchParams.get('sig')).toMatch(/^[A-Za-z0-9+/]{43}=$/);
 });
 
-test('with the real SDK, offline: a client without the account key cannot sign, and its SAS is never shown', async () => {
+/**
+ * The real SDK's client for a SAS-only connection string — it holds no
+ * account key — with every upload counted instead of sent.
+ */
+function sasOnlyClient() {
+  const real = azureSdk.BlobServiceClient.fromConnectionString(SAS_CONNECTION_STRING);
+  const uploaded: string[] = [];
+  const count = async (name: string): Promise<BlobUploadCommonResponse> => {
+    uploaded.push(name);
+    return UPLOADED;
+  };
+  const service: AzureBlobServiceClient = {
+    getContainerClient(name) {
+      const container = real.getContainerClient(name);
+      return {
+        getBlockBlobClient(blobName) {
+          const blob = container.getBlockBlobClient(blobName);
+          return {
+            url: blob.url,
+            generateSasUrl: (options) =>
+              blob.generateSasUrl(options as Parameters<typeof blob.generateSasUrl>[0]),
+            uploadData: () => count(blobName),
+            uploadFile: () => count(blobName),
+            uploadStream: () => count(blobName),
+          };
+        },
+      };
+    },
+  };
+  return { service, uploaded };
+}
+
+test('with the real SDK, offline: a client without the account key cannot sign, fails staging before anything is uploaded, and its SAS is never shown', async () => {
+  const { service, uploaded } = sasOnlyClient();
+  const provider = new AzureBlobStorageProvider({
+    container: CONTAINER,
+    client: service,
+    module: azureSdk,
+  });
+  const cannotSign =
+    'SAS for the blob failed: Can only generate the SAS when the client is initialized with a ' +
+    'shared key credential';
+
+  const allocating = await rejection(provider.allocateOutput());
+  const staging = await rejection(provider.stageRead(Buffer.from('x')));
+
+  expect(allocating.code).toBe('storage_failed');
+  expect(allocating.message).toBe(`Signing a write ${cannotSign}`);
+  expect(staging.code).toBe('storage_failed');
+  expect(staging.message).toBe(`Signing a read ${cannotSign}`);
+  expect(uploaded).toEqual([]);
+  for (const error of [allocating, staging]) {
+    expect(everythingPrinted(error)).not.toContain('CONNECTION_STRING_SAS_SIG');
+  }
+});
+
+test('stageRead signs before it uploads: a client whose signing fails writes nothing', async () => {
+  const store = fakeContainer();
+  const failing: AzureContainerClient = {
+    getBlockBlobClient(name) {
+      return {
+        ...store.container.getBlockBlobClient(name),
+        generateSasUrl: () => Promise.reject(new Error('this client holds no key')),
+      };
+    },
+  };
   const error = await rejection(
     new AzureBlobStorageProvider({
       container: CONTAINER,
-      connectionString: SAS_CONNECTION_STRING,
+      client: fakeService(failing).service,
       module: azureSdk,
-    }).allocateOutput(),
+    }).stageRead(Buffer.from('x')),
   );
   expect(error.code).toBe('storage_failed');
-  expect(error.message).toBe(
-    'Signing a write SAS for the blob failed: Can only generate the SAS when the client is ' +
-      'initialized with a shared key credential',
-  );
-  expect(everythingPrinted(error)).not.toContain('CONNECTION_STRING_SAS_SIG');
+  expect(error.message).toBe('Signing a read SAS for the blob failed: this client holds no key');
+  expect(store.uploads).toEqual([]);
 });
 
 // --- the client ------------------------------------------------------------------------
@@ -509,7 +588,8 @@ test('an upload failure quoting the account key and a SAS rejects storage_failed
   const printed = everythingPrinted(error);
   expect(printed).not.toContain(ACCOUNT_KEY);
   expect(printed).not.toContain('SAS_UPLOAD_LEAK');
-  expect(store.sas).toEqual([]);
+  expect(store.sas.map(({ permissions }) => permissions)).toEqual(['r']);
+  expect(printed).not.toContain('SIG_r_1');
 });
 
 test('a signing, client or container failure quoting a connection string or its key has them scrubbed', async () => {
@@ -633,7 +713,7 @@ test('no printed form of the provider, or of a client using it, shows the accoun
     new AzureBlobStorageProvider({ container: CONTAINER, connectionString: CONNECTION_STRING }),
     new AzureBlobStorageProvider({
       container: CONTAINER,
-      connectionString: SAS_CONNECTION_STRING,
+      client: azureSdk.BlobServiceClient.fromConnectionString(SAS_CONNECTION_STRING),
     }),
     new AzureBlobStorageProvider({
       container: CONTAINER,
@@ -689,6 +769,34 @@ test('invalid options throw invalid_argument without quoting a key or connection
     expect(error.message).not.toContain(ACCOUNT_KEY);
     expect(error.message).not.toContain('AccountKey');
   }
+});
+
+test('a connection string holding a SAS and no account key is refused at construction, never quoted; one holding the key as well is accepted', () => {
+  const sasOnly = [
+    SAS_CONNECTION_STRING,
+    `${SAS_CONNECTION_STRING};AccountKey=`,
+    SAS_CONNECTION_STRING.replace('SharedAccessSignature=', 'sharedaccesssignature ='),
+  ];
+  for (const connectionString of sasOnly) {
+    const error = thrown(
+      () => new AzureBlobStorageProvider({ container: CONTAINER, connectionString }),
+    );
+    expect(error.code).toBe('invalid_argument');
+    expect(error.message).toBe(
+      'AzureBlobStorageProvider: connectionString holds a shared access signature and no ' +
+        'account key, and every URL this provider returns is signed with the account key: ' +
+        'pass a connection string that holds the key, or accountName with accountKey.',
+    );
+    expect(error.message).not.toContain('CONNECTION_STRING_SAS_SIG');
+    expect(error.message).not.toContain('SharedAccessSignature=');
+  }
+  expect(
+    () =>
+      new AzureBlobStorageProvider({
+        container: CONTAINER,
+        connectionString: `${CONNECTION_STRING};SharedAccessSignature=sv=2020&sig=ALSO_SAS`,
+      }),
+  ).not.toThrow();
 });
 
 test('invalid arguments reject invalid_argument before any SDK call', async () => {
@@ -747,6 +855,27 @@ test('a missing @azure/storage-blob rejects missing_peer_dependency naming the i
   expect(error.message).toContain('AzureBlobStorageProvider needs @azure/storage-blob');
   expect(error.message).toContain('`npm install @azure/storage-blob`');
   expect(error.message).toContain('pass the module as the module option instead');
+  expect(error.message).toContain('(Error [ERR_MODULE_NOT_FOUND]: Cannot find package)');
+});
+
+test('an installed @azure/storage-blob that fails to load names the module option, with the loader error as text', async () => {
+  const actual =
+    await vi.importActual<typeof import('../src/storage/peer.js')>('../src/storage/peer.js');
+  vi.mocked(loadPeer).mockImplementation((peer: Peer) =>
+    actual.loadPeer(peer, () => Promise.reject(new TypeError('the sandbox refused import()'))),
+  );
+  const error = await rejection(
+    new AzureBlobStorageProvider({
+      container: CONTAINER,
+      connectionString: CONNECTION_STRING,
+    }).stageRead(Buffer.from('x')),
+  );
+  expect(error.code).toBe('storage_failed');
+  expect(error.message).toBe(
+    'Loading @azure/storage-blob for AzureBlobStorageProvider failed (TypeError: the sandbox ' +
+      'refused import()). Pass the module as the module option instead: a module passed in ' +
+      'needs no run-time import.',
+  );
 });
 
 test('a failed load is retried on the next call', async () => {

@@ -320,6 +320,34 @@ function stageInputSchema(what: string): z.ZodType<StageInput> {
 }
 
 /**
+ * A template to render or describe: any form a {@link RenderRequest}'s
+ * `source` takes, or `{ url }` holding one. An http(s) URL — a string or a
+ * `URL` — is used as it is; a local file path, a `file:` URL, a `Buffer` or a
+ * `Readable` is uploaded through the client's storage once the job holds its
+ * pool slot. A path that names no file, a string that is not an http(s) URL,
+ * and a URL of any other scheme are refused, as they are in a spec.
+ *
+ * @example
+ * ```ts
+ * await render('https://example.com/capsule.mogrt?sig=…').prores.save('./out.mov');
+ * await render('./capsule.mogrt').prores.save('./out.mov'); // uploaded through storage
+ * await describe({ url: await readFile('./capsule.mogrt') });
+ * ```
+ */
+export const TemplateSourceSchema = z.union(
+  [stageInputSchema('source'), z.strictObject({ url: stageInputSchema('url') })],
+  {
+    error: (issue) =>
+      issue.input === ''
+        ? 'source must not be empty'
+        : 'source must be an http(s) URL, a file path, a URL, a Buffer or a Readable, or { url } holding one',
+  },
+);
+
+/** A {@link TemplateSourceSchema} input: what `render(source)` and `describe(source)` take. */
+export type TemplateSource = z.infer<typeof TemplateSourceSchema>;
+
+/**
  * A reference to a render preset as a {@link RenderRequest} takes it: the
  * {@link PresetRef} forms, with `url` accepting any render input — an http(s)
  * URL used as it is, or an `.epr` given as a file path, a `file:` URL, a
@@ -333,16 +361,7 @@ function stageInputSchema(what: string): z.ZodType<StageInput> {
  * const inMemory: PresetRefInput = { url: await readFile('./My Preset.epr') };
  * ```
  */
-export const PresetRefInputSchema = z.union(
-  [
-    z.strictObject({ url: stageInputSchema('url') }),
-    z.strictObject({ presetId: z.string().min(1, 'presetId must not be empty') }),
-  ],
-  { error: 'a preset ref must be either { url } or { presetId }, not both and not neither' },
-);
-
-/** A {@link PresetRefInputSchema} input: `{ url }` (any render input naming an `.epr`) or `{ presetId }`. */
-export type PresetRefInput = z.infer<typeof PresetRefInputSchema>;
+export type PresetRefInput = { url: StageInput } | { presetId: string };
 
 /**
  * One deliverable of a {@link RenderRequest}: a {@link RenderOutput} whose

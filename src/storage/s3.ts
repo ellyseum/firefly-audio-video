@@ -32,8 +32,11 @@ export interface S3Credentials {
 
 /** The part of an `S3Client` {@link S3StorageProvider} calls, and hands to `getSignedUrl`. */
 export interface S3ClientLike {
-  /** Sends one command; this provider sends `PutObjectCommand`. */
-  send(command: object): Promise<unknown>;
+  /**
+   * Sends one command; this provider sends `PutObjectCommand`, with the
+   * upload's `abortSignal` when it has one.
+   */
+  send(command: object, options?: { abortSignal?: AbortSignal }): Promise<unknown>;
 }
 
 /** The part of the `@aws-sdk/client-s3` module {@link S3StorageProvider} calls. */
@@ -220,6 +223,8 @@ export class S3StorageProvider implements StorageProvider {
   /**
    * Uploads `input` to a new object — or the object `opts.key` names under
    * the prefix — and resolves with a presigned URL DGR can read it from.
+   * `opts.signal` goes to the `PutObject` as the SDK's `abortSignal`, which
+   * stops the upload when it aborts; presigning takes no signal.
    *
    * @throws {@link AudioVideoError} `invalid_argument` for an input that is
    *   not a local file, a `Buffer` or a `Readable`, or an invalid option;
@@ -228,14 +233,14 @@ export class S3StorageProvider implements StorageProvider {
    */
   async stageRead(
     input: StageInput,
-    opts: { key?: string; contentType?: string; expiresIn?: number } = {},
+    opts: { key?: string; contentType?: string; expiresIn?: number; signal?: AbortSignal } = {},
   ): Promise<string> {
     const body = await uploadBody(input, NAME);
     const key = objectKey(this.#prefix, opts.key, 'staged', body);
     const expiresIn = this.#expiry(opts.expiresIn, READ_EXPIRY_SECONDS);
     const contentType = checkContentType(opts.contentType);
     const sdk = await this.#load();
-    await this.#upload(sdk, key, body, contentType);
+    await this.#upload(sdk, key, body, contentType, opts.signal);
     return this.#presign(sdk, 'GET', key, expiresIn);
   }
 
@@ -303,23 +308,28 @@ export class S3StorageProvider implements StorageProvider {
     return { client, PutObjectCommand, GetObjectCommand, getSignedUrl };
   }
 
-  /** Sends a `PutObject` of `body` to `key`; a file stream is closed however the upload ends. */
+  /**
+   * Sends a `PutObject` of `body` to `key`, stopped by `signal`; a file
+   * stream is closed however the upload ends.
+   */
   async #upload(
     sdk: S3Sdk,
     key: string,
     body: UploadBody,
     contentType: string | undefined,
+    signal: AbortSignal | undefined,
   ): Promise<void> {
     const payload = await putPayload(body);
     try {
-      await sdk.client.send(
-        new sdk.PutObjectCommand({
-          Bucket: this.#bucket,
-          Key: key,
-          ...payload,
-          ...(contentType !== undefined ? { ContentType: contentType } : {}),
-        }),
-      );
+      const command = new sdk.PutObjectCommand({
+        Bucket: this.#bucket,
+        Key: key,
+        ...payload,
+        ...(contentType !== undefined ? { ContentType: contentType } : {}),
+      });
+      await (signal !== undefined
+        ? sdk.client.send(command, { abortSignal: signal })
+        : sdk.client.send(command));
     } catch (error) {
       throw adapterError('Uploading the object to S3 failed', error, this.#secrets);
     } finally {

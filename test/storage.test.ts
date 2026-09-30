@@ -185,6 +185,27 @@ test('an empty string, a URL of another scheme, and a value of any other kind re
   expect(provider.calls).toEqual([]);
 });
 
+test('a URL of another scheme is named with the article its sound takes', async () => {
+  const provider = recordingProvider();
+  const cases: Array<[string, string]> = [
+    ['ftp://files.example/a.png', 'an ftp:'],
+    ['sftp://files.example/a.png', 'an sftp:'],
+    ['s3://bucket/a.png', 'an s3:'],
+    ['ws://example.com/socket', 'a ws:'],
+    ['data:text/plain,x', 'a data:'],
+    ['blob:https://example.com/0f3c', 'a blob:'],
+    ['about:blank', 'an about:'],
+    ['mailto:someone@example.com', 'a mailto:'],
+  ];
+  for (const [url, named] of cases) {
+    const error = await rejection(normalizeAsset(new URL(url), provider));
+    expect(error.message).toBe(
+      `The input is ${named} URL: DGR reads http(s) URLs, and a file: URL names a local file to upload.`,
+    );
+  }
+  expect(provider.calls).toEqual([]);
+});
+
 test('a file: URL naming no existing file rejects invalid_argument', async () => {
   const missing = pathToFileURL(join(dir, 'missing.png'));
   const error = await rejection(normalizeAsset(missing, recordingProvider()));

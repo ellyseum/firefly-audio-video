@@ -28,11 +28,11 @@ export type {
   TemplateDescription,
   TemplateFont,
 } from './dgr/describe.js';
-export type { TemplateSource } from './dgr/render.js';
 
 export type {
   RenderSpec,
   RenderRequest,
+  TemplateSource,
   RenderRequestOutput,
   RenderOutput,
   RenderVariable,

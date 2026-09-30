@@ -79,12 +79,17 @@ export function checkExpiry(value: unknown, where: string, max: number, min = 1)
 
 /**
  * @internal Reads a stage input as an upload body. A provider uploads local
- * bytes, so an http(s) URL is refused: DGR can read it as it is.
+ * bytes, so an http(s) URL is refused: DGR can read it as it is. A failure to
+ * read a file is scrubbed of `secrets`, as {@link adapterError} does.
  *
  * @throws {@link AudioVideoError} `invalid_argument` for an http(s) URL, or
  *   anything `normalizeAsset` refuses.
  */
-export async function uploadBody(input: StageInput, provider: string): Promise<UploadBody> {
+export async function uploadBody(
+  input: StageInput,
+  provider: string,
+  secrets: readonly string[] = [],
+): Promise<UploadBody> {
   const asset = await classifyAsset(input);
   if (asset.kind === 'url') {
     throw invalidOption(
@@ -98,19 +103,23 @@ export async function uploadBody(input: StageInput, provider: string): Promise<U
   try {
     return { kind: 'file', path: value, size: (await stat(value)).size };
   } catch (error) {
-    throw adapterError('Reading the input file failed', error);
+    throw adapterError('Reading the input file failed', error, secrets);
   }
 }
 
-/** @internal Reads a stream to its end into one `Buffer`, for an upload that needs the length first. */
-export async function readAll(stream: Readable): Promise<Buffer> {
+/**
+ * @internal Reads a stream to its end into one `Buffer`, for an upload that
+ * needs the length first. A failure is scrubbed of `secrets`, as
+ * {@link adapterError} does.
+ */
+export async function readAll(stream: Readable, secrets: readonly string[] = []): Promise<Buffer> {
   const chunks: Buffer[] = [];
   try {
     for await (const chunk of stream) {
       chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string | Uint8Array));
     }
   } catch (error) {
-    throw adapterError('Reading the input stream failed', error);
+    throw adapterError('Reading the input stream failed', error, secrets);
   }
   return Buffer.concat(chunks);
 }

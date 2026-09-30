@@ -72,15 +72,21 @@ afterEach(() => {
   );
 });
 
-/** A fake S3 client: records every command, reads a streamed body to its end, and answers `answer`. */
+/**
+ * A fake S3 client: records every command and the options it was sent with,
+ * reads a streamed body to its end, and answers `answer`.
+ */
 function fakeClient(answer: (command: object) => Promise<unknown> = async () => ({})) {
   const sent: object[] = [];
+  const options: unknown[] = [];
   const bodies: string[] = [];
   return {
     sent,
+    options,
     bodies,
-    async send(command: object): Promise<unknown> {
+    async send(command: object, sendOptions?: { abortSignal?: AbortSignal }): Promise<unknown> {
       sent.push(command);
+      options.push(sendOptions);
       const body = (command as { input?: { Body?: unknown } }).input?.Body;
       if (body instanceof Readable) {
         const chunks: Buffer[] = [];
@@ -117,8 +123,8 @@ function recordingClientClass(client: S3ClientLike) {
     constructor(config: unknown) {
       configs.push(config);
     }
-    send(command: object): Promise<unknown> {
-      return client.send(command);
+    send(command: object, options?: { abortSignal?: AbortSignal }): Promise<unknown> {
+      return client.send(command, options);
     }
   }
   return { configs, RecordingS3Client };
@@ -159,13 +165,19 @@ async function bodyText(body: unknown): Promise<string> {
 /**
  * The real `@aws-sdk/client-s3` module whose `S3Client` keeps every setting
  * the provider gives it but sends its requests to a recording handler that
- * answers 200, never to the network.
+ * answers 200, never to the network. `handlerOptions` holds what the SDK
+ * handed the handler alongside each request.
  */
 function offlineSdk() {
   const requests: SentRequest[] = [];
+  const handlerOptions: Array<{ abortSignal?: unknown } | undefined> = [];
   const requestHandler = {
-    async handle(request: Omit<SentRequest, 'body'> & { body?: unknown }) {
+    async handle(
+      request: Omit<SentRequest, 'body'> & { body?: unknown },
+      options?: { abortSignal?: unknown },
+    ) {
       const { method, hostname, path, headers } = request;
+      handlerOptions.push(options);
       requests.push({ method, hostname, path, headers, body: await bodyText(request.body) });
       return { response: { statusCode: 200, headers: {}, body: Readable.from([]) } };
     },
@@ -175,7 +187,7 @@ function offlineSdk() {
       super({ ...config, requestHandler });
     }
   }
-  return { requests, module: { ...s3Sdk, S3Client: OfflineS3Client } };
+  return { requests, handlerOptions, module: { ...s3Sdk, S3Client: OfflineS3Client } };
 }
 
 /** The `AudioVideoError` a promise rejects with. */
@@ -303,6 +315,36 @@ test('a Readable is read in full and sent as bytes with its length', async () =>
   expect(Buffer.isBuffer(put.input.Body)).toBe(true);
   expect(put.input.ContentLength).toBe(5);
   expect(client.bodies).toEqual(['parts']);
+});
+
+test('stageRead hands its signal to the PutObject as the abortSignal, which the real SDK passes to its request handler', async () => {
+  const client = fakeClient();
+  const controller = new AbortController();
+  const provider = new S3StorageProvider({
+    bucket: BUCKET,
+    client,
+    presigner: fakePresigner().module,
+    s3: s3Module(client).module,
+  });
+  await provider.stageRead(Buffer.from('x'), { signal: controller.signal });
+  await provider.stageRead(Buffer.from('y'));
+  const [withSignal, withoutSignal] = client.options as Array<
+    { abortSignal?: unknown } | undefined
+  >;
+  expect(client.options).toHaveLength(2);
+  expect(withSignal?.abortSignal).toBe(controller.signal);
+  expect(withoutSignal).toBeUndefined();
+
+  const offline = offlineSdk();
+  await new S3StorageProvider({
+    bucket: BUCKET,
+    region: 'us-east-1',
+    credentials: CREDENTIALS,
+    s3: offline.module,
+    presigner: presignerSdk,
+  }).stageRead(Buffer.from('x'), { signal: controller.signal });
+  expect(offline.handlerOptions).toHaveLength(1);
+  expect(offline.handlerOptions[0]?.abortSignal).toBe(controller.signal);
 });
 
 // --- allocateOutput ---------------------------------------------------------------------
@@ -799,6 +841,33 @@ test('a missing AWS SDK package rejects missing_peer_dependency naming both pack
   );
   expect(presignerOnly.message).toContain('needs @aws-sdk/s3-request-presigner');
   expect(presignerOnly.message).toContain('the presigner option');
+});
+
+test('an AWS SDK package that is installed but fails to load names the option that takes it, with the loader error redacted', async () => {
+  const actual =
+    await vi.importActual<typeof import('../src/storage/peer.js')>('../src/storage/peer.js');
+  vi.mocked(loadPeer).mockImplementation((peer: Peer) =>
+    actual.loadPeer(peer, () =>
+      Promise.reject(new Error('refused at https://x.example/sdk.js?sig=LOAD_SIG_LEAK')),
+    ),
+  );
+  const s3 = await rejection(new S3StorageProvider({ bucket: BUCKET }).stageRead(Buffer.from('x')));
+  expect(s3.code).toBe('storage_failed');
+  expect(s3.message).toBe(
+    'Loading @aws-sdk/client-s3 for S3StorageProvider failed (Error: refused at ' +
+      'https://x.example/sdk.js). Pass the module as the s3 option instead: a module passed in ' +
+      'needs no run-time import.',
+  );
+
+  const presigner = await rejection(
+    new S3StorageProvider({ bucket: BUCKET, s3: s3Module(fakeClient()).module }).allocateOutput(),
+  );
+  expect(presigner.message).toContain(
+    'Loading @aws-sdk/s3-request-presigner for S3StorageProvider',
+  );
+  expect(presigner.message).toContain('Pass the module as the presigner option instead');
+  for (const error of [s3, presigner])
+    expect(everythingPrinted(error)).not.toContain('LOAD_SIG_LEAK');
 });
 
 test('a failed load is retried on the next call', async () => {

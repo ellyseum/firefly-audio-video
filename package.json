@@ -47,7 +47,7 @@
     }
   },
   "bin": {
-    "dgr": "./dist/cli.cjs"
+    "dgr": "dist/cli.cjs"
   },
   "files": [
     "dist"
@@ -121,7 +121,7 @@
     "vitest": "^5.0.2"
   },
   "lint-staged": {
-    "*.{ts,js,json,md}": [
+    "*.{ts,js,mjs,json,md,yml,yaml}": [
       "prettier --write"
     ],
     "*.ts": [

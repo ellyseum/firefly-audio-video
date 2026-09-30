@@ -12,8 +12,8 @@ import type { Readable } from 'node:stream';
 import { resolveAsset, type Asset, type ResolveAs } from '../core/asset.js';
 import { resolveTokenProvider, type TokenProvider } from '../core/auth.js';
 import { AudioVideoError } from '../core/errors.js';
-import { HttpClient } from '../core/http.js';
-import { redactValue } from '../core/redact.js';
+import { HttpClient, hostOrigin } from '../core/http.js';
+import { redactError } from '../core/redact.js';
 import {
   runJob,
   type AsyncJob,
@@ -564,7 +564,7 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
     if (maxRetries !== undefined && !(Number.isInteger(maxRetries) && maxRetries >= 0)) {
       throw invalidArgument('retry.maxRetries must be an integer >= 0.');
     }
-    if (config.host !== undefined) checkHost(config.host);
+    if (config.host !== undefined) hostOrigin(config.host);
     if (config.storage !== undefined && !isStorageProvider(config.storage)) {
       throw invalidArgument('storage must implement stageRead() and allocateOutput().');
     }
@@ -942,8 +942,10 @@ function settleFields(
 /**
  * Everything a single-request call promises to reject with: an
  * {@link AudioVideoError} unchanged, or anything else — a raw fetch failure,
- * an abort reason `HttpClient` does not wrap — as one. `code` is
- * `'cancelled'` when `signal` is why it failed, else `'request_failed'`.
+ * an abort reason `HttpClient` does not wrap — as one, whose `cause` is a
+ * redacted copy of the original ({@link redactError}), never the original
+ * itself. `code` is `'cancelled'` when `signal` is why it failed, else
+ * `'request_failed'`.
  */
 function publicFailure(error: unknown, signal: AbortSignal | undefined): AudioVideoError {
   if (error instanceof AudioVideoError) return error;
@@ -951,23 +953,8 @@ function publicFailure(error: unknown, signal: AbortSignal | undefined): AudioVi
   return new AudioVideoError({
     message: aborted ? 'The request was cancelled.' : 'The request failed.',
     code: aborted ? 'cancelled' : 'request_failed',
-    cause: sanitizedCause(error),
+    cause: redactError(error),
   });
-}
-
-/**
- * A redacted stand-in for a rejection's `cause`: a new `Error` carrying the
- * original's `name` and `code` (when it has one) and a message with every
- * embedded URL redacted — never the original error itself, which may still
- * be holding an unredacted URL or secret.
- */
-function sanitizedCause(error: unknown): Error {
-  const original = error instanceof Error ? error : new Error(String(error));
-  const sanitized = new Error(redactValue(original.message));
-  sanitized.name = original.name;
-  const code = (original as Error & { code?: unknown }).code;
-  if (typeof code === 'string') (sanitized as Error & { code?: string }).code = code;
-  return sanitized;
 }
 
 /** Checks a `resolveAs` value a caller outside TypeScript may have passed. */
@@ -1019,18 +1006,6 @@ function authFor(config: ClientConfig, clientId: string): TokenProvider {
     clientSecret,
     ...(normalized !== undefined ? { scope: normalized } : {}),
   });
-}
-
-function checkHost(host: unknown): void {
-  let url: URL | undefined;
-  try {
-    url = typeof host === 'string' ? new URL(host) : undefined;
-  } catch {
-    url = undefined;
-  }
-  if (url === undefined || (url.protocol !== 'https:' && url.protocol !== 'http:')) {
-    throw invalidArgument('host must be an http(s) URL, e.g. https://audio-video-api.adobe.io.');
-  }
 }
 
 function isStorageProvider(value: unknown): value is StorageProvider {

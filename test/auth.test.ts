@@ -477,11 +477,58 @@ test('a mint IMS has not answered within MINT_TIMEOUT_MS rejects every waiter au
   }
 });
 
-test('a call made while a timed-out mint is still pending waits on it, under its own bound, rather than starting another', async () => {
+test('a call made once a pending mint has passed its time-box starts a fresh mint and is served by it', async () => {
   useFakeClock();
+  const authenticate = vi.spyOn(ServerToServerTokenProvider.prototype, 'authenticate');
   const held = deferred();
-  ims.token('LATE_TOKEN', { hold: held.promise });
-  ims.token('TOKEN_2');
+  const now = Math.floor(Date.now() / 1000);
+  const older = fakeJwt({ exp: now + 3_600 });
+  const newer = fakeJwt({ exp: now + 7_200 });
+  ims.token(older, { hold: held.promise });
+  ims.token(newer);
+  const provider = new ClientCredentialsProvider(CREDS);
+
+  try {
+    const first = track(provider.getAccessToken());
+    await until(() => ims.requests.length === 1);
+
+    // One millisecond inside the time-box, a call still joins the pending mint.
+    await vi.advanceTimersByTimeAsync(MINT_TIMEOUT_MS - 1);
+    const joined = track(provider.getAccessToken());
+    await flush();
+    expect(ims.requests).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await until(() => first.state === 'rejected');
+    expect((first.error as AudioVideoError).code).toBe('auth_failed');
+    // The joined caller's own 30 s run from when it joined.
+    expect(joined.state).toBe('pending');
+
+    // Past the time-box: a fresh mint, and this call is served by it.
+    await expect(provider.getAccessToken()).resolves.toBe(newer);
+    expect(ims.requests).toHaveLength(2);
+
+    // The hung mint answers only now, with a token that expires sooner: the newer one stays cached.
+    held.resolve();
+    await expect(authenticate.mock.results[0]?.value).resolves.toBe(older);
+    await until(() => joined.state === 'fulfilled');
+    expect(joined.value).toBe(older);
+    await expect(provider.getAccessToken()).resolves.toBe(newer);
+    expect(ims.requests).toHaveLength(2);
+  } finally {
+    held.resolve();
+  }
+});
+
+test('a hung mint that answers later with a token that expires later replaces the cached one', async () => {
+  useFakeClock();
+  const authenticate = vi.spyOn(ServerToServerTokenProvider.prototype, 'authenticate');
+  const held = deferred();
+  const now = Math.floor(Date.now() / 1000);
+  const later = fakeJwt({ exp: now + 7_200 });
+  const sooner = fakeJwt({ exp: now + 3_600 });
+  ims.token(later, { hold: held.promise });
+  ims.token(sooner);
   const provider = new ClientCredentialsProvider(CREDS);
 
   try {
@@ -489,29 +536,82 @@ test('a call made while a timed-out mint is still pending waits on it, under its
     await until(() => ims.requests.length === 1);
     await vi.advanceTimersByTimeAsync(MINT_TIMEOUT_MS);
     await until(() => first.state === 'rejected');
+    await expect(provider.getAccessToken()).resolves.toBe(sooner);
 
-    // Joins the pending mint: no second request, and its own 30 s from now.
-    const second = track(provider.getAccessToken());
-    await flush();
-    expect(ims.requests).toHaveLength(1);
-    await vi.advanceTimersByTimeAsync(MINT_TIMEOUT_MS - 1);
-    await flush();
-    expect(second.state).toBe('pending');
-    await vi.advanceTimersByTimeAsync(1);
-    await until(() => second.state === 'rejected');
-    expect((second.error as AudioVideoError).code).toBe('auth_failed');
-
-    // Still no second mint; the late answer serves the caller waiting now.
-    const third = track(provider.getAccessToken({ forceRefresh: true }));
-    await flush();
-    expect(ims.requests).toHaveLength(1);
     held.resolve();
-    await until(() => third.state === 'fulfilled');
-    expect(third.value).toBe('LATE_TOKEN');
-    expect(ims.requests).toHaveLength(1);
+    await expect(authenticate.mock.results[0]?.value).resolves.toBe(later);
+    await flush();
+    await expect(provider.getAccessToken()).resolves.toBe(later);
+    expect(ims.requests).toHaveLength(2);
   } finally {
     held.resolve();
   }
+});
+
+test('with two mints pending past their time-boxes, a call waits on the newer one instead of starting a third', async () => {
+  useFakeClock();
+  const firstHeld = deferred();
+  const secondHeld = deferred();
+  ims.token('TOKEN_1', { hold: firstHeld.promise });
+  ims.token('TOKEN_2', { hold: secondHeld.promise });
+  ims.token('TOKEN_3');
+  const provider = new ClientCredentialsProvider(CREDS);
+
+  try {
+    const a = track(provider.getAccessToken());
+    await until(() => ims.requests.length === 1);
+    await vi.advanceTimersByTimeAsync(MINT_TIMEOUT_MS);
+    await until(() => a.state === 'rejected');
+
+    const b = track(provider.getAccessToken());
+    await until(() => ims.requests.length === 2);
+    await vi.advanceTimersByTimeAsync(MINT_TIMEOUT_MS);
+    await until(() => b.state === 'rejected');
+
+    const c = track(provider.getAccessToken());
+    await flush();
+    expect(ims.requests).toHaveLength(2);
+    secondHeld.resolve();
+    await until(() => c.state === 'fulfilled');
+    expect(c.value).toBe('TOKEN_2');
+    expect(ims.requests).toHaveLength(2);
+  } finally {
+    firstHeld.resolve();
+    secondHeld.resolve();
+  }
+});
+
+test('a forced refresh caches its token even when it expires before the token it replaces', async () => {
+  useFakeClock();
+  const now = Math.floor(Date.now() / 1000);
+  const refused = fakeJwt({ exp: now + 7_200 });
+  const replacement = fakeJwt({ exp: now + 3_600 });
+  ims.token(refused);
+  ims.token(replacement);
+  const provider = new ClientCredentialsProvider(CREDS);
+
+  await expect(provider.getAccessToken()).resolves.toBe(refused);
+  await expect(provider.getAccessToken({ forceRefresh: true })).resolves.toBe(replacement);
+  await expect(provider.getAccessToken()).resolves.toBe(replacement);
+  expect(ims.requests).toHaveLength(2);
+});
+
+test('a token due for refresh gives way to its replacement even when the replacement expires sooner', async () => {
+  useFakeClock();
+  const now = Math.floor(Date.now() / 1000);
+  const due = fakeJwt({ exp: now + 120 }); // refresh point: 60 s from now
+  const replacement = fakeJwt({ exp: now + 100 });
+  ims.token(due);
+  ims.token(replacement);
+  ims.token('TOKEN_3');
+  const provider = new ClientCredentialsProvider(CREDS);
+
+  await expect(provider.getAccessToken()).resolves.toBe(due);
+  await vi.advanceTimersByTimeAsync(61_000);
+  await expect(provider.getAccessToken()).resolves.toBe(replacement);
+  // Served again from the cache, without a third request.
+  await expect(provider.getAccessToken()).resolves.toBe(replacement);
+  expect(ims.requests).toHaveLength(2);
 });
 
 test('a late answer that fails token validation is not cached, and the next call starts a fresh mint', async () => {

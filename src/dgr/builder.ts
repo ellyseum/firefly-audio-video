@@ -10,7 +10,7 @@ import type { Asset, AssetReadOptions } from '../core/asset.js';
 import { AudioVideoError } from '../core/errors.js';
 import type { JobMeta, JobStatusLike, PollInterval } from '../core/job.js';
 import { rejectedJob, type JobHandle } from '../core/pooled-job.js';
-import { anySignal } from '../core/signals.js';
+import { linkSignals } from '../core/signals.js';
 import { PRESET_NAMES } from '../presets/names.js';
 import type { Client, RenderJob } from './client.js';
 import { Preset, toPreset, type PresetInput, type ResizeTarget } from './preset.js';
@@ -26,7 +26,13 @@ import type {
 
 /** Options for a fluent `render(source, options)`. */
 export interface RenderBuilderOptions {
-  /** Runs this render on `client` rather than the default client (or the client whose `render()` was called). */
+  /**
+   * Runs this render on `client` rather than the default client (or the
+   * client whose `render()` was called). It is read when the render starts:
+   * a value that is not a client from `createClient()` rejects the render
+   * `invalid_argument` then, and writes no log record, since the builder logs
+   * through the client it runs on and none exists.
+   */
   client?: Client;
   /**
    * Cancels the render when it aborts: before the job is submitted nothing is
@@ -116,7 +122,9 @@ export interface FluentRenderer {
 /**
  * @internal A builder for `source`. `resolve` is called when the render
  * starts — never before — and names the client it runs on; a throw from it
- * rejects the render.
+ * (`invalid_argument` for a `{ client }` that is not a client) rejects the
+ * render with that error and logs nothing: the builder logs only through the
+ * client `resolve` returns, and there is none to log on.
  */
 export function createRenderBuilder(
   source: TemplateSource,
@@ -195,7 +203,7 @@ class FluentRender implements Omit<RenderBuilder, PresetName> {
   }
 
   buffer(options?: AssetReadOptions): Promise<Buffer> {
-    return this.#started().then((asset) => asset.buffer(this.#readOptions(options)));
+    return this.#started().then((asset) => this.#read(options, (read) => asset.buffer(read)));
   }
 
   stream(options?: AssetReadOptions): Readable {
@@ -203,7 +211,7 @@ class FluentRender implements Omit<RenderBuilder, PresetName> {
   }
 
   save(path: string, options?: AssetReadOptions): Promise<void> {
-    return this.#started().then((asset) => asset.save(path, this.#readOptions(options)));
+    return this.#started().then((asset) => this.#read(options, (read) => asset.save(path, read)));
   }
 
   resize(target: ResizeTarget): RenderBuilder {
@@ -319,20 +327,44 @@ class FluentRender implements Omit<RenderBuilder, PresetName> {
 
   async *#chunks(options: AssetReadOptions | undefined): AsyncGenerator<Buffer> {
     const asset = await this.#started();
-    yield* asset.stream(this.#readOptions(options));
+    const link = this.#readLink(options);
+    try {
+      yield* asset.stream(link.options);
+    } finally {
+      link.release();
+    }
+  }
+
+  /** Runs one terminal's read under {@link FluentRender.#readLink}, releasing the link once the read settles. */
+  async #read<V>(
+    options: AssetReadOptions | undefined,
+    read: (options: AssetReadOptions) => Promise<V>,
+  ): Promise<V> {
+    const link = this.#readLink(options);
+    try {
+      return await read(link.options);
+    } finally {
+      link.release();
+    }
   }
 
   /**
    * The options a terminal's underlying `Asset` read observes: a signal that
    * fires with whichever of the caller's own signal, this builder's `signal`
    * option, and this builder's own `cancel()` fires first, and the caller's
-   * `retries`.
+   * `retries`. The signal's listeners on those signals go once it aborts or
+   * `release` is called, which the terminal does when its read is over: the
+   * caller's signals can outlive the read by far.
    */
-  #readOptions(options: AssetReadOptions | undefined): AssetReadOptions {
+  #readLink(options: AssetReadOptions | undefined): {
+    options: AssetReadOptions;
+    release: () => void;
+  } {
     const signals = [this.#reading.signal, this.#options.signal, options?.signal].filter(
       (signal): signal is AbortSignal => signal !== undefined,
     );
-    return { signal: anySignal(signals), retries: options?.retries };
+    const { signal, release } = linkSignals(signals);
+    return { options: { signal, retries: options?.retries }, release };
   }
 
   static {

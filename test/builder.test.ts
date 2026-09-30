@@ -1,3 +1,4 @@
+import { getEventListeners } from 'node:events';
 import { existsSync, mkdtempSync, readFileSync, rmdirSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -74,6 +75,21 @@ async function rejection(promise: PromiseLike<unknown>): Promise<AudioVideoError
     return error as AudioVideoError;
   }
   throw new Error('expected a rejection');
+}
+
+/** Runs `body` with `AbortSignal.any` missing, as on Node before 18.17 and 20.3. */
+async function withoutAbortSignalAny(body: () => Promise<void>): Promise<void> {
+  const native = Object.getOwnPropertyDescriptor(AbortSignal, 'any');
+  Object.defineProperty(AbortSignal, 'any', {
+    value: undefined,
+    configurable: true,
+    writable: true,
+  });
+  try {
+    await body();
+  } finally {
+    if (native !== undefined) Object.defineProperty(AbortSignal, 'any', native);
+  }
 }
 
 test('a fluent render resolves an Asset through allocateOutput: the write URL goes to DGR, the read URL becomes asset.url', async () => {
@@ -228,6 +244,30 @@ test('.buffer(), .save() and .stream() hand their retries option to the asset re
   }
   expect(existsSync(path)).toBe(false);
   rmdirSync(dir);
+});
+
+test('finished .buffer() and .stream() reads leave no listener on the builder or read signals, on a Node without AbortSignal.any too', async () => {
+  await withoutAbortSignalAny(async () => {
+    jobsSucceed('job-listeners');
+    api.download('/out/', BYTES);
+    const signals = {
+      builder: new AbortController().signal,
+      buffer: new AbortController().signal,
+      stream: new AbortController().signal,
+    };
+    const builder = client().render(CAPSULE, { pollIntervalMs: 0, signal: signals.builder }).prores;
+
+    expect(Buffer.compare(await builder.buffer({ signal: signals.buffer }), BYTES)).toBe(0);
+    const chunks: Buffer[] = [];
+    for await (const chunk of builder.stream({ signal: signals.stream })) {
+      chunks.push(chunk as Buffer);
+    }
+    expect(Buffer.compare(Buffer.concat(chunks), BYTES)).toBe(0);
+
+    for (const [name, signal] of Object.entries(signals)) {
+      expect.soft(getEventListeners(signal, 'abort'), `${name} signal`).toHaveLength(0);
+    }
+  });
 });
 
 test('.save() creates its destination directory, the same as Asset.save', async () => {

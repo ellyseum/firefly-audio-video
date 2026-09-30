@@ -6,6 +6,7 @@ import { inspect } from 'node:util';
 import { afterAll, afterEach, beforeAll, beforeEach, expect, expectTypeOf, test } from 'vitest';
 import { Asset } from '../src/core/asset.js';
 import { AudioVideoError } from '../src/core/errors.js';
+import { HttpClient } from '../src/core/http.js';
 import { InMemoryPool } from '../src/core/pool.js';
 import type { RenderBuilder } from '../src/dgr/builder.js';
 import {
@@ -607,6 +608,32 @@ test('a host carrying user credentials is refused when the client is created, wi
   expect(error.code).toBe('invalid_argument');
   expect(error.message).not.toContain('HOST_PASS');
 });
+
+test.each<[label: string, host: unknown]>([
+  ['that is not a URL', 'audio-video-api.adobe.io'],
+  ['that is not http(s)', 'ftp://files.example'],
+  ['carrying user credentials', 'https://svc:HOST_PASS@audio-video-api.adobe.io'],
+  ['that is not a string', 42],
+])(
+  "a host %s is refused by createClient with HttpClient's own error, ahead of the storage check",
+  (_label, host) => {
+    const fromHttp = thrown(
+      () =>
+        new HttpClient({
+          host: host as string,
+          apiKey: 'key',
+          tokenProvider: { getAccessToken: async () => 'token' },
+        }),
+    );
+    const fromClient = thrown(() =>
+      client({ host: host as string, storage: {} as unknown as ClientConfig['storage'] }),
+    );
+
+    expect(fromClient.code).toBe('invalid_argument');
+    expect(fromClient.message).toBe(fromHttp.message);
+    expect(fromClient.message).not.toContain('HOST_PASS');
+  },
+);
 
 test('a spec with thousands of problems rejects invalid_argument naming ten and counting the rest', async () => {
   const outputs = Array.from({ length: 5_000 }, () => ({ bogus: true }));

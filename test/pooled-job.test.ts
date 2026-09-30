@@ -1,3 +1,4 @@
+import { getEventListeners } from 'node:events';
 import { inspect } from 'node:util';
 import { afterAll, afterEach, beforeAll, expect, test } from 'vitest';
 import { AudioVideoError } from '../src/core/errors.js';
@@ -84,6 +85,21 @@ async function rejection(promise: PromiseLike<unknown>): Promise<AudioVideoError
     return error as AudioVideoError;
   }
   throw new Error('expected a rejection');
+}
+
+/** Runs `body` with `AbortSignal.any` missing, as on Node before 18.17 and 20.3. */
+async function withoutAbortSignalAny(body: () => Promise<void>): Promise<void> {
+  const native = Object.getOwnPropertyDescriptor(AbortSignal, 'any');
+  Object.defineProperty(AbortSignal, 'any', {
+    value: undefined,
+    configurable: true,
+    writable: true,
+  });
+  try {
+    await body();
+  } finally {
+    if (native !== undefined) Object.defineProperty(AbortSignal, 'any', native);
+  }
 }
 
 test('a call holds its slot from admission until its job settles, and a rejecting job releases it', async () => {
@@ -384,6 +400,49 @@ test('cancel() while finishing aborts the signal finish received', async () => {
 
   await job.cancel();
   expect((await rejection(job)).code).toBe('cancelled');
+});
+
+test('a call that settles leaves no listener on the caller signal, on a Node without AbortSignal.any too', async () => {
+  await withoutAbortSignalAny(async () => {
+    const controller = new AbortController();
+    let finishSignal: AbortSignal | undefined;
+    const job = runPooledJob({
+      pool: new InMemoryPool(),
+      signal: controller.signal,
+      prepare: () => nothingToStage(() => controlledJob('job-a', Promise.resolve('raw'))),
+      finish: (value, signal) => {
+        finishSignal = signal;
+        return value;
+      },
+    });
+
+    await expect(job).resolves.toBe('raw');
+    expect(finishSignal).not.toBe(controller.signal);
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+  });
+});
+
+test('a caller signal aborting while the call finishes aborts the finish signal, leaving no listener behind', async () => {
+  await withoutAbortSignalAny(async () => {
+    const controller = new AbortController();
+    const reachedFinish = deferred();
+    const job = runPooledJob({
+      pool: new InMemoryPool(),
+      signal: controller.signal,
+      prepare: () => nothingToStage(() => controlledJob('job-a', Promise.resolve('raw'))),
+      finish: (_value, signal) =>
+        new Promise<string>((_resolve, reject) => {
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+          reachedFinish.resolve();
+        }),
+    });
+    await reachedFinish.promise;
+
+    const reason = new Error('caller gave up');
+    controller.abort(reason);
+    await expect(job).rejects.toBe(reason);
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+  });
 });
 
 test('onSettle runs exactly once, after finish, and a throwing onSettle changes nothing', async () => {

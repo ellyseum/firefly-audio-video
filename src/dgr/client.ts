@@ -12,7 +12,7 @@ import type { Readable } from 'node:stream';
 import { resolveAsset, type Asset, type ResolveAs } from '../core/asset.js';
 import { resolveTokenProvider, type TokenProvider } from '../core/auth.js';
 import { AudioVideoError } from '../core/errors.js';
-import { HttpClient } from '../core/http.js';
+import { HttpClient, hostOrigin } from '../core/http.js';
 import { redactValue } from '../core/redact.js';
 import {
   runJob,
@@ -533,7 +533,7 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
     if (maxRetries !== undefined && !(Number.isInteger(maxRetries) && maxRetries >= 0)) {
       throw invalidArgument('retry.maxRetries must be an integer >= 0.');
     }
-    if (config.host !== undefined) checkHost(config.host);
+    if (config.host !== undefined) hostOrigin(config.host);
     if (config.storage !== undefined && !isStorageProvider(config.storage)) {
       throw invalidArgument('storage must implement stageRead() and allocateOutput().');
     }
@@ -982,18 +982,6 @@ function authFor(config: ClientConfig, clientId: string): TokenProvider {
     clientSecret,
     ...(normalized !== undefined ? { scope: normalized } : {}),
   });
-}
-
-function checkHost(host: unknown): void {
-  let url: URL | undefined;
-  try {
-    url = typeof host === 'string' ? new URL(host) : undefined;
-  } catch {
-    url = undefined;
-  }
-  if (url === undefined || (url.protocol !== 'https:' && url.protocol !== 'http:')) {
-    throw invalidArgument('host must be an http(s) URL, e.g. https://audio-video-api.adobe.io.');
-  }
 }
 
 function isStorageProvider(value: unknown): value is StorageProvider {

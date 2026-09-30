@@ -284,15 +284,21 @@ export class HttpClient {
 }
 
 /**
- * The origin every request of a client targets. The host must parse as an
- * http(s) URL without user credentials: those belong in the token provider,
- * and a URL carrying them would be sent to, and printed by, everything that
- * reads the request URL.
+ * The origin every request of a client targets — the one host check, shared
+ * by {@link HttpClient}'s constructor and the client's config validation. The
+ * host must be a string that parses as an http(s) URL without user
+ * credentials: those belong in the token provider, and a URL carrying them
+ * would be sent to, and printed by, everything that reads the request URL.
+ *
+ * @throws {@link AudioVideoError} `invalid_argument` naming which of those
+ *   the host fails; the message never repeats the host itself.
+ *
+ * @internal
  */
-function hostOrigin(host: string): string {
+export function hostOrigin(host: unknown): string {
   let url: URL | undefined;
   try {
-    url = new URL(host);
+    url = typeof host === 'string' ? new URL(host) : undefined;
   } catch {
     url = undefined;
   }

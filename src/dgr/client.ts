@@ -167,7 +167,12 @@ export interface ClientConfig {
    * Omitted, a client in an App Builder environment — `__OW_NAMESPACE` or
    * `AIO_runtime_namespace` set — uses an `AioFilesStorageProvider`, and any
    * other client has none. A `storage` given here always wins; pass a
-   * `PassthroughStorageProvider` for a client that must never upload.
+   * `PassthroughStorageProvider` for a client that must never upload. That
+   * automatic provider imports `@adobe/aio-lib-files` by name at run time,
+   * which cannot reach a package webpack has bundled into the action: a
+   * webpack-bundled action passes
+   * `new AioFilesStorageProvider({ module: files })` here, with
+   * `import * as files from '@adobe/aio-lib-files'`.
    */
   storage?: StorageProvider;
   /**

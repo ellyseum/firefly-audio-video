@@ -116,6 +116,11 @@ const MIN_EXPIRY_SECONDS = 2;
  * the App Builder environment is present — `__OW_NAMESPACE` or
  * `AIO_runtime_namespace` is set. An explicit `storage` always wins;
  * configure a `PassthroughStorageProvider` to keep a client from uploading.
+ * The provider chosen automatically imports `@adobe/aio-lib-files` by name at
+ * run time, which cannot reach a package webpack has bundled into the action,
+ * so a webpack-bundled action configures its storage itself and passes the
+ * module: `new AioFilesStorageProvider({ module: files })`, with
+ * `import * as files from '@adobe/aio-lib-files'`.
  *
  * A `Readable` is read into memory before its upload, which needs the length
  * first; stage a large file by its path instead.
@@ -267,7 +272,10 @@ export class AioFilesStorageProvider implements StorageProvider {
 /**
  * @internal The storage a client uses when none is configured: an
  * {@link AioFilesStorageProvider} when the App Builder environment is present
- * (`__OW_NAMESPACE` or `AIO_runtime_namespace` set), else none.
+ * (`__OW_NAMESPACE` or `AIO_runtime_namespace` set), else none. It is given
+ * no `module`, so it imports `@adobe/aio-lib-files` by name at run time; a
+ * webpack-bundled action, where that import cannot reach the bundled
+ * package, configures a provider with `module` itself instead.
  */
 export function appBuilderStorage(
   env: NodeJS.ProcessEnv = process.env,

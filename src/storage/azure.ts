@@ -22,22 +22,22 @@ import {
 export interface AzureBlockBlobClient {
   /** The blob's URL. */
   readonly url: string;
-  /** Uploads bytes held in memory. */
+  /** Uploads bytes held in memory; `abortSignal` stops it. */
   uploadData(
     data: Buffer,
-    options?: { blobHTTPHeaders?: { blobContentType?: string } },
+    options?: { blobHTTPHeaders?: { blobContentType?: string }; abortSignal?: AbortSignal },
   ): Promise<unknown>;
-  /** Uploads a file from disk, in blocks. */
+  /** Uploads a file from disk, in blocks; `abortSignal` stops it. */
   uploadFile(
     filePath: string,
-    options?: { blobHTTPHeaders?: { blobContentType?: string } },
+    options?: { blobHTTPHeaders?: { blobContentType?: string }; abortSignal?: AbortSignal },
   ): Promise<unknown>;
-  /** Uploads a stream of unknown length, in blocks. */
+  /** Uploads a stream of unknown length, in blocks; `abortSignal` stops it. */
   uploadStream(
     stream: Readable,
     bufferSize?: number,
     maxConcurrency?: number,
-    options?: { blobHTTPHeaders?: { blobContentType?: string } },
+    options?: { blobHTTPHeaders?: { blobContentType?: string }; abortSignal?: AbortSignal },
   ): Promise<unknown>;
   /** The blob's URL with a SAS signed by the account key. */
   generateSasUrl(options: {
@@ -239,6 +239,8 @@ export class AzureBlobStorageProvider implements StorageProvider {
   /**
    * Uploads `input` to a new blob — or the blob `opts.key` names under the
    * prefix — and resolves with its URL carrying a read-only SAS.
+   * `opts.signal` goes to the upload as the SDK's `abortSignal`, which stops
+   * it when it aborts; signing takes no signal.
    *
    * @throws {@link AudioVideoError} `invalid_argument` for an input that is
    *   not a local file, a `Buffer` or a `Readable`, or an invalid option;
@@ -247,7 +249,7 @@ export class AzureBlobStorageProvider implements StorageProvider {
    */
   async stageRead(
     input: StageInput,
-    opts: { key?: string; contentType?: string; expiresIn?: number } = {},
+    opts: { key?: string; contentType?: string; expiresIn?: number; signal?: AbortSignal } = {},
   ): Promise<string> {
     const body = await uploadBody(input, NAME);
     const key = objectKey(this.#prefix, opts.key, 'staged', body);
@@ -255,7 +257,7 @@ export class AzureBlobStorageProvider implements StorageProvider {
     const contentType = checkContentType(opts.contentType);
     const sdk = await this.#load();
     const blob = this.#blob(sdk, key);
-    await this.#upload(blob, body, contentType);
+    await this.#upload(blob, body, contentType, opts.signal);
     return this.#sign(sdk, blob, 'r', expiresIn);
   }
 
@@ -348,14 +350,17 @@ export class AzureBlobStorageProvider implements StorageProvider {
     }
   }
 
-  /** Uploads `body` to `blob`: a Buffer in one call, a file or a stream in blocks. */
+  /** Uploads `body` to `blob`, stopped by `signal`: a Buffer in one call, a file or a stream in blocks. */
   async #upload(
     blob: AzureBlockBlobClient,
     body: UploadBody,
     contentType: string | undefined,
+    signal: AbortSignal | undefined,
   ): Promise<void> {
-    const options =
-      contentType !== undefined ? { blobHTTPHeaders: { blobContentType: contentType } } : {};
+    const options = {
+      ...(contentType !== undefined ? { blobHTTPHeaders: { blobContentType: contentType } } : {}),
+      ...(signal !== undefined ? { abortSignal: signal } : {}),
+    };
     try {
       if (body.kind === 'buffer') await blob.uploadData(body.data, options);
       else if (body.kind === 'file') await blob.uploadFile(body.path, options);

@@ -280,6 +280,23 @@ test('a Readable uploads in blocks as the stream it is, never read into memory f
   expect(stream.readableEnded).toBe(false);
 });
 
+test('stageRead hands its signal to every kind of upload as the abortSignal', async () => {
+  const { provider, uploads } = fakeProvider();
+  const controller = new AbortController();
+  const { signal } = controller;
+  await provider.stageRead(Buffer.from('x'), { signal, contentType: 'image/png' });
+  await provider.stageRead(logo, { signal });
+  await provider.stageRead(Readable.from([Buffer.from('x')]), { signal });
+  expect(uploads.map(({ method }) => method)).toEqual(['uploadData', 'uploadFile', 'uploadStream']);
+  expect(uploads[0]?.options).toEqual({
+    blobHTTPHeaders: { blobContentType: 'image/png' },
+    abortSignal: signal,
+  });
+  for (const upload of uploads) {
+    expect((upload.options as { abortSignal?: unknown }).abortSignal).toBe(signal);
+  }
+});
+
 // --- allocateOutput ---------------------------------------------------------------------
 
 test('allocateOutput signs a create-and-write SAS and a read SAS for one blob, for 24 hours, and uploads nothing', async () => {

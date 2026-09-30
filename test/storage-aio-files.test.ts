@@ -201,6 +201,27 @@ test('a file is uploaded from disk under a key that keeps its name', async () =>
   expect(puts[0]?.headers['content-type']).toBeUndefined();
 });
 
+test('stageRead hands its signal to the upload: once it has aborted, nothing reaches the store and the reason is the rejection', async () => {
+  blobStore();
+  const files = fakeFiles();
+  const controller = new AbortController();
+  const reason = new AudioVideoError({
+    message: 'The job was cancelled before it was submitted.',
+    code: 'cancelled',
+  });
+  controller.abort(reason);
+
+  const error = await rejection(
+    new AioFilesStorageProvider({ files }).stageRead(Buffer.from('x'), {
+      signal: controller.signal,
+    }),
+  );
+
+  expect(error).toBe(reason);
+  expect(puts).toEqual([]);
+  expect(files.calls.map((call) => call.options.permissions)).toEqual(['rw']);
+});
+
 test('a Readable is read in full and uploaded in one PUT', async () => {
   blobStore();
   const files = fakeFiles();

@@ -32,10 +32,13 @@ export type StageInput = Buffer | Readable | URL | string;
  * admitted and just before it is submitted, so a staged URL is fresh when
  * DGR is sent it however long the job queued. Each call's options carry a
  * `signal` that aborts when the render is cancelled, or its caller's signal
- * aborts, before the submit; pass it to the transport so the upload stops. A
- * provider that ignores it cannot hold the call hostage: the call stops
- * waiting the moment the signal aborts, releases its slot to the next queued
- * job and rejects `cancelled`, while the ignored upload runs on unseen.
+ * aborts, before the submit; pass it to the transport so the upload stops.
+ * The built-in providers do: `AioFilesStorageProvider` to its upload's
+ * `fetch`, `S3StorageProvider` and `AzureBlobStorageProvider` to their SDK's
+ * `abortSignal` on the upload; presigning and signing take none. A provider
+ * that ignores the signal cannot hold the call hostage: the call stops
+ * waiting the moment it aborts, releases its slot to the next queued job and
+ * rejects `cancelled`, while the ignored upload runs on unseen.
  *
  * @example
  * ```ts

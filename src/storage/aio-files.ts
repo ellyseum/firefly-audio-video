@@ -171,6 +171,8 @@ export class AioFilesStorageProvider implements StorageProvider {
   /**
    * Uploads `input` to a new object — or the object `opts.key` names under
    * the prefix — and resolves with a presigned URL DGR can read it from.
+   * `opts.signal` goes to the upload's `fetch`, which stops when it aborts
+   * and rejects with its reason; presigning takes no signal.
    *
    * @throws {@link AudioVideoError} `invalid_argument` for an input that is
    *   not a local file, a `Buffer` or a `Readable`, or an invalid option;
@@ -180,7 +182,7 @@ export class AioFilesStorageProvider implements StorageProvider {
    */
   async stageRead(
     input: StageInput,
-    opts: { key?: string; contentType?: string; expiresIn?: number } = {},
+    opts: { key?: string; contentType?: string; expiresIn?: number; signal?: AbortSignal } = {},
   ): Promise<string> {
     const body = await uploadBody(input, NAME);
     const key = objectKey(this.#prefix, opts.key, 'staged', body);
@@ -189,7 +191,7 @@ export class AioFilesStorageProvider implements StorageProvider {
     const payload = await payloadOf(body);
     const files = await this.#client();
     const uploadUrl = await presign(files, key, 'rw', expiresIn);
-    await putBlob(uploadUrl, payload, contentType);
+    await putBlob(uploadUrl, payload, contentType, opts.signal);
     return presign(files, key, 'r', expiresIn);
   }
 
@@ -339,11 +341,15 @@ async function presign(
   return url;
 }
 
-/** `PUT`s `payload` to a presigned Azure blob URL as a block blob; anything but `201` is a failure. */
+/**
+ * `PUT`s `payload` to a presigned Azure blob URL as a block blob, stopping
+ * when `signal` aborts; anything but `201` is a failure.
+ */
 async function putBlob(
   url: string,
   payload: Blob | Buffer,
   contentType: string | undefined,
+  signal: AbortSignal | undefined,
 ): Promise<void> {
   let res: Response;
   try {
@@ -355,6 +361,7 @@ async function putBlob(
       },
       body: payload,
       redirect: 'manual',
+      ...(signal !== undefined ? { signal } : {}),
     });
   } catch (error) {
     throw adapterError('Uploading the object failed before a response arrived', error);

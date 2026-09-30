@@ -831,7 +831,6 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
     });
   }
 
-  /** Runs one single-request call and logs exactly one record when it settles. */
   /**
    * Runs one single-request call and logs exactly one record when it
    * settles. Anything `run` throws that is not already an

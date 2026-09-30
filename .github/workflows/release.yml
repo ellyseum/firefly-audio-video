@@ -1,0 +1,155 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Runs on every push and pull request, independent of the flags below: it
+  # proves the package.json "files" allowlist still produces exactly the
+  # public surface — the built dist/, LICENSE, README.md and package.json —
+  # and nothing from the development tree.
+  dry-run-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run build
+      - run: node scripts/verify-pack-contents.mjs
+
+  # Maintains the release PR from conventional commits and, on merge, tags
+  # and creates the GitHub Release. Runs only for pushes: on a pull request
+  # there is no default-branch history yet for it to act on.
+  release-please:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      version: ${{ steps.release.outputs.version }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - id: release
+        uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # Gates the `next` channel: an untested commit never reaches npm. Skipped
+  # while publishing is disabled, since nothing downstream can run anyway.
+  verify:
+    if: github.event_name == 'push' && vars.PUBLISH_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - run: node scripts/runtime-smoke.mjs
+
+  # Reads whether the package has ever shipped a stable @latest version, so
+  # the very first publish is always the 0.1.0 release rather than a
+  # prerelease landing ahead of it. Read-only and unauthenticated.
+  check-npm-tag:
+    if: github.event_name == 'push' && vars.PUBLISH_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      has-latest: ${{ steps.check.outputs.has-latest }}
+    steps:
+      - id: check
+        run: |
+          if npm view firefly-audio-video@latest version >/dev/null 2>&1; then
+            echo "has-latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has-latest=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no @latest version exists on npm yet — the next channel is skipped until the first stable release ships"
+          fi
+
+  # Publishes the stable release to the default npm dist-tag (`latest`) the
+  # moment release-please tags one, with provenance and no long-lived token.
+  publish-latest:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true' && vars.PUBLISH_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+      url: https://www.npmjs.com/package/firefly-audio-video/v/${{ needs.release-please.outputs.version }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: '.nvmrc'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+      - run: npm ci
+      - run: npm run build
+      - run: npm publish --provenance --access public
+        env:
+          # Set only for the one-time bootstrap publish, before a npm
+          # trusted publisher exists for this package; npm tries OIDC first
+          # and only falls back to this token when OIDC is not configured,
+          # so leaving the reference in place is inert once the secret is
+          # deleted. No other npm secret may appear in this workflow.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}
+
+  # Publishes every green push to main that is not itself a release commit
+  # to the `next` dist-tag, so a dependent can track main without waiting
+  # for a release PR. Never moves a dist-tag; @next simply catches up again
+  # on the push after a stable release.
+  publish-next:
+    needs: [release-please, verify, check-npm-tag]
+    if: >-
+      vars.PUBLISH_ENABLED == 'true' &&
+      needs.release-please.outputs.release_created != 'true' &&
+      needs.check-npm-tag.outputs.has-latest == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: npm-next
+      url: https://www.npmjs.com/package/firefly-audio-video/v/${{ steps.version.outputs.version }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: '.nvmrc'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+      - run: npm ci
+      - run: npm run build
+      - name: compute the next prerelease version
+        id: version
+        run: |
+          base="$(node -p "require('./package.json').version")"
+          IFS='.' read -r major minor patch <<< "$base"
+          sha7="${GITHUB_SHA:0:7}"
+          version="${major}.${minor}.$((patch + 1))-next.${GITHUB_RUN_NUMBER}.g${sha7}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+      # Applied to the checked-out workspace only; never committed, so
+      # package.json in the repo keeps its release-please-owned version.
+      - run: npm version "${{ steps.version.outputs.version }}" --no-git-tag-version
+      - run: npm publish --tag next --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}

@@ -348,16 +348,7 @@ export type TemplateSource = z.infer<typeof TemplateSourceSchema>;
  * const inMemory: PresetRefInput = { url: await readFile('./My Preset.epr') };
  * ```
  */
-export const PresetRefInputSchema = z.union(
-  [
-    z.strictObject({ url: stageInputSchema('url') }),
-    z.strictObject({ presetId: z.string().min(1, 'presetId must not be empty') }),
-  ],
-  { error: 'a preset ref must be either { url } or { presetId }, not both and not neither' },
-);
-
-/** A {@link PresetRefInputSchema} input: `{ url }` (any render input naming an `.epr`) or `{ presetId }`. */
-export type PresetRefInput = z.infer<typeof PresetRefInputSchema>;
+export type PresetRefInput = { url: StageInput } | { presetId: string };
 
 /**
  * One deliverable of a {@link RenderRequest}: a {@link RenderOutput} whose

@@ -46,8 +46,8 @@ export type PresetRef = z.infer<typeof PresetRefSchema>;
 /**
  * A single template-variable override applied within one render variation — for
  * example binding a media control to an uploaded asset, or setting its scale mode.
- * The full set of properties DGR accepts varies by the target control's `type` (the
- * describe endpoint's `Controls` response in ./types.ts enumerates control types),
+ * The full set of properties DGR accepts varies by the target control's `type` (as
+ * reported for each `TemplateControl` a `describe()` call returns),
  * so beyond the proven `variableId` / `assetIndex` / `scale` / `value` fields this
  * schema keeps any other caller-supplied properties intact rather than silently
  * stripping them — the render-body example is one proven instance, not

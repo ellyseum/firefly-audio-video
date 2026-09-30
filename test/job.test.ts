@@ -8,7 +8,6 @@ import { AudioVideoError } from '../src/core/errors.js';
 import { DEFAULT_HOST, HttpClient } from '../src/core/http.js';
 import { AsyncJob, DEFAULT_MAX_POLL_FAILURES, parseTimings, runJob } from '../src/core/job.js';
 import type { JobItemLike, JobStatusLike, JobSubmission } from '../src/core/job.js';
-import type { JobStatusResponse } from '../src/dgr/types.js';
 import { deferred } from './support/fake-ims.js';
 import { until } from './support/mock-api.js';
 
@@ -1313,8 +1312,8 @@ test('util.inspect prints only { jobId, state } — never the status URL or host
   expect(polls()).toBe(1);
 });
 
-test('the dgr JobStatusResponse satisfies JobStatusLike structurally, while core/job.ts imports nothing from dgr/', () => {
-  const dgrStatus: JobStatusResponse = {
+test('a full DGR status body satisfies JobStatusLike structurally, while core/job.ts imports nothing from dgr/', () => {
+  const dgrStatus = {
     jobId: 'j1',
     status: 'running',
     createdDate: CREATED,

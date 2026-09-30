@@ -25,7 +25,7 @@ export const EXIT_CODES: readonly ExitCodeEntry[] = [
   {
     code: 4,
     meaning:
-      'the job failed, timed out or returned an invalid response, or it was cancelled from outside this process',
+      'the job failed or returned an invalid response, or it was cancelled from outside this process',
   },
   {
     code: 5,

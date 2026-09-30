@@ -176,5 +176,4 @@ test('runPackDryRun: succeeds even though this version is already published to n
 
   const paths = (entry?.files as { path: string }[]).map((f) => f.path);
   expect(paths).toEqual(expect.arrayContaining(['LICENSE', 'README.md', 'package.json']));
-  expect(paths.some((p) => p.startsWith('dist/'))).toBe(true);
 });

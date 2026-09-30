@@ -59,7 +59,7 @@ async function renderedForm(config: EncodeConfig): Promise<{ presetId: string } 
   });
   if ('presetId' in ref) return { presetId: ref.presetId };
   if (xml === undefined)
-    throw new Error('resolvePreset() resolved a config to a URL it never staged.');
+    throw new Error('encode got no .epr for a config that does not render natively.');
   return { xml };
 }
 

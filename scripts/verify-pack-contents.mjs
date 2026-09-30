@@ -169,8 +169,8 @@ export function hasBuiltDist(root) {
  */
 export function runPackDryRun() {
   return process.platform === 'win32'
-    ? spawnSync('npm pack --dry-run --json', { encoding: 'utf8', shell: true })
-    : spawnSync('npm', ['pack', '--dry-run', '--json'], { encoding: 'utf8' });
+    ? spawnSync('npm pack --dry-run --json --ignore-scripts', { encoding: 'utf8', shell: true })
+    : spawnSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], { encoding: 'utf8' });
 }
 
 function main() {

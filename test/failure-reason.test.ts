@@ -64,6 +64,11 @@ describe('failureReason', () => {
     expect(failureReason([{ code: 'c', message }])).toBe(`c: ${message}`);
   });
 
+  test('is undefined, never a throw, for an entry that cannot be written as JSON', () => {
+    expect(failureReason([{ count: 10n }])).toBeUndefined();
+    expect(withFailureReason('m.', [{ count: 10n }])).toBe('m.');
+  });
+
   test('is undefined when there are no items, or none carries a reason', () => {
     expect(failureReason(undefined)).toBeUndefined();
     expect(failureReason([])).toBeUndefined();

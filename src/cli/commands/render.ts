@@ -162,7 +162,10 @@ function buildSpec(options: RenderOwnOptions): RenderRequest {
   return buildRenderRequestFromFlags(options) as RenderRequest;
 }
 
-/** `--out`/`--resolve-as` reduced to one mode: `--resolve-as file` needs `--out`; neither given prints the URL. */
+/**
+ * `--out`/`--resolve-as` reduced to one mode: `--resolve-as file` needs `--out`;
+ * neither given prints each output's read URL.
+ */
 function resolveOutputMode(options: RenderOwnOptions): OutputMode {
   const requested = options.resolveAs;
   if (requested !== undefined && requested !== 'url' && requested !== 'file') {

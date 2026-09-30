@@ -470,7 +470,12 @@ function withinMintTimeout(mint: Promise<string>): Promise<string> {
   });
 }
 
-/** The `cancelled` error a caller receives once its own signal stops its wait for a token. */
+/**
+ * The `cancelled` error a caller receives once its own signal stops its wait
+ * for a token. `cause` is the signal's abort reason exactly as given, by
+ * design: it is the caller's own value, handed back to the caller, and `cause`
+ * never reaches a log record or a serialized form of the error.
+ */
 function cancelledError(signal: AbortSignal): AudioVideoError {
   return new AudioVideoError({
     message: 'Waiting for an access token was cancelled.',

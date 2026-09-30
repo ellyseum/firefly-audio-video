@@ -439,6 +439,11 @@ export class AsyncJob<T> implements PromiseLike<T> {
    * error the abort stands for. A rejection that is itself an {@link AudioVideoError}
    * passes through even when the signal is aborted: it describes a definite outcome
    * (`job_failed`, an HTTP failure) that a same-instant cancel must not mask.
+   *
+   * A cancel that came from the caller's own signal keeps that signal's abort
+   * reason as `cause` exactly as given, by design: it is the caller's own value,
+   * handed back to the caller, and `cause` never reaches a log record or a
+   * serialized form of the error.
    */
   #mapRejection(err: unknown): unknown {
     const { signal } = this.#controller;

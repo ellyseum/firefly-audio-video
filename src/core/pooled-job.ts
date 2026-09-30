@@ -15,7 +15,7 @@
 import { AudioVideoError } from './errors.js';
 import type { AsyncJob, JobMeta } from './job.js';
 import type { PoolBackend } from './pool.js';
-import { anySignal } from './signals.js';
+import { linkSignals } from './signals.js';
 
 /**
  * A running call: awaitable like a promise (`await job`, `job.then()`,
@@ -195,10 +195,14 @@ export class PooledJob<J, T> implements JobHandle<T> {
     );
     if (admitted === SKIPPED) throw beforeStart.reason;
     const { signal } = options;
-    const finishSignal = signal
-      ? anySignal([this.#finishing.signal, signal])
-      : this.#finishing.signal;
-    return options.finish(admitted.value, finishSignal);
+    if (signal === undefined) return options.finish(admitted.value, this.#finishing.signal);
+    // Released once finish settles: the caller's signal can outlive this call by far.
+    const link = linkSignals([this.#finishing.signal, signal]);
+    try {
+      return await options.finish(admitted.value, link.signal);
+    } finally {
+      link.release();
+    }
   }
 
   #start(start: () => AsyncJob<J>): AsyncJob<J> {
@@ -261,7 +265,13 @@ export function rejectedJob<T>(error: unknown): JobHandle<T> {
   };
 }
 
-/** The `cancelled` error a call rejects with when it is cancelled outside its job. */
+/**
+ * The `cancelled` error a call rejects with when it is cancelled outside its
+ * job. When the caller's signal cancelled it, `cause` is that signal's abort
+ * reason exactly as given, by design: it is the caller's own value, handed
+ * back to the caller, and `cause` never reaches a log record or a serialized
+ * form of the error.
+ */
 function cancelledError(cause: unknown, when: string): AudioVideoError {
   return new AudioVideoError({
     message: `The job was cancelled ${when}.`,

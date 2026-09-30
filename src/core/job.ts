@@ -179,6 +179,12 @@ interface JobContext {
   trackSubmission(submission: Promise<JobSubmission>): Promise<JobSubmission>;
   /** Records the derived timing once a terminal status body has been read. */
   setMeta(meta: JobMeta): void;
+  /**
+   * Sends the same best-effort cancel request {@link AsyncJob.cancel} does —
+   * at most once per job, whichever asks first — and resolves once it has
+   * been attempted. Never rejects: a failed cancel request is swallowed.
+   */
+  cancelRemote(): Promise<void>;
 }
 
 /** @internal Everything {@link AsyncJob} needs to run and cancel one job. */
@@ -291,6 +297,7 @@ export class AsyncJob<T> implements PromiseLike<T> {
         setMeta: (meta) => {
           this.#meta = meta;
         },
+        cancelRemote: () => (this.#remoteCancel ??= this.#issueRemoteCancel()),
       })
       .then(
         (value) => {
@@ -479,9 +486,15 @@ export class AsyncJob<T> implements PromiseLike<T> {
  *   response) — each such failure is retried after a growing delay, and a
  *   successful poll resets the count;
  * - rejects at once with the request's own error when a status poll fails in any
- *   other way (a `404`, say — the job is gone), including `invalid_response`
- *   when the submission's `statusUrl` is not on the HTTP client's own origin,
- *   which is never requested;
+ *   other way (a `404`, say — the job is gone);
+ * - rejects `invalid_response` when the submission's `statusUrl` is one the HTTP
+ *   client refuses to request — another origin, `http:` where the client's host
+ *   is `https:`, user credentials, or text that does not parse — and never
+ *   requests it. The service did accept the job, so it is first sent the
+ *   best-effort cancel request {@link AsyncJob.cancel} sends, to the cancel path
+ *   on the client's own host, never to the refused URL; the job rejects once
+ *   that request has been attempted, and a failed cancel request never replaces
+ *   the `invalid_response`;
  * - rejects `submit_failed`, with the rejection as `cause`, when the submit call
  *   rejects with anything other than an {@link AudioVideoError}; a submit
  *   rejecting with one (`http_429`, an auth failure, …) rejects the job with that
@@ -567,7 +580,8 @@ export function parseTimings(status: JobStatusLike, jobId: string = status.jobId
  * Submits, then polls until terminal, throwing for every non-success outcome. A
  * status poll that fails transiently is retried after {@link pollRetryDelayMs},
  * until `maxPollFailures` such failures occur in a row; any other poll failure,
- * and a failed submit, is thrown as-is.
+ * and a failed submit, is thrown as-is — after the remote cancel when the
+ * failure is the HTTP client refusing the submission's `statusUrl`.
  */
 async function pollUntilTerminal<T>(
   http: HttpClient,
@@ -598,6 +612,10 @@ async function pollUntilTerminal<T>(
       // The request's own `cancelled` is this job's abort arriving through it: rethrow the abort
       // reason so the job settles as its own `cancelled` or `job_timeout`.
       if (signal.aborted) throw isCancellation(err) ? signal.reason : err;
+      if (isRefusedStatusUrl(err)) {
+        await ctx.cancelRemote();
+        throw err;
+      }
       if (!isTransientPollFailure(err)) throw err;
       failedPolls += 1;
       if (failedPolls >= maxPollFailures) throw pollFailedError(jobId, failedPolls, err);
@@ -761,6 +779,17 @@ function isTransientPollFailure(err: unknown): boolean {
   if (!(err instanceof AudioVideoError)) return true;
   if (err.status === undefined) return TRANSIENT_REQUEST_CODES.has(err.code);
   return TRANSIENT_POLL_STATUSES.has(err.status);
+}
+
+/**
+ * True for the HTTP client's refusal of a status poll's URL, raised before
+ * anything is sent: the only `invalid_response` the client produces itself,
+ * and one with no HTTP status.
+ */
+function isRefusedStatusUrl(err: unknown): boolean {
+  return (
+    err instanceof AudioVideoError && err.code === 'invalid_response' && err.status === undefined
+  );
 }
 
 /**

@@ -813,6 +813,72 @@ test('a statusUrl on another origin is never polled: the job rejects invalid_res
   expect(polled).toBe(0);
 });
 
+test.each([
+  ['on another origin', 'https://other-host.example/v1/status/j1'],
+  ['on the configured host over plain http', 'http://audio-video-api.adobe.io/v1/status/j1'],
+])(
+  'a statusUrl %s cancels the accepted job once, on the configured host, before rejecting invalid_response',
+  async (_label, statusUrl) => {
+    const refused: string[] = [];
+    agent
+      .get(new URL(statusUrl).origin)
+      .intercept({ path: () => true, method: () => true })
+      .reply(200, (opts) => {
+        refused.push(`${opts.method} ${opts.path}`);
+        return { status: 'completed' };
+      })
+      .persist();
+    const cancels = cancelEndpoint();
+    const job = runJob(http(), {
+      submit: () => Promise.resolve({ jobId: 'j1', statusUrl }),
+      mapResult: () => 'unreached',
+    });
+
+    const err = await rejectionOf(job);
+
+    expect(err?.code).toBe('invalid_response');
+    expect(cancels()).toBe(1);
+    expect(refused).toEqual([]);
+  },
+);
+
+test('a refused statusUrl rejects the job only once its cancel request has been answered', async () => {
+  const held = deferred();
+  let cancels = 0;
+  pool()
+    .intercept({ path: CANCEL_PATH, method: 'PUT' })
+    .reply(200, async () => {
+      cancels += 1;
+      await held.promise;
+      return '';
+    });
+  const job = runJob(http(), {
+    submit: () =>
+      Promise.resolve({ jobId: 'j1', statusUrl: 'https://other-host.example/v1/status/j1' }),
+    mapResult: () => 'unreached',
+  });
+
+  await until(() => cancels === 1);
+  expect(await isPending(job)).toBe(true);
+
+  held.resolve();
+  expect((await rejectionOf(job))?.code).toBe('invalid_response');
+});
+
+test('a refused statusUrl still rejects invalid_response when the cancel request fails', async () => {
+  const cancels = cancelEndpoint(500);
+  const job = runJob(http(), {
+    submit: () =>
+      Promise.resolve({ jobId: 'j1', statusUrl: 'https://other-host.example/v1/status/j1' }),
+    mapResult: () => 'unreached',
+  });
+
+  const err = await rejectionOf(job);
+
+  expect(err?.code).toBe('invalid_response');
+  expect(cancels()).toBe(1);
+});
+
 test('the listener on the caller signal is detached when the job settles without that signal aborting', async () => {
   const polls = runningForever();
   cancelEndpoint();

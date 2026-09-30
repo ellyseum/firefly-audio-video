@@ -97,8 +97,19 @@ function probeStorage(hold: Hold = briefly) {
   const calls: ProbeCall[] = [];
   const inFlight = { stage: 0, allocate: 0 };
   const peak = { stage: 0, allocate: 0 };
+  const waiters: Array<{ readonly count: number; readonly resolve: () => void }> = [];
+  function announce(): void {
+    for (let index = waiters.length - 1; index >= 0; index -= 1) {
+      const waiter = waiters[index];
+      if (waiter !== undefined && calls.length >= waiter.count) {
+        waiter.resolve();
+        waiters.splice(index, 1);
+      }
+    }
+  }
   async function held<T>(call: ProbeCall, result: (at: number, id: number) => T): Promise<T> {
     const id = calls.push(call);
+    announce();
     const at = Date.now();
     inFlight[call.kind] += 1;
     peak[call.kind] = Math.max(peak[call.kind], inFlight[call.kind]);
@@ -121,7 +132,17 @@ function probeStorage(hold: Hold = briefly) {
         readUrl: `${STORAGE}/out/${id}.mov?at=${at}&sig=READ_SIG_${id}`,
       })),
   };
-  return { storage, calls, peak };
+  /**
+   * Resolves the moment `calls` holds at least `count` entries — a signal
+   * the stub raises itself the instant it records one, so a slow real
+   * upload or filesystem read is waited out in full rather than raced
+   * against a fixed number of turns.
+   */
+  function waitForCalls(count: number): Promise<void> {
+    if (calls.length >= count) return Promise.resolve();
+    return new Promise((resolve) => waiters.push({ count, resolve }));
+  }
+  return { storage, calls, peak, waitForCalls };
 }
 
 /** One recorded submit: the job ID it was given, its body, and the clock when it arrived. */
@@ -291,8 +312,9 @@ test('cancelling a describe while its local template uploads in the slot aborts 
     const c = client({ pool: new InMemoryPool({ concurrency: 1 }), storage: probe.storage });
 
     const describing = c.describe(template);
-    // Reading the file on disk takes real time, not only event-loop turns.
-    await until(() => probe.calls.length === 1, 5_000);
+    // Reading the file on disk takes real time, not only event-loop turns:
+    // wait on the stub's own call rather than a fixed number of them.
+    await probe.waitForCalls(1);
     expect(probe.calls[0]?.input).toBe(template);
 
     await describing.cancel();

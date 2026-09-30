@@ -12,6 +12,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, open, rename, rm, type FileHandle } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { Readable } from 'node:stream';
+import { brandClass } from './brand.js';
 import { AudioVideoError, type AudioVideoErrorOptions } from './errors.js';
 import type { JobMeta } from './job.js';
 import { redactUrl, redactValue } from './redact.js';
@@ -617,6 +618,10 @@ export class Asset {
       code: 'asset_fetch_failed',
       cause: sanitizeTransportError(cause, this.#url),
     });
+  }
+
+  static {
+    brandClass(this, 'Asset');
   }
 }
 

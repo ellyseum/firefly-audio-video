@@ -1,10 +1,14 @@
-/** `dgr describe <template>`: a template's editable controls and fonts. */
+/**
+ * `dgr describe <template>`: a template's editable controls and fonts. The
+ * template goes to `describe()` exactly as given — an http(s) URL is read
+ * where it is, and a local file is staged through `--storage` once the job
+ * holds its pool slot.
+ */
 
 import { Command } from 'commander';
 import { resolveClient } from '../client.js';
 import { runCommand } from '../run-command.js';
 import type { CliRuntime, GlobalOptions } from '../runtime.js';
-import { resolveTemplateUrl } from '../template-source.js';
 
 export function buildDescribeCommand(runtime: CliRuntime): Command {
   const command = new Command('describe');
@@ -15,8 +19,7 @@ export function buildDescribeCommand(runtime: CliRuntime): Command {
       const options = self.optsWithGlobals() as GlobalOptions;
       await runCommand(runtime, options.json === true, async () => {
         const client = resolveClient(runtime, options, { storage: true });
-        const source = await resolveTemplateUrl(client, template);
-        const description = await client.describe(source);
+        const description = await client.describe(template);
         return {
           result: description,
           json: { controls: description.controls, fonts: description.fonts },

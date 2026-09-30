@@ -1055,6 +1055,15 @@ test('stage uploads through storage and resolves its read URL', async () => {
   expect(storage.staged).toEqual([{ input, opts: { key: 'logo.png', contentType: 'image/png' } }]);
 });
 
+test('stage passes an http(s) URL through with no storage, and refuses a string that is neither a URL nor a file before any storage call', async () => {
+  await expect(client().stage(CAPSULE)).resolves.toBe(CAPSULE);
+  const storage = fakeStorage();
+  const error = await rejection(client({ storage }).stage('./no-such-logo.png'));
+  expect(error.code).toBe('invalid_argument');
+  expect(error.message).toContain('neither an http(s) URL nor an existing file');
+  expect(storage.staged).toEqual([]);
+});
+
 test('stage without storage rejects invalid_argument naming the option; a failing provider rejects storage_failed', async () => {
   const noStorage = await rejection(client().stage(Buffer.from('x')));
   expect(noStorage.code).toBe('invalid_argument');

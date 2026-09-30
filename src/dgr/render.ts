@@ -10,7 +10,7 @@ import * as z from 'zod';
 import { Asset } from '../core/asset.js';
 import { AudioVideoError } from '../core/errors.js';
 import type { JobItemLike, JobMeta, JobStatusLike } from '../core/job.js';
-import type { StorageProvider } from '../core/storage.js';
+import { storageFailure, type StorageProvider } from '../core/storage.js';
 import { NAMED, nameForPresetId } from '../presets/catalog.js';
 import { describeIssues } from '../presets/codecs.js';
 import { buildRenderBody } from './build-body.js';
@@ -545,16 +545,6 @@ function assetMeta(
     ...durations,
     perItem: item === undefined ? [] : [{ index, ...durations }],
   };
-}
-
-/**
- * @internal A storage provider's failure as the SDK reports it: an
- * {@link AudioVideoError} the provider threw passes through; anything else is
- * wrapped with `code: 'storage_failed'`.
- */
-export function storageFailure(message: string, cause?: unknown): AudioVideoError {
-  if (cause instanceof AudioVideoError) return cause;
-  return new AudioVideoError({ message, code: 'storage_failed', cause });
 }
 
 /** Each distinct defined value once, comma-joined in order; `undefined` when there is none. */

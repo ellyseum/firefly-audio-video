@@ -158,9 +158,9 @@ export async function cancel(jobId: string, options?: RequestOptions): Promise<J
 }
 
 /**
- * Uploads `input` through the default client's storage — or `options.client`'s
- * — and resolves with a presigned URL DGR can read it from. See
- * {@link Client.stage}.
+ * Resolves with a URL DGR can read `input` from, on the default client — or
+ * on `options.client`: an http(s) URL as it is, anything else uploaded
+ * through that client's storage. See {@link Client.stage}.
  *
  * @example
  * ```ts

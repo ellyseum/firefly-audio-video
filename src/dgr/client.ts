@@ -36,7 +36,7 @@ import {
   type JobHandle,
   type PooledJobOutcome,
 } from '../core/pooled-job.js';
-import type { StageInput, StorageProvider } from '../core/storage.js';
+import { normalizeAsset, type StageInput, type StorageProvider } from '../core/storage.js';
 import {
   createRenderBuilder,
   type FluentRenderer,
@@ -58,7 +58,6 @@ import {
   prepareRequest,
   presetLogFields,
   renderAssets,
-  storageFailure,
   type FluentRenderInput,
   type PreparedRender,
   type TemplateSource,
@@ -394,9 +393,12 @@ export interface Client {
    */
   cancel(jobId: string, options?: RequestOptions): Promise<JobStatusLike>;
   /**
-   * Uploads `input` through this client's storage and resolves with a
-   * presigned URL DGR can read it from. Takes no pool slot. Without `storage`
-   * configured it rejects `invalid_argument`.
+   * Resolves with a URL DGR can read `input` from: an http(s) URL as it is,
+   * with no storage call; a `Buffer`, a `Readable` or a local file (a path or
+   * a `file:` URL) uploaded through this client's storage, as the presigned
+   * read URL it returns. Takes no pool slot. A string that is neither an
+   * http(s) URL nor an existing file rejects `invalid_argument`, as does an
+   * upload with no `storage` configured.
    *
    * @example
    * ```ts
@@ -669,30 +671,10 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
   async stage(input: StageInput, options: StageOptions = {}): Promise<string> {
     const target = this.#targetOrLog(options, 'stage', STAGE_ENDPOINT, undefined);
     if (target !== this) return target.stage(input, options);
-    return this.#logged('stage', STAGE_ENDPOINT, undefined, undefined, async () => {
-      const storage = this.#storage;
-      if (storage === undefined) {
-        throw invalidArgument(
-          'stage() uploads through storage, and no storage is configured: pass a StorageProvider ' +
-            'as the storage option of configure() or createClient().',
-        );
-      }
-      const { key, contentType, expiresIn } = options;
-      let url: unknown;
-      try {
-        url = await storage.stageRead(input, {
-          ...(key !== undefined ? { key } : {}),
-          ...(contentType !== undefined ? { contentType } : {}),
-          ...(expiresIn !== undefined ? { expiresIn } : {}),
-        });
-      } catch (cause) {
-        throw storageFailure('Staging the input failed.', cause);
-      }
-      if (typeof url !== 'string' || url === '') {
-        throw storageFailure('storage.stageRead() resolved without a URL for the staged object.');
-      }
-      return url;
-    });
+    const { key, contentType, expiresIn } = options;
+    return this.#logged('stage', STAGE_ENDPOINT, undefined, undefined, () =>
+      normalizeAsset(input, this.#storage, { key, contentType, expiresIn }),
+    );
   }
 
   /** @internal Starts a fluent render; see {@link FluentRenderer}. */

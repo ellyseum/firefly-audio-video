@@ -153,6 +153,26 @@ async function runBehaviourChecks(mod, label) {
       throw new Error(`Asset.toJSON() meta mismatch: ${JSON.stringify(json.meta)}`);
     }
   });
+
+  await check(
+    `[${label}] normalizeAsset passes a URL through and refuses bytes with no storage`,
+    async () => {
+      const url = `https://example.test/logo.png?sig=${FAKE_SIGNATURE}`;
+      assertEqual(await mod.normalizeAsset(url), url, 'normalizeAsset(url)');
+      assertEqual(
+        await mod.normalizeAsset(url, new mod.PassthroughStorageProvider()),
+        url,
+        'normalizeAsset(url, passthrough)',
+      );
+      const refused = await mod.normalizeAsset(Buffer.from('x')).then(
+        () => undefined,
+        (err) => err,
+      );
+      if (!(refused instanceof mod.AudioVideoError) || refused.code !== 'invalid_argument') {
+        throw new Error(`a Buffer with no storage did not reject invalid_argument: ${refused}`);
+      }
+    },
+  );
 }
 
 if (cjs) await runBehaviourChecks(cjs, 'cjs');

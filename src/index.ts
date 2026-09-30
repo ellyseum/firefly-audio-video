@@ -73,4 +73,5 @@ export type {
 export { InMemoryPool, DEFAULT_CONCURRENCY } from './core/pool.js';
 export type { InMemoryPoolOptions, PoolBackend } from './core/pool.js';
 
+export { normalizeAsset, PassthroughStorageProvider } from './core/storage.js';
 export type { StageInput, StorageProvider } from './core/storage.js';

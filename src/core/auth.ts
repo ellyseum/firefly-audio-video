@@ -57,13 +57,16 @@ export interface TokenProvider {
  */
 export interface ClientCredentials {
   /**
-   * The integration's client ID. Also sent as the `x-api-key` header. Must
-   * not contain `&`, `=`, `+`, `%` or `#` (see {@link ClientCredentialsProvider}).
+   * The integration's client ID. Also sent as the `x-api-key` header.
+   * Surrounding whitespace is trimmed; it must not contain whitespace, a
+   * control character, `&`, `=`, `+`, `%` or `#` (see
+   * {@link ClientCredentialsProvider}).
    */
   clientId: string;
   /**
    * The integration's client secret. Never logged, thrown, or otherwise
-   * surfaced. Must not contain `&`, `=`, `+`, `%` or `#` (see
+   * surfaced. Surrounding whitespace is trimmed; it must not contain
+   * whitespace, a control character, `&`, `=`, `+`, `%` or `#` (see
    * {@link ClientCredentialsProvider}).
    */
   clientSecret: string;
@@ -223,9 +226,12 @@ export interface ClientCredentialsProviderOptions {
  *
  * **Credentials are checked at construction.** The wrapped provider builds
  * its form body without URL-encoding, so a client ID, secret or scope
- * containing `&`, `=`, `+`, `%` or `#` would reach IMS as a different value;
- * the constructor rejects such values, and empty or non-string ones, with
- * `invalid_argument` before any request is made.
+ * containing `&`, `=`, `+`, `%` or `#`, whitespace or a control character
+ * would reach IMS as a different value. The constructor trims surrounding
+ * whitespace — the newline a value read from an environment file keeps —
+ * and rejects anything else of that kind, and empty or non-string values,
+ * with `invalid_argument` before any request is made, never quoting the
+ * value.
  *
  * **Known upstream behaviour: the wrapped provider writes to
  * `console.error`.** It logs `"Error while fetching token"` with the error
@@ -379,11 +385,16 @@ export class ClientCredentialsProvider implements TokenProvider {
 /** The characters that change meaning in the form body the wrapped provider builds unencoded. */
 const FORM_RESERVED_RE = /[&=+%#]/;
 
+/** Whitespace or a control character, which no credential or scope list holds. */
+const FORM_UNSAFE_RE = /[\s\p{Cc}]/u;
+
 /**
- * `value`, once it is known to survive the wrapped provider's form body: a
- * non-empty string with none of `&`, `=`, `+`, `%` or `#`, which the
- * provider interpolates without URL-encoding. The error names `field`,
- * never the value.
+ * `value` trimmed, once it is known to survive the wrapped provider's form
+ * body: a non-empty string with no whitespace or control character inside
+ * it and none of `&`, `=`, `+`, `%` or `#`, which the provider interpolates
+ * without URL-encoding. Trimming makes a value read from the environment
+ * with its trailing newline the same credential it is everywhere else. The
+ * error names `field`, never the value.
  */
 function formSafe(value: unknown, field: 'clientId' | 'clientSecret' | 'scope'): string {
   if (typeof value !== 'string' || value.trim() === '') {
@@ -392,7 +403,8 @@ function formSafe(value: unknown, field: 'clientId' | 'clientSecret' | 'scope'):
       code: 'invalid_argument',
     });
   }
-  if (FORM_RESERVED_RE.test(value)) {
+  const text = value.trim();
+  if (FORM_RESERVED_RE.test(text)) {
     throw new AudioVideoError({
       message:
         `${field} contains one of & = + % #. The official IMS token provider sends ` +
@@ -400,7 +412,15 @@ function formSafe(value: unknown, field: 'clientId' | 'clientSecret' | 'scope'):
       code: 'invalid_argument',
     });
   }
-  return value;
+  if (FORM_UNSAFE_RE.test(text)) {
+    throw new AudioVideoError({
+      message:
+        `${field} contains whitespace or a control character inside it, which IMS would read ` +
+        `as a different value${field === 'scope' ? '; separate scopes with commas' : ''}.`,
+      code: 'invalid_argument',
+    });
+  }
+  return text;
 }
 
 /** The shape of an OAuth 2.0 `error` code: a short run of letters and underscores. */

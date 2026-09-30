@@ -991,6 +991,22 @@ test('listPresets unwraps the items list', async () => {
   await expect(client().listPresets()).resolves.toEqual(items);
 });
 
+test('credentials read with a trailing newline reach IMS and the x-api-key header trimmed alike', async () => {
+  api.reply('GET', '/v1/presets', 200, { items: [] });
+
+  await createClient({
+    clientId: 'cid-123\n',
+    clientSecret: 'sec-456\n',
+    logging: false,
+  }).listPresets();
+
+  const [mint] = api.imsRequests();
+  expect(mint?.get('client_id')).toBe('cid-123');
+  expect(mint?.get('client_secret') === 'sec-456', 'IMS receives the trimmed secret').toBe(true);
+  const [listing] = api.calls.filter((call) => call.origin === API && call.path === '/v1/presets');
+  expect(listing?.headers['x-api-key']).toBe('cid-123');
+});
+
 test('the single-request calls each emit one record', async () => {
   const logger = recordingLogger();
   api.status('job-15', () => ({ jobId: 'job-15', status: 'succeeded', totalJobItems: 2 }));

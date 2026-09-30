@@ -824,6 +824,54 @@ test('a secret with punctuation the form body carries safely is accepted and sen
   );
 });
 
+test('credentials with surrounding whitespace, such as the newline an environment file leaves, reach IMS trimmed', async () => {
+  ims.token('TOKEN_1');
+
+  await new ClientCredentialsProvider({
+    clientId: ' cid-123\n',
+    clientSecret: '\tsec-456\r\n',
+    scope: 'openid,AdobeID \n',
+  }).getAccessToken();
+
+  const form = ims.form(0);
+  expect(form.get('client_id')).toBe('cid-123');
+  expect(form.get('client_secret') === 'sec-456', 'IMS receives the trimmed secret').toBe(true);
+  expect(form.get('scope')).toBe('openid,AdobeID');
+});
+
+test.each<[field: 'clientId' | 'clientSecret' | 'scope', label: string, inside: string]>([
+  ['clientId', 'a space', ' '],
+  ['clientId', 'a NUL', '\u0000'],
+  ['clientSecret', 'a tab', '\t'],
+  ['clientSecret', 'a newline', '\n'],
+  ['clientSecret', 'a no-break space', ' '],
+  ['clientSecret', 'a C1 control character', '\u0085'],
+  ['clientSecret', 'a DEL', '\u007f'],
+  ['scope', 'a space', ' '],
+])(
+  'a %s with %s inside it rejects invalid_argument before any request, never echoing it',
+  (field, _label, inside) => {
+    const authenticate = vi.spyOn(ServerToServerTokenProvider.prototype, 'authenticate');
+    const value = `Q7XZ${inside}K2WM`;
+
+    const err = thrownBy(() => new ClientCredentialsProvider({ ...CREDS, [field]: value }));
+
+    expect(err !== undefined, 'the constructor refuses the value').toBe(true);
+    // Absence next: the assertions below print the error when they fail.
+    for (const [where, text] of surfaces(err)) {
+      expectAbsent(text, 'Q7XZ', where);
+      expectAbsent(text, 'K2WM', where);
+    }
+    expect(err).toBeInstanceOf(AudioVideoError);
+    expect((err as AudioVideoError).code).toBe('invalid_argument');
+    expect((err as AudioVideoError).message).toMatch(
+      new RegExp(`^${field} contains whitespace or a control character`),
+    );
+    expect(authenticate).not.toHaveBeenCalled();
+    expect(ims.requests).toHaveLength(0);
+  },
+);
+
 // --- failure -------------------------------------------------------------------
 
 test('an unreachable IMS rejects auth_failed, and no surface carries the secret', async () => {

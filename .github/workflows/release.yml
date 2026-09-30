@@ -132,13 +132,6 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm publish --provenance --access public
-        env:
-          # Set only for the one-time bootstrap publish, before a npm
-          # trusted publisher exists for this package; npm tries OIDC first
-          # and only falls back to this token when OIDC is not configured,
-          # so leaving the reference in place is inert once the secret is
-          # deleted. No other npm secret may appear in this workflow.
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}
 
   # Publishes every green push to main that is not itself a release commit
   # to the `next` dist-tag, so a dependent can track main without waiting
@@ -194,5 +187,3 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
       - run: npm publish --provenance --tag next --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}

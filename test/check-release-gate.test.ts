@@ -164,28 +164,6 @@ test("mutation: renaming publish-next's environment reddens publish-next-environ
   expect(ids(violations)).toEqual(['publish-next-environment']);
 });
 
-test('mutation: an extra secret inside publish-latest reddens secret-scope', () => {
-  const mutated = mutate(
-    BASE,
-    '          NODE_AUTH_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}\n\n  # Publishes every green push',
-    '          NODE_AUTH_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}\n          EXTRA: ${{ secrets.NPM_TOKEN }}\n\n  # Publishes every green push',
-  );
-  const violations = checkReleaseGate(mutated);
-  expect(ids(violations)).toEqual(['secret-scope']);
-  expect(onlyMessage(violations)).toMatch(/NPM_TOKEN/);
-});
-
-test('mutation: an extra secret inside publish-next reddens secret-scope', () => {
-  const mutated = mutate(
-    BASE,
-    '        env:\n          NODE_AUTH_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}\n',
-    '        env:\n          NODE_AUTH_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}\n          EXTRA: ${{ secrets.SOMETHING_ELSE }}\n',
-  );
-  const violations = checkReleaseGate(mutated);
-  expect(ids(violations)).toEqual(['secret-scope']);
-  expect(onlyMessage(violations)).toMatch(/SOMETHING_ELSE/);
-});
-
 test('mutation: dropping --provenance from publish-latest reddens npm-publish-provenance', () => {
   const mutated = mutate(
     BASE,

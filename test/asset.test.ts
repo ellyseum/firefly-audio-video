@@ -1484,7 +1484,7 @@ test('a save() that fails on the disk side lets go of the download: no abort lis
     .catch((e: unknown) => e);
 
   expect(err).toBeInstanceOf(AudioVideoError);
-  expect((err as AudioVideoError).code).toBe('asset_fetch_failed');
+  expect((err as AudioVideoError).code).toBe('save_failed');
   expect(getEventListeners(controller.signal, 'abort')).toEqual([]);
   await server.idle();
   // The server closes its end once the whole body is written, so the client's
@@ -1522,7 +1522,7 @@ test.each<[string, (dir: string) => string, string[]]>([
     const err = (await asset.save(path).catch((e: unknown) => e)) as AudioVideoError;
 
     expect(err).toBeInstanceOf(AudioVideoError);
-    expect(err.code).toBe('asset_fetch_failed');
+    expect(err.code).toBe('save_failed');
     expect(err.message).toMatch(/^Saving the asset at http:\/\/127\.0\.0\.1:\d+\/out\.mov/);
     expect(err.message.endsWith(` to ${path} failed while ${step}.`)).toBe(true);
     expect(err.message).not.toContain('.partial');

@@ -54,6 +54,12 @@ test('redactUrl: never throws on a malformed URL, and still redacts what it can'
   expect(out).toBe('http://[bad-host]?rest=keep');
 });
 
+test('redactUrl: on an unparseable URL, only the first surviving & takes the place of a removed ?', () => {
+  expect(redactUrl('http://[bad-host]?sig=SECRET&rest=keep&more=1')).toBe(
+    'http://[bad-host]?rest=keep&more=1',
+  );
+});
+
 test('redactUrl: never throws on a string with no URL structure at all', () => {
   expect(() => redactUrl('not a url in any sense')).not.toThrow();
 });
@@ -63,6 +69,27 @@ test('redactUrl: a protocol-relative URL is resolved and still redacted', () => 
   expect(out).not.toContain('SECRET');
   expect(out).toContain('attacker.example');
   expect(out).toContain('rest=keep');
+});
+
+test.each([
+  ['a relative path comes back relative', '/v1/f?sig=SECRET&rest=keep', '/v1/f?rest=keep'],
+  [
+    'a protocol-relative URL keeps the origin it names',
+    '//cdn.example/f?sig=SECRET&rest=keep',
+    'http://cdn.example/f?rest=keep',
+  ],
+  [
+    'a host that merely begins with the resolution base keeps its own origin',
+    '//redact.invalid.example/f?sig=SECRET&rest=keep',
+    'http://redact.invalid.example/f?rest=keep',
+  ],
+  [
+    'the resolution base host on another port keeps its own origin',
+    '//redact.invalid:8080/f?sig=SECRET&rest=keep',
+    'http://redact.invalid:8080/f?rest=keep',
+  ],
+])('redactUrl: %s', (_case, input, expected) => {
+  expect(redactUrl(input)).toBe(expected);
 });
 
 // --- every credential-bearing parameter ------------------------------------------------
@@ -200,6 +227,56 @@ test('a URL used as an object key loses its signature too', () => {
   expect(redactValue({ 'https://h.example/f?sig=KEYSIG&rest=keep': 1 })).toEqual({
     'https://h.example/f?rest=keep': 1,
   });
+});
+
+// --- Azure connection strings ------------------------------------------------------------
+
+const ACCOUNT_KEY_CONNECTION_STRING =
+  'DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=CS_ACCOUNT_KEY+/w==;' +
+  'EndpointSuffix=core.windows.net';
+const SAS_CONNECTION_STRING =
+  'BlobEndpoint=https://acct.blob.core.windows.net/;SharedAccessSignature=sv=2022-11-02' +
+  '&ss=b&srt=co&sp=rl&se=2030-01-01T00:00:00Z&rscd=attachment&sig=CS_SAS_SIG%3D;' +
+  'QueueEndpoint=https://acct.queue.core.windows.net/';
+
+test.each([
+  [
+    'an account key, from a connection string quoted in a message',
+    `cannot connect with '${ACCOUNT_KEY_CONNECTION_STRING}'`,
+    "cannot connect with 'DefaultEndpointsProtocol=https;AccountName=acct;EndpointSuffix=core.windows.net'",
+  ],
+  [
+    'a whole shared access signature, the & and = inside it included',
+    SAS_CONNECTION_STRING,
+    'BlobEndpoint=https://acct.blob.core.windows.net/;QueueEndpoint=https://acct.queue.core.windows.net/',
+  ],
+  [
+    'a setting that opens the string, its name in any case',
+    'accountkey=CS_ACCOUNT_KEY;ACCOUNTNAME=acct',
+    ';ACCOUNTNAME=acct',
+  ],
+  [
+    'a setting written with spaces around its =',
+    'AccountKey = CS_ACCOUNT_KEY is invalid',
+    ' is invalid',
+  ],
+])('an Azure connection string loses %s', (_case, input, expected) => {
+  expect(redactValue(input)).toBe(expected);
+});
+
+test('a connection string in a log record or an error message is scrubbed; look-alike settings stay', () => {
+  expect(
+    redactValue({ connectionString: ACCOUNT_KEY_CONNECTION_STRING, container: 'renders' }),
+  ).toEqual({
+    connectionString:
+      'DefaultEndpointsProtocol=https;AccountName=acct;EndpointSuffix=core.windows.net',
+    container: 'renders',
+  });
+  const error = new AudioVideoError({ message: `storage refused ${SAS_CONNECTION_STRING}` });
+  expect(error.message).not.toContain('CS_SAS_SIG');
+  expect(error.message).not.toContain('SharedAccessSignature');
+  const lookAlike = 'AccountName=acct;AccountKeyVersion=2;EndpointSuffix=core.windows.net';
+  expect(redactValue(lookAlike)).toBe(lookAlike);
 });
 
 // --- redactHeaders -------------------------------------------------------------

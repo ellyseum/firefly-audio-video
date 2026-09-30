@@ -497,8 +497,46 @@ export function presetIdFor(body: string): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-8${hex.slice(13, 16)}-${variant}${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
-/** One `<ExporterParam>` element, which never nests another. */
-const PARAM_BLOCK = /<ExporterParam ObjectID="\d+"[^>]*>[\s\S]*?<\/ExporterParam>/g;
+/** An `<ExporterParam>` start tag up to the digits of its `ObjectID`. */
+const PARAM_OPEN = '<ExporterParam ObjectID="';
+const PARAM_CLOSE = '</ExporterParam>';
+
+/** True when `text` holds an ASCII digit at `index`. */
+function isDigitAt(text: string, index: number): boolean {
+  const code = text.charCodeAt(index);
+  return code >= 48 && code <= 57;
+}
+
+/**
+ * The `[start, end)` span of each `<ExporterParam>` element in `xml`, in document
+ * order: a start tag `<ExporterParam ObjectID="` + digits + `"` running to its
+ * first `>`, then everything up to and including the first `</ExporterParam>`
+ * after that — an element never nests another. Each search resumes past the
+ * last, and a missing `>` or `</ExporterParam>` ends the walk, since no later
+ * start tag could find one either; the scan is linear in `xml.length` on any
+ * input, a caller's `.epr` included.
+ */
+function paramSpans(xml: string): Array<[start: number, end: number]> {
+  const spans: Array<[start: number, end: number]> = [];
+  let from = 0;
+  for (;;) {
+    const start = xml.indexOf(PARAM_OPEN, from);
+    if (start === -1) return spans;
+    const digits = start + PARAM_OPEN.length;
+    let quote = digits;
+    while (isDigitAt(xml, quote)) quote += 1;
+    if (quote === digits || xml.charAt(quote) !== '"') {
+      from = start + 1;
+      continue;
+    }
+    const tagEnd = xml.indexOf('>', quote + 1);
+    if (tagEnd === -1) return spans;
+    const close = xml.indexOf(PARAM_CLOSE, tagEnd + 1);
+    if (close === -1) return spans;
+    spans.push([start, close + PARAM_CLOSE.length]);
+    from = close + PARAM_CLOSE.length;
+  }
+}
 
 /** An error for a template that no longer has the shape the patcher needs. */
 function templateError(message: string): AudioVideoError {
@@ -509,14 +547,18 @@ function templateError(message: string): AudioVideoError {
 function patchParam(xml: string, identifier: string, patch: (block: string) => string): string {
   const marker = `<ParamIdentifier>${identifier}</ParamIdentifier>`;
   let found = 0;
-  const out = xml.replace(PARAM_BLOCK, (block) => {
-    if (!block.includes(marker)) return block;
+  let out = '';
+  let copied = 0;
+  for (const [start, end] of paramSpans(xml)) {
+    const block = xml.slice(start, end);
+    if (!block.includes(marker)) continue;
     found += 1;
-    return patch(block);
-  });
+    out += xml.slice(copied, start) + patch(block);
+    copied = end;
+  }
   if (found !== 1)
     throw templateError(`expected exactly one ${identifier} parameter, found ${found}.`);
-  return out;
+  return out + xml.slice(copied);
 }
 
 /** Replaces the text of the one `<tag>` element in `block`. */
@@ -606,14 +648,44 @@ interface ParamReading {
   readonly arbData?: string;
 }
 
-/** The first `<ExporterParam>` per `ParamIdentifier`, with its value and payload. */
-function readParams(xml: string): Map<string, ParamReading> {
+const ARB_DATA_OPEN = '<ParamArbData';
+const ARB_DATA_CLOSE = '</ParamArbData>';
+
+/**
+ * The text of the first `<ParamArbData…>text</ParamArbData>` in `block`: a
+ * `<ParamArbData` start tag running to its first `>`, then the text up to the
+ * next `<`, which must open `</ParamArbData>`. A candidate that fails resumes
+ * the search past its `>`, and a missing `>` or `<` ends it, so the scan is
+ * linear; a regex `<ParamArbData[^>]*>` backtracks quadratically over a
+ * repeated `<ParamArbData`, which its `[^>]*` can itself match.
+ */
+function arbDataOf(block: string): string | undefined {
+  let from = 0;
+  for (;;) {
+    const start = block.indexOf(ARB_DATA_OPEN, from);
+    if (start === -1) return undefined;
+    const tagEnd = block.indexOf('>', start + ARB_DATA_OPEN.length);
+    if (tagEnd === -1) return undefined;
+    const textEnd = block.indexOf('<', tagEnd + 1);
+    if (textEnd === -1) return undefined;
+    if (block.startsWith(ARB_DATA_CLOSE, textEnd)) return block.slice(tagEnd + 1, textEnd);
+    from = tagEnd + 1;
+  }
+}
+
+/**
+ * The first `<ExporterParam>` per `ParamIdentifier`, with its value and payload.
+ * The identifier and value patterns are linear: their `[^<]*` stops at the next
+ * tag.
+ */
+export function readParams(xml: string): Map<string, ParamReading> {
   const params = new Map<string, ParamReading>();
-  for (const [block] of xml.matchAll(PARAM_BLOCK)) {
+  for (const [start, end] of paramSpans(xml)) {
+    const block = xml.slice(start, end);
     const id = /<ParamIdentifier>([^<]*)<\/ParamIdentifier>/.exec(block)?.[1];
     if (id === undefined || params.has(id)) continue;
     const value = /<ParamValue>([^<]*)<\/ParamValue>/.exec(block)?.[1];
-    const arbData = /<ParamArbData[^>]*>([^<]*)<\/ParamArbData>/.exec(block)?.[1];
+    const arbData = arbDataOf(block);
     params.set(id, {
       ...(value === undefined ? {} : { value }),
       ...(arbData === undefined ? {} : { arbData }),

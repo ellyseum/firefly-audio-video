@@ -11,7 +11,8 @@
  * - {@link redactValue} — an arbitrary log record, error `.items`, or error
  *   `.message` string: walks objects/arrays recursively, scrubbing secret-named
  *   keys, any embedded URL, a secret parameter written in plain text (in its
- *   `&amp;` and percent-encoded forms too), a `Bearer` credential and a JWT.
+ *   `&amp;` and percent-encoded forms too), an Azure connection string's
+ *   account key and shared access signature, a `Bearer` credential and a JWT.
  * - {@link redactError} — a redacted copy of an error, to keep as another
  *   error's `cause`.
  *
@@ -89,8 +90,18 @@ const RAW_SECRET_PARAM_RE = new RegExp(
  */
 function stripSecretParamsFromRawString(u: string): string {
   const stripped = u.replace(RAW_SECRET_PARAM_RE, '');
-  return u.includes('?') && !stripped.includes('?') ? stripped.replace('&', '?') : stripped;
+  if (!u.includes('?') || stripped.includes('?')) return stripped;
+  const separator = stripped.indexOf('&');
+  if (separator === -1) return stripped;
+  return `${stripped.slice(0, separator)}?${stripped.slice(separator + 1)}`;
 }
+
+/**
+ * The origin a relative reference is resolved against so the URL parser can read
+ * its query string. `.invalid` is a reserved top-level domain, so no real URL
+ * names this host.
+ */
+const RELATIVE_BASE = 'http://redact.invalid';
 
 /** `u` with its secret query parameters removed through the URL parser, or the raw fallback. */
 function stripParsedSecrets(u: string): string {
@@ -100,10 +111,12 @@ function stripParsedSecrets(u: string): string {
     // Not an absolute URL (no scheme/host) — fall through to relative resolution.
   }
   try {
-    const base = 'http://redact.invalid';
-    const resolved = stripSecrets(new URL(u, base));
+    const url = new URL(u, RELATIVE_BASE);
+    const resolved = stripSecrets(url);
     if (resolved === undefined) return u;
-    return resolved.startsWith(base) ? resolved.slice(base.length) : resolved;
+    // Only a reference that resolved onto the base goes back to being relative; one
+    // naming its own origin (`//host/…`) keeps the resolved form.
+    return url.origin === RELATIVE_BASE ? `${url.pathname}${url.search}${url.hash}` : resolved;
   } catch {
     // Not parseable even as a relative reference — fall through to the raw scrub.
   }
@@ -267,9 +280,25 @@ function stripSecretParamsFromText(s: string): string {
   );
 }
 
-/** The text-level passes a URL, or any string, gets: user info after `//`, then every secret parameter. */
+/**
+ * An Azure connection string's secret settings, `AccountKey` and
+ * `SharedAccessSignature` — names in any case, spaces allowed around the `=` —
+ * with the `;` before one, wherever the connection string sits in a larger
+ * string. A value runs to the next `;` (a shared access signature carries its
+ * own `&` and `=`), `#`, whitespace, quote or angle bracket.
+ */
+const CONNECTION_STRING_SECRET_RE =
+  /;?\b(?:AccountKey|SharedAccessSignature)[ \t]*=[ \t]*[^;#\s"'<>]*/gi;
+
+/**
+ * The text-level passes a URL, or any string, gets: user info after `//`, an
+ * Azure connection string's account key and shared access signature, then
+ * every secret parameter.
+ */
 function stripSecretsFromText(s: string): string {
-  return stripSecretParamsFromText(s.replace(USERINFO_RE, '$1'));
+  return stripSecretParamsFromText(
+    s.replace(USERINFO_RE, '$1').replace(CONNECTION_STRING_SECRET_RE, ''),
+  );
 }
 
 /**
@@ -282,7 +311,10 @@ const BEARER_RE = /\b([Bb][Ee][Aa][Rr][Ee][Rr]\s+)(?![a-z]+(?![\w\-.~+/=]))[\w\-
 /** A JWT: three base64url segments, the first opening with `eyJ` (the encoding of `{"`). */
 const JWT_RE = /\beyJ[\w-]+\.[\w-]+\.[\w-]*/g;
 
-/** Every redaction a free-text string gets: embedded URLs, user info, secret parameters, `Bearer` credentials and JWTs. */
+/**
+ * Every redaction a free-text string gets: embedded URLs, user info, connection-string
+ * secrets, secret parameters, `Bearer` credentials and JWTs.
+ */
 function redactString(s: string): string {
   return stripSecretsFromText(redactEmbeddedUrls(s))
     .replace(BEARER_RE, '$1REDACTED')
@@ -324,7 +356,8 @@ function readProperty(value: object, key: string): unknown {
  * Deep-walks `value`, redacting as it goes. A string has every embedded URL run
  * through {@link redactUrl}, then loses any user info or secret parameter
  * still written in its text (`sig=…` in a bare query string, an HTML body's
- * `&amp;sig=…`, a percent-encoded `%3Fsig%3D…`), any `Bearer` credential
+ * `&amp;sig=…`, a percent-encoded `%3Fsig%3D…`), any Azure connection-string
+ * `AccountKey=…` or `SharedAccessSignature=…` setting, any `Bearer` credential
  * (`Bearer REDACTED`) and any JWT (`REDACTED`). An array is walked element by
  * element. An object has each key checked against a known secret pattern
  * (`authorization`, `cookie`, `sig`, and anything naming a token, secret,

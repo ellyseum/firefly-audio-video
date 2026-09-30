@@ -156,7 +156,12 @@ export function invalidOption(message: string): AudioVideoError {
 /** How much of a cause's message a provider failure repeats. */
 const CAUSE_LIMIT = 300;
 
-/** A cause's message, redacted, scrubbed of `secrets`, and cut short. */
+/**
+ * A cause's message, scrubbed of `secrets`, redacted, and cut short. The scrub
+ * comes first: the redaction pass rewrites a connection string it recognizes and
+ * re-encodes a query string it strips, after which a secret no longer appears
+ * verbatim for the scrub to find.
+ */
 function causeText(cause: unknown, secrets: readonly string[]): string {
   let text: string;
   try {
@@ -164,7 +169,7 @@ function causeText(cause: unknown, secrets: readonly string[]): string {
   } catch {
     return '';
   }
-  const redacted = scrub(redactValue(text), secrets).trim();
+  const redacted = redactValue(scrub(text, secrets)).trim();
   return redacted.length > CAUSE_LIMIT ? `${redacted.slice(0, CAUSE_LIMIT - 3)}...` : redacted;
 }
 

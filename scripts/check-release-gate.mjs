@@ -21,6 +21,10 @@
  *    the not-a-release-commit check (`release_created != 'true'`).
  *  - `publish-next`'s `needs:` includes `verify`.
  *  - `publish-next` declares `environment: npm-next`.
+ *  - `publish-next` runs `npm version` before `npm run build`, and checks
+ *    the built package's `dist/cli.cjs --version` after the build and
+ *    before `npm publish`, so a prerelease never ships reporting another
+ *    version.
  *  - the only `secrets.*` referenced inside either publish job is
  *    `NPM_BOOTSTRAP_TOKEN`.
  *  - every `npm publish` invocation, in any job, carries `--provenance` —
@@ -267,6 +271,11 @@ function runtimeSmokeMajors(lines) {
   return majors;
 }
 
+/** The index of the first line in `lines` that is not a comment and matches `pattern`, or -1. */
+function stepIndex(lines, pattern) {
+  return lines.findIndex((line) => !isBlankOrComment(line) && pattern.test(line));
+}
+
 /** Every trimmed line invoking `npm publish` without `--provenance`, in a job's body. */
 function npmPublishLinesWithoutProvenance(lines) {
   return lines
@@ -390,6 +399,22 @@ export function checkReleaseGate(text) {
       push(
         'publish-next-needs-verify',
         `needs: must include "verify", found: ${JSON.stringify(needs)}`,
+      );
+    }
+    const versionAt = stepIndex(next, /\bnpm version\b/);
+    const buildAt = stepIndex(next, /\bnpm run build\b/);
+    const checkAt = stepIndex(next, /\bdist\/cli\.cjs --version\b/);
+    const publishAt = stepIndex(next, /\bnpm publish\b/);
+    if (versionAt === -1 || buildAt === -1 || versionAt > buildAt) {
+      push(
+        'publish-next-version',
+        'npm version must run before npm run build, so the package is built at the version it is published as',
+      );
+    }
+    if (checkAt === -1 || checkAt < buildAt || (publishAt !== -1 && checkAt > publishAt)) {
+      push(
+        'publish-next-version',
+        "the built package's dist/cli.cjs --version must be checked after npm run build and before npm publish",
       );
     }
     const env = findEnvironmentName(next);

@@ -165,7 +165,6 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
           package-manager-cache: false
       - run: npm ci
-      - run: npm run build
       - name: compute the next prerelease version
         id: version
         run: |
@@ -174,9 +173,26 @@ jobs:
           sha7="${GITHUB_SHA:0:7}"
           version="${major}.${minor}.$((patch + 1))-next.${GITHUB_RUN_NUMBER}.g${sha7}"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
-      # Applied to the checked-out workspace only; never committed, so
-      # package.json in the repo keeps its release-please-owned version.
+      # The version is set before the build, in both places it lives:
+      # package.json, which npm publishes under, and the VERSION literal in
+      # src/index.ts, which the build bakes into the package and `dgr -V`
+      # prints. Neither change is committed, so the repository keeps its
+      # release-please-owned version.
       - run: npm version "${{ steps.version.outputs.version }}" --no-git-tag-version
+      - name: stamp the prerelease version into src/index.ts
+        run: sed -i -E "s/^export const VERSION = '[^']*';/export const VERSION = '${VERSION}';/" src/index.ts
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+      - run: npm run build
+      - name: check the built package reports the prerelease version
+        run: |
+          built="$(node dist/cli.cjs --version)"
+          if [ "$built" != "$VERSION" ]; then
+            echo "::error::the built package reports ${built}, not ${VERSION}"
+            exit 1
+          fi
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
       - run: npm publish --provenance --tag next --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}

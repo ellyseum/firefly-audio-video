@@ -140,6 +140,7 @@ test('render(spec): 202, then poll, then succeeded, resolves an Asset at the out
     {
       source: { url: CAPSULE },
       presets: [{ source: { presetId: 'ffs_video_api_land_1080p_hq' } }],
+      variations: [{ variables: [] }],
       outputs: [{ variationIndex: 0, presetIndex: 0, destination: { url: WRITE } }],
     },
   ]);

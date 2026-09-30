@@ -44,6 +44,12 @@ export interface RenderBodyWire {
   source: { url: string };
   presets: RenderBodyPresetRef[];
   assets?: { source: { url: string } }[];
-  variations?: { variables: RenderVariable[] }[];
+  /**
+   * Always at least one entry. `buildRenderBody` fills in a single
+   * override-free variation (`{ variables: [] }`) when the friendly spec has
+   * none — the real API rejects a render whose body omits `variations`
+   * entirely with a `422 validation_error`.
+   */
+  variations: { variables: RenderVariable[] }[];
   outputs: RenderBodyOutput[];
 }

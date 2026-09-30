@@ -4,8 +4,30 @@
  */
 
 import * as z from 'zod';
-import { RenderSpecSchema, type RenderSpec } from './schemas.js';
+import { RenderSpecSchema, RenderVariationSchema, type RenderSpec } from './schemas.js';
 import type { RenderBodyOutput, RenderBodyPresetRef, RenderBodyWire } from './types.js';
+
+/**
+ * The wire body's `variations[]`, exactly as the published `TemplateRenderRequest`
+ * contract requires it: present, with at least one entry — the real API answers
+ * `422 validation_error` for a render whose body omits `variations` entirely, even
+ * when nothing needs overriding. {@link RenderSpecSchema}'s own `variations`
+ * (./schemas.ts) stays optional for a caller, because `buildRenderBody` always
+ * fills in a single override-free variation when a spec has none or an empty
+ * array; this schema validates the value that actually reaches the wire, so a
+ * body missing `variations` — or carrying an empty array — can never leave this
+ * module.
+ */
+export const WireVariationsSchema = z
+  .array(RenderVariationSchema)
+  .min(1, 'variations must contain at least one entry — the real API rejects a render with none');
+
+/**
+ * The wire value for a spec with no per-variation overrides: one variation with
+ * no variable bindings — what every output's default `variationIndex: 0` already
+ * points at.
+ */
+const DEFAULT_VARIATIONS: RenderBodyWire['variations'] = [{ variables: [] }];
 
 /**
  * Validates `spec` against {@link RenderSpecSchema} and, once valid, transforms it
@@ -17,6 +39,11 @@ import type { RenderBodyOutput, RenderBodyPresetRef, RenderBodyWire } from './ty
  *   `{ source: { url } }` — a bare `{ presetId }` is rejected with a
  *   `422 validation_error`.
  * - `variationIndex` defaults to `0` when omitted.
+ * - `variations` is always present on the wire, with at least one entry — a
+ *   spec with none, or an empty array, gets a single override-free variation
+ *   (`{ variables: [] }`), matching every output's default `variationIndex: 0`.
+ *   The real API rejects a render whose body omits `variations` entirely with a
+ *   `422 validation_error`.
  * - `fileName` is left off the output entirely when absent, rather than sent as
  *   `undefined`.
  * - `presetIndex` passes through unchanged — it is already a 0-based index into
@@ -62,13 +89,17 @@ export function buildRenderBody(spec: RenderSpec): RenderBodyWire {
     destination: { url: output.destination },
   }));
 
+  const variations = WireVariationsSchema.parse(
+    parsed.variations && parsed.variations.length > 0 ? parsed.variations : DEFAULT_VARIATIONS,
+  );
+
   return {
     source: { url: parsed.source },
     presets,
     ...(parsed.assets && parsed.assets.length > 0
       ? { assets: parsed.assets.map((url) => ({ source: { url } })) }
       : {}),
-    ...(parsed.variations && parsed.variations.length > 0 ? { variations: parsed.variations } : {}),
+    variations,
     outputs,
   };
 }

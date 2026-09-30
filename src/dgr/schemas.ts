@@ -69,6 +69,19 @@ export const RenderVariableSchema = z.looseObject({
 export type RenderVariable = z.infer<typeof RenderVariableSchema>;
 
 /**
+ * One variation of a render: the set of {@link RenderVariableSchema} overrides
+ * applied for it. A render's `outputs[]` selects one variation per deliverable
+ * via `variationIndex`. {@link RenderSpecSchema}'s own `variations` (below)
+ * uses this shape for a caller's list, which may be empty or absent; the wire
+ * body's `variations[]` uses the same shape but always carries at least one
+ * entry — see `WireVariationsSchema` in `./build-body.ts`.
+ */
+export const RenderVariationSchema = z.strictObject({ variables: z.array(RenderVariableSchema) });
+
+/** A friendly {@link RenderVariationSchema} input. */
+export type RenderVariation = z.infer<typeof RenderVariationSchema>;
+
+/**
  * One deliverable of a render job: which variation and preset produce it, and where
  * the finished asset should land. `destination` is a plain presigned write URL here
  * — the SDK wraps it in the `{ url }` object the wire format expects (the
@@ -275,7 +288,7 @@ export const RenderSpecSchema = z.strictObject({
   source: z.string().min(1, 'source must not be empty'),
   presets: z.array(PresetRefSchema).min(1, 'at least one preset is required'),
   assets: z.array(z.string().min(1, 'asset url must not be empty')).optional(),
-  variations: z.array(z.strictObject({ variables: z.array(RenderVariableSchema) })).optional(),
+  variations: z.array(RenderVariationSchema).optional(),
   outputs: z.array(RenderOutputSchema).min(1, 'at least one output is required'),
 });
 

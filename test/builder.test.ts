@@ -92,6 +92,7 @@ test('a fluent render resolves an Asset through allocateOutput: the write URL go
     {
       source: { url: CAPSULE },
       presets: [{ source: { presetId: 'ffs_video_api_land_1080p_hq' } }],
+      variations: [{ variables: [] }],
       outputs: [
         {
           variationIndex: 0,

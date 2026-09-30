@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
 import * as z from 'zod';
-import { buildRenderBody } from '../src/dgr/build-body.js';
+import { WireVariationsSchema, buildRenderBody } from '../src/dgr/build-body.js';
 import type { RenderSpec } from '../src/dgr/schemas.js';
 
 test('destination becomes an object {url}, not a string', () => {
@@ -95,4 +95,61 @@ test('an assetIndex with no assets at all is out of range too, and an in-range o
     variations: [{ variables: [{ variableId: 'v', assetIndex: 0 }] }],
   });
   expect(body.variations?.[0]?.variables[0]?.assetIndex).toBe(0);
+});
+
+test('a spec with no variations gets one variation with no overrides on the wire', () => {
+  const body = buildRenderBody({
+    source: 's',
+    presets: [{ presetId: 'p' }],
+    outputs: [{ presetIndex: 0, destination: 'd' }],
+  });
+  expect(body.variations).toEqual([{ variables: [] }]);
+  expect(body.outputs.every((output) => output.variationIndex < body.variations.length)).toBe(true);
+});
+
+test('a spec with an explicitly empty variations array also gets one variation with no overrides', () => {
+  const body = buildRenderBody({
+    source: 's',
+    presets: [{ presetId: 'p' }],
+    variations: [],
+    outputs: [{ presetIndex: 0, destination: 'd' }],
+  });
+  expect(body.variations).toEqual([{ variables: [] }]);
+});
+
+test("every output's variationIndex stays within the wire body's variations length when the spec has none", () => {
+  const body = buildRenderBody({
+    source: 's',
+    presets: [{ presetId: 'p' }],
+    outputs: [
+      { presetIndex: 0, destination: 'd0' },
+      { presetIndex: 0, destination: 'd1' },
+    ],
+  });
+  expect(body.variations).toHaveLength(1);
+  expect(body.outputs.every((output) => output.variationIndex < body.variations.length)).toBe(true);
+});
+
+test('explicit variations pass through unchanged on the wire', () => {
+  const variations = [
+    { variables: [{ variableId: '0_0_media', assetIndex: 0 }] },
+    { variables: [{ variableId: '0_0_media', value: 'Second' }] },
+  ];
+  const body = buildRenderBody({
+    source: 's',
+    presets: [{ presetId: 'p' }],
+    assets: ['https://x/a0.png'],
+    variations,
+    outputs: [
+      { variationIndex: 0, presetIndex: 0, destination: 'd0' },
+      { variationIndex: 1, presetIndex: 0, destination: 'd1' },
+    ],
+  });
+  expect(body.variations).toEqual(variations);
+});
+
+test('the wire variations schema rejects a body missing variations, or carrying an empty array', () => {
+  expect(WireVariationsSchema.safeParse(undefined).success).toBe(false);
+  expect(WireVariationsSchema.safeParse([]).success).toBe(false);
+  expect(WireVariationsSchema.safeParse([{ variables: [] }]).success).toBe(true);
 });

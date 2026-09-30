@@ -17,6 +17,9 @@
  *    (not OR) `vars.PUBLISH_ENABLED == 'true'`.
  *  - `publish-latest`'s `needs:` includes `verify`.
  *  - `publish-latest` declares `environment: release`.
+ *  - `publish-latest` publishes with `npm stage publish`, never a direct
+ *    `npm publish` — npm's trusted publisher for that environment only
+ *    accepts a staged version, which a maintainer approves on npm with 2FA.
  *  - `publish-next`'s `if:` requires `vars.PUBLISH_ENABLED == 'true'` and
  *    the not-a-release-commit check (`release_created != 'true'`).
  *  - `publish-next`'s `needs:` includes `verify`.
@@ -30,9 +33,10 @@
  *    into `NODE_AUTH_TOKEN` — that env var is what `npm publish` reads
  *    before it tries OIDC, so either shape reopens the door trusted
  *    publishing closed.
- *  - every `npm publish` invocation, in any job, carries `--provenance` —
- *    the attestation trusted publishing produces, and proof a publish
- *    never ships without it even if a stored token slipped back in.
+ *  - every `npm publish` or `npm stage publish` invocation, in any job,
+ *    carries `--provenance` — the attestation trusted publishing produces,
+ *    and proof a publish never ships without it even if a stored token
+ *    slipped back in.
  *  - `verify`, which both publish jobs need, runs every quality gate
  *    (typecheck, lint, format check, build, test), the packed-file check
  *    (`scripts/verify-pack-contents.mjs`), and `scripts/runtime-smoke.mjs`
@@ -295,11 +299,16 @@ function stepIndex(lines, pattern) {
   return lines.findIndex((line) => !isBlankOrComment(line) && pattern.test(line));
 }
 
-/** Every trimmed line invoking `npm publish` without `--provenance`, in a job's body. */
+/** Every trimmed line invoking `npm publish` or `npm stage publish` without `--provenance`, in a job's body. */
 function npmPublishLinesWithoutProvenance(lines) {
   return lines
-    .filter((l) => /\bnpm publish\b/.test(l) && !l.includes('--provenance'))
+    .filter((l) => /\bnpm (?:stage )?publish\b/.test(l) && !l.includes('--provenance'))
     .map((l) => l.trim());
+}
+
+/** Every trimmed line in a job's body invoking `npm publish` or `npm stage publish`, either form. */
+function npmPublishOrStageLines(lines) {
+  return lines.filter((l) => /\bnpm (?:stage )?publish\b/.test(l)).map((l) => l.trim());
 }
 
 /**
@@ -390,6 +399,19 @@ export function checkReleaseGate(text) {
         'publish-latest-environment',
         `environment must be "release", found: ${JSON.stringify(env)}`,
       );
+    }
+    const publishLines = npmPublishOrStageLines(latest);
+    if (publishLines.length === 0) {
+      push('publish-latest-stage', 'job "publish-latest" has no npm publish step');
+    } else {
+      for (const line of publishLines) {
+        if (!/\bnpm stage publish\b/.test(line)) {
+          push(
+            'publish-latest-stage',
+            `job "publish-latest" must publish with "npm stage publish", not a direct publish: ${line}`,
+          );
+        }
+      }
     }
   }
 

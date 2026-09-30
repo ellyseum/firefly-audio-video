@@ -2,9 +2,10 @@
  * Builds the `dgr` commander program: a pure factory over a
  * {@link CliRuntime} (the real process by default, or a test's fakes),
  * wired so every exit — a command's own, or commander's own usage errors —
- * goes through `runtime.exit()` rather than a real `process.exit()`. With
- * `--json` in argv, a usage error prints the same one-document failure every
- * command prints, on stdout, instead of commander's own text on stderr.
+ * goes through `runtime.exit()`, which by default sets `process.exitCode`
+ * and lets the process end once its event loop drains. With `--json` in
+ * argv, a usage error prints the same one-document failure every command
+ * prints, on stdout, instead of commander's own text on stderr.
  */
 
 import { Command, CommanderError } from 'commander';
@@ -34,8 +35,14 @@ export interface CreateProgramOptions {
   env?: CliEnv;
   stdout?: NodeJS.WritableStream;
   stderr?: NodeJS.WritableStream;
-  /** Replaces `process.exit`. Called exactly once per invocation. */
+  /**
+   * Sets the exit code. Called exactly once per invocation. Defaults to
+   * setting `process.exitCode`, so the process ends once pending work has
+   * drained.
+   */
   exit?: (code: number) => void;
+  /** Ends the process at once; only a second Ctrl+C during `render` calls it. Defaults to `process.exit`. */
+  forceExit?: (code: number) => void;
   /** Subscribes to Ctrl+C for as long as `render` runs. Defaults to the process's `SIGINT`. */
   onInterrupt?: InterruptSource;
 }
@@ -53,9 +60,9 @@ const EPILOG = [
  * A configured `dgr` program. `options.client` makes every command run on
  * that client, skipping credential resolution entirely — how a test drives
  * this with no network. `parseAsync()` on the returned program never
- * rejects and never calls the real `process.exit`: every exit path,
- * commander's own included, calls `options.exit` (or `process.exit` by
- * default) exactly once.
+ * rejects: every exit path, commander's own included, calls `options.exit`
+ * exactly once, and only a second Ctrl+C during `render` calls
+ * `options.forceExit`.
  */
 export function createProgram(options: CreateProgramOptions = {}): Command {
   const runtime: CliRuntime = {
@@ -63,7 +70,8 @@ export function createProgram(options: CreateProgramOptions = {}): Command {
     env: options.env ?? process.env,
     stdout: options.stdout ?? process.stdout,
     stderr: options.stderr ?? process.stderr,
-    exit: options.exit ?? ((code: number) => process.exit(code)),
+    exit: options.exit ?? setProcessExitCode,
+    forceExit: options.forceExit ?? ((code: number) => process.exit(code)),
     onInterrupt: options.onInterrupt ?? onProcessSigint,
   };
 
@@ -125,6 +133,16 @@ export function createProgram(options: CreateProgramOptions = {}): Command {
 
   wrapParseAsync(program, runtime, parse);
   return program;
+}
+
+/**
+ * Sets the process's exit code, leaving the process to end once its event
+ * loop drains. `process.exit()` while a fetch's handles are still closing
+ * aborts Node on Windows (libuv's `UV_HANDLE_CLOSING` assertion) and
+ * replaces the exit code with 0xC0000409.
+ */
+function setProcessExitCode(code: number): void {
+  process.exitCode = code;
 }
 
 /** Subscribes `listener` to the process's `SIGINT`; the returned function unsubscribes it. */

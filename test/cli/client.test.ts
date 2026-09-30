@@ -22,6 +22,7 @@ function runtimeOf(overrides: Partial<CliRuntime> = {}): CliRuntime {
     stdout: writableStub(),
     stderr: writableStub(),
     exit: () => undefined,
+    forceExit: () => undefined,
     onInterrupt: () => () => undefined,
     ...overrides,
   };

@@ -1,9 +1,9 @@
 /**
  * The seam every CLI command depends on instead of the real process: a
  * client to skip building one, an environment to read credentials and
- * defaults from, the streams a command's output goes to, the function that
- * ends the process, and where Ctrl+C comes from. {@link createProgram}
- * builds one from real `process` state by default; a test supplies its own.
+ * defaults from, the streams a command's output goes to, how the process
+ * ends, and where Ctrl+C comes from. {@link createProgram} builds one from
+ * real `process` state by default; a test supplies its own.
  */
 
 import type { Client } from '../dgr/client.js';
@@ -21,8 +21,14 @@ export interface CliRuntime {
   readonly env: CliEnv;
   readonly stdout: NodeJS.WritableStream;
   readonly stderr: NodeJS.WritableStream;
-  /** Ends the process with this exit code. Never called more than once per invocation. */
+  /**
+   * Sets the code the process exits with once its pending work — an open
+   * socket, a cancel request — has drained. Never called more than once per
+   * invocation.
+   */
   readonly exit: (code: number) => void;
+  /** Ends the process now, abandoning pending work — only a second Ctrl+C during `render` calls this. */
+  readonly forceExit: (code: number) => void;
   /** Where `render` listens for Ctrl+C while its job runs. */
   readonly onInterrupt: InterruptSource;
 }

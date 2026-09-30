@@ -325,7 +325,7 @@ test('Ctrl+C cancels the job exactly once, prints one notice to stderr, and exit
   expect(harness.exit).toHaveBeenCalledExactlyOnceWith(130);
 });
 
-test('a second Ctrl+C exits 130 immediately, without waiting for the job to settle, and cancels only once', async () => {
+test('a second Ctrl+C ends the process at once with 130, without waiting for the job, and cancels only once', async () => {
   const dj = deferredJob<string>({ jobId: 'job-1', meta: META });
   const render = vi.fn(() => dj.job);
   const harness = createHarness({ client: createFakeClient({ render }) });
@@ -336,14 +336,15 @@ test('a second Ctrl+C exits 130 immediately, without waiting for the job to sett
   harness.interrupt();
 
   // The job is still pending — .cancel() never settles it in this test double
-  // — yet the second Ctrl+C already forced the exit.
-  expect(harness.exit).toHaveBeenCalledExactlyOnceWith(130);
+  // — yet the second Ctrl+C already ended the process.
+  expect(harness.forceExit).toHaveBeenCalledExactlyOnceWith(130);
   expect(dj.cancelCalls).toBe(1);
 
   dj.fail(cancelledError());
   await run;
-  // Settling afterward must not call exit a second time.
-  expect(harness.exit).toHaveBeenCalledExactlyOnceWith(130);
+  // Settling afterward sets no exit code and ends nothing a second time.
+  expect(harness.forceExit).toHaveBeenCalledExactlyOnceWith(130);
+  expect(harness.exit).not.toHaveBeenCalled();
 });
 
 test('Ctrl+C with no in-flight job (a synchronous validation failure) never subscribes a listener', async () => {
@@ -383,6 +384,7 @@ test("by default render listens on the process's SIGINT while the job runs, and 
   const baseline = process.listenerCount('SIGINT');
   const dj = deferredJob<string>({ jobId: 'job-1', meta: META });
   const exit = vi.fn<(code: number) => void>();
+  const forceExit = vi.fn<(code: number) => void>();
   const sink = { write: () => true } as unknown as NodeJS.WritableStream;
   const program = createProgram({
     client: createFakeClient({ render: vi.fn(() => dj.job) }),
@@ -390,6 +392,7 @@ test("by default render listens on the process's SIGINT while the job runs, and 
     stdout: sink,
     stderr: sink,
     exit,
+    forceExit,
   });
 
   const run = program.parseAsync(['render', '--template', 't.mogrt', '--preset', 'prores'], {
@@ -406,4 +409,5 @@ test("by default render listens on the process's SIGINT while the job runs, and 
 
   expect(process.listenerCount('SIGINT')).toBe(baseline);
   expect(exit).toHaveBeenCalledExactlyOnceWith(130);
+  expect(forceExit).not.toHaveBeenCalled();
 });

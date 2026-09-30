@@ -1,6 +1,7 @@
 /**
- * Builds a `createProgram()` instance over captured streams, a spied `exit`
- * and an interrupt source the test presses by hand, for command tests.
+ * Builds a `createProgram()` instance over captured streams, spied `exit`
+ * and `forceExit`, and an interrupt source the test presses by hand, for
+ * command tests.
  */
 
 import { vi } from 'vitest';
@@ -9,6 +10,7 @@ import { createProgram, type CreateProgramOptions } from '../../../src/cli/progr
 export interface Harness {
   readonly program: ReturnType<typeof createProgram>;
   readonly exit: ReturnType<typeof vi.fn<(code: number) => void>>;
+  readonly forceExit: ReturnType<typeof vi.fn<(code: number) => void>>;
   stdoutText(): string;
   stderrText(): string;
   /** Presses Ctrl+C: calls every listener subscribed through the runtime's interrupt source. */
@@ -31,11 +33,15 @@ function capturingStream(): { stream: NodeJS.WritableStream; text: () => string 
 }
 
 export function createHarness(
-  options: Omit<CreateProgramOptions, 'stdout' | 'stderr' | 'exit' | 'onInterrupt'> = {},
+  options: Omit<
+    CreateProgramOptions,
+    'stdout' | 'stderr' | 'exit' | 'forceExit' | 'onInterrupt'
+  > = {},
 ): Harness {
   const stdout = capturingStream();
   const stderr = capturingStream();
   const exit = vi.fn<(code: number) => void>();
+  const forceExit = vi.fn<(code: number) => void>();
   const listeners = new Set<() => void>();
   const program = createProgram({
     ...options,
@@ -43,6 +49,7 @@ export function createHarness(
     stdout: stdout.stream,
     stderr: stderr.stream,
     exit,
+    forceExit,
     onInterrupt: (listener) => {
       listeners.add(listener);
       return () => {
@@ -53,6 +60,7 @@ export function createHarness(
   return {
     program,
     exit,
+    forceExit,
     stdoutText: stdout.text,
     stderrText: stderr.text,
     interrupt: () => {

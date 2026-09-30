@@ -1,4 +1,4 @@
-import { expect, test } from 'vitest';
+import { expect, test, vi } from 'vitest';
 import { VERSION } from '../../src/index.js';
 import { createProgram } from '../../src/cli/program.js';
 import { EXIT_CODES } from '../../src/cli/exit-codes.js';
@@ -115,6 +115,24 @@ test('a global option is read the same way whether given before or after the sub
   const after = createHarness({ client: createFakeClient({ listPresets: async () => remote }) });
   await after.run(['presets', '--remote', '--json']);
   expect(before.stdoutText()).toBe(after.stdoutText());
+});
+
+test('by default an exit sets process.exitCode and never calls process.exit', async () => {
+  const original = process.exitCode;
+  const processExit = vi.spyOn(process, 'exit').mockImplementation((code) => {
+    throw new Error(`process.exit(${String(code)}) was called`);
+  });
+  const sink = { write: () => true } as unknown as NodeJS.WritableStream;
+  try {
+    await createProgram({ env: {}, stdout: sink, stderr: sink }).parseAsync(['bogus-command'], {
+      from: 'user',
+    });
+    expect(process.exitCode).toBe(2);
+    expect(processExit).not.toHaveBeenCalled();
+  } finally {
+    process.exitCode = original;
+    processExit.mockRestore();
+  }
 });
 
 test('createProgram() builds without any options, defaulting to the real process streams', () => {

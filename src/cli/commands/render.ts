@@ -63,8 +63,9 @@ async function runRender(
     if (sigintCount === 1) {
       runtime.stderr.write('Cancelling the render...\n');
       void job?.cancel();
-    } else {
-      doExit(130);
+    } else if (!exited) {
+      exited = true;
+      runtime.forceExit(130);
     }
   };
 

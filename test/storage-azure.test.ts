@@ -251,7 +251,7 @@ test('stageRead uploads a Buffer as a block blob, then returns a read-only HTTPS
   expect(uploads[0]?.options).toEqual({ blobHTTPHeaders: { blobContentType: 'image/png' } });
   expect(uploads[0]?.blob).toMatch(STAGED_KEY);
   expect(sas).toEqual([
-    { blob: uploads[0]?.blob, permissions: 'r', expiresOn: inSeconds(3600), protocol: 'https' },
+    { blob: uploads[0]?.blob, permissions: 'r', expiresOn: inSeconds(86400), protocol: 'https' },
   ]);
   expect(url.startsWith(`${BLOB_BASE}/firefly-audio-video/staged/`)).toBe(true);
   expect(url).toMatch(/sp=r&sig=SIG_r_1$/);

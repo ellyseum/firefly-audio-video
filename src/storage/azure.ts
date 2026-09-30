@@ -101,8 +101,9 @@ export interface AzureBlobStorageProviderOptions {
   prefix?: string;
   /**
    * Seconds every URL this provider returns stays valid, from 1 to 604800
-   * (seven days). Defaults to one hour for a staged input and 24 hours for an
-   * output, whose URLs must outlive the render and the download after it.
+   * (seven days). Defaults to 24 hours: a staged input's URL must last until
+   * the service reads it, which can follow a long wait in its queue, and an
+   * output's URLs must outlive the render and the download after it.
    */
   expiresIn?: number;
   /**

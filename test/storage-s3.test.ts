@@ -303,7 +303,7 @@ test('stageRead sends PutObject with the bytes, then returns a presigned GET of 
   expect(presigner.calls).toHaveLength(1);
   expect(presigner.calls[0]?.command).toBeInstanceOf(GetObjectCommand);
   expect(objectOf(presigner.calls[0]?.command)).toEqual({ Bucket: BUCKET, Key: put.input.Key });
-  expect(presigner.calls[0]?.options).toEqual({ expiresIn: 3600 });
+  expect(presigner.calls[0]?.options).toEqual({ expiresIn: 86400 });
   expect(presigner.calls[0]?.client).toBe(client);
   expect(url).toMatch(/X-Amz-Signature=SIG_GetObject_1/);
 });

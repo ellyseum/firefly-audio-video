@@ -164,6 +164,60 @@ test("mutation: renaming publish-next's environment reddens publish-next-environ
   expect(ids(violations)).toEqual(['publish-next-environment']);
 });
 
+test('mutation: putting the bootstrap-token line back in publish-latest reddens npm-token-secret', () => {
+  const mutated = mutate(
+    BASE,
+    '      - run: npm publish --provenance --access public\n',
+    '      - run: npm publish --provenance --access public\n        env:\n          NODE_AUTH_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}\n',
+  );
+  const violations = checkReleaseGate(mutated);
+  expect(ids(violations)).toEqual(['npm-token-secret']);
+  expect(onlyMessage(violations)).toMatch(/"publish-latest".*NODE_AUTH_TOKEN/);
+});
+
+test('mutation: putting the bootstrap-token line back in publish-next reddens npm-token-secret', () => {
+  const mutated = mutate(
+    BASE,
+    '      - run: npm publish --provenance --tag next --access public\n',
+    '      - run: npm publish --provenance --tag next --access public\n        env:\n          NODE_AUTH_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}\n',
+  );
+  const violations = checkReleaseGate(mutated);
+  expect(ids(violations)).toEqual(['npm-token-secret']);
+  expect(onlyMessage(violations)).toMatch(/"publish-next".*NODE_AUTH_TOKEN/);
+});
+
+test('mutation: a secret merely named like an npm token, fed into an unrelated key, still reddens npm-token-secret', () => {
+  const mutated = mutate(
+    BASE,
+    '      - run: npm publish --provenance --access public\n',
+    '      - run: npm publish --provenance --access public\n        env:\n          SOME_OTHER_VAR: ${{ secrets.NPM_TOKEN }}\n',
+  );
+  const violations = checkReleaseGate(mutated);
+  expect(ids(violations)).toEqual(['npm-token-secret']);
+  expect(onlyMessage(violations)).toMatch(/NPM_TOKEN/);
+});
+
+test('mutation: any secret fed into NODE_AUTH_TOKEN reddens npm-token-secret even under an unrelated name', () => {
+  const mutated = mutate(
+    BASE,
+    '      - run: npm publish --provenance --access public\n',
+    '      - run: npm publish --provenance --access public\n        env:\n          NODE_AUTH_TOKEN: ${{ secrets.RELEASE_TOKEN }}\n',
+  );
+  const violations = checkReleaseGate(mutated);
+  expect(ids(violations)).toEqual(['npm-token-secret']);
+  expect(onlyMessage(violations)).toMatch(/RELEASE_TOKEN/);
+});
+
+test('mutation: an unrelated secret fed into an unrelated key does not redden npm-token-secret', () => {
+  const mutated = mutate(
+    BASE,
+    '      - run: npm publish --provenance --access public\n',
+    '      - run: npm publish --provenance --access public\n        env:\n          SOME_OTHER_VAR: ${{ secrets.SOME_OTHER_SECRET }}\n',
+  );
+  const violations = checkReleaseGate(mutated);
+  expect(ids(violations)).toEqual([]);
+});
+
 test('mutation: dropping --provenance from publish-latest reddens npm-publish-provenance', () => {
   const mutated = mutate(
     BASE,

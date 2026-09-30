@@ -25,12 +25,14 @@
  *    the built package's `dist/cli.cjs --version` after the build and
  *    before `npm publish`, so a prerelease never ships reporting another
  *    version.
- *  - the only `secrets.*` referenced inside either publish job is
- *    `NPM_BOOTSTRAP_TOKEN`.
+ *  - neither publish job references a `secrets.*` value that looks like a
+ *    stored npm auth token: one named `NPM_...`, or any secret at all fed
+ *    into `NODE_AUTH_TOKEN` — that env var is what `npm publish` reads
+ *    before it tries OIDC, so either shape reopens the door trusted
+ *    publishing closed.
  *  - every `npm publish` invocation, in any job, carries `--provenance` —
- *    trusted publishing adds it automatically once configured, but a
- *    publish authenticated by the bootstrap token alone must not ship
- *    without it.
+ *    the attestation trusted publishing produces, and proof a publish
+ *    never ships without it even if a stored token slipped back in.
  *  - `verify`, which both publish jobs need, runs every quality gate
  *    (typecheck, lint, format check, build, test), the packed-file check
  *    (`scripts/verify-pack-contents.mjs`), and `scripts/runtime-smoke.mjs`
@@ -221,14 +223,31 @@ function hasIdTokenWrite(lines) {
   return lines.some((l) => /^\s*id-token:\s*write\s*$/.test(l));
 }
 
-function secretsReferenced(lines) {
-  const names = new Set();
+/** A secret name this repo treats as looking like an npm auth token by its own spelling. */
+const NPM_TOKEN_SECRET_NAME = /^NPM_/;
+
+/**
+ * Every line, in a job's body, that authenticates npm with a stored secret
+ * rather than trusted publishing: a `secrets.*` reference whose own name
+ * looks like an npm token, or any `NODE_AUTH_TOKEN:` assignment fed by a
+ * secret regardless of that secret's name — `npm publish` reads that env
+ * var before it ever tries OIDC, so either shape is a live way back to
+ * long-lived-token auth.
+ */
+function npmTokenSecretLines(lines) {
+  const hits = [];
   for (const line of lines) {
-    for (const m of line.matchAll(/secrets\.([A-Za-z0-9_]+)/g)) {
-      names.add(m[1]);
+    const secret = line.match(/secrets\.([A-Za-z0-9_]+)/);
+    if (!secret) {
+      continue;
+    }
+    const feedsNodeAuthToken = /^\s*NODE_AUTH_TOKEN\s*:/.test(line);
+    const nameLooksLikeNpmToken = NPM_TOKEN_SECRET_NAME.test(secret[1]);
+    if (feedsNodeAuthToken || nameLooksLikeNpmToken) {
+      hits.push(line.trim());
     }
   }
-  return [...names];
+  return hits;
 }
 
 /** The commands `verify` must run before either publish job may start, each named in its violation. */
@@ -452,13 +471,8 @@ export function checkReleaseGate(text) {
     if (!body) {
       continue;
     }
-    for (const secret of secretsReferenced(body)) {
-      if (secret !== 'NPM_BOOTSTRAP_TOKEN') {
-        push(
-          'secret-scope',
-          `job "${name}" references secrets.${secret}; only NPM_BOOTSTRAP_TOKEN is allowed`,
-        );
-      }
+    for (const line of npmTokenSecretLines(body)) {
+      push('npm-token-secret', `job "${name}" authenticates npm with a stored secret: ${line}`);
     }
   }
 

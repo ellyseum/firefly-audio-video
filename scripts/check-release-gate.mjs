@@ -22,6 +22,10 @@
  *  - `publish-next` declares `environment: npm-next`.
  *  - the only `secrets.*` referenced inside either publish job is
  *    `NPM_BOOTSTRAP_TOKEN`.
+ *  - every `npm publish` invocation, in any job, carries `--provenance` —
+ *    trusted publishing adds it automatically once configured, but a
+ *    publish authenticated by the bootstrap token alone must not ship
+ *    without it.
  *
  * Usage: `node scripts/check-release-gate.mjs [path-to-release.yml]`
  */
@@ -216,6 +220,13 @@ function secretsReferenced(lines) {
   return [...names];
 }
 
+/** Every trimmed line invoking `npm publish` without `--provenance`, in a job's body. */
+function npmPublishLinesWithoutProvenance(lines) {
+  return lines
+    .filter((l) => /\bnpm publish\b/.test(l) && !l.includes('--provenance'))
+    .map((l) => l.trim());
+}
+
 /**
  * @param {string} text the workflow file's raw contents
  * @returns {{ id: string, message: string }[]} every rule violated; empty when clean
@@ -258,6 +269,15 @@ export function checkReleaseGate(text) {
       push('id-token-scope', `job "${name}" is missing from the workflow`);
     } else if (!hasIdTokenWrite(body)) {
       push('id-token-scope', `job "${name}" must declare id-token: write`);
+    }
+  }
+
+  for (const [name, body] of jobs) {
+    for (const line of npmPublishLinesWithoutProvenance(body)) {
+      push(
+        'npm-publish-provenance',
+        `job "${name}" runs npm publish without --provenance: ${line}`,
+      );
     }
   }
 

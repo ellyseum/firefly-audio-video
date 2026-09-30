@@ -150,6 +150,6 @@ jobs:
       # Applied to the checked-out workspace only; never committed, so
       # package.json in the repo keeps its release-please-owned version.
       - run: npm version "${{ steps.version.outputs.version }}" --no-git-tag-version
-      - run: npm publish --tag next --access public
+      - run: npm publish --provenance --tag next --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}

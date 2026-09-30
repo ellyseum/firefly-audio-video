@@ -185,3 +185,40 @@ test('mutation: an extra secret inside publish-next reddens secret-scope', () =>
   expect(ids(violations)).toEqual(['secret-scope']);
   expect(onlyMessage(violations)).toMatch(/SOMETHING_ELSE/);
 });
+
+test('mutation: dropping --provenance from publish-latest reddens npm-publish-provenance', () => {
+  const mutated = mutate(
+    BASE,
+    '- run: npm publish --provenance --access public',
+    '- run: npm publish --access public',
+  );
+  const violations = checkReleaseGate(mutated);
+  expect(ids(violations)).toEqual(['npm-publish-provenance']);
+  expect(onlyMessage(violations)).toMatch(/"publish-latest".*without --provenance/);
+});
+
+test('mutation: dropping --provenance from publish-next reddens npm-publish-provenance', () => {
+  const mutated = mutate(
+    BASE,
+    '- run: npm publish --provenance --tag next --access public',
+    '- run: npm publish --tag next --access public',
+  );
+  const violations = checkReleaseGate(mutated);
+  expect(ids(violations)).toEqual(['npm-publish-provenance']);
+  expect(onlyMessage(violations)).toMatch(/"publish-next".*without --provenance/);
+});
+
+test('mutation: dropping --provenance from both publish jobs reddens npm-publish-provenance twice', () => {
+  let mutated = mutate(
+    BASE,
+    '- run: npm publish --provenance --access public',
+    '- run: npm publish --access public',
+  );
+  mutated = mutate(
+    mutated,
+    '- run: npm publish --provenance --tag next --access public',
+    '- run: npm publish --tag next --access public',
+  );
+  const violations = checkReleaseGate(mutated);
+  expect(ids(violations)).toEqual(['npm-publish-provenance', 'npm-publish-provenance']);
+});

@@ -124,12 +124,14 @@ export function createProgram(options: CreateProgramOptions = {}): Command {
   program.addCommand(buildStageCommand(runtime));
   program.addCommand(buildEncodeCommand(runtime));
 
-  // `.addCommand()` does not inherit the parent's output/exit configuration
-  // the way `.command()` does, so every command — root included — is
-  // configured explicitly here, once, regardless of how it was attached.
+  // `.addCommand()` does not inherit the parent's output, exit and help
+  // configuration the way `.command()` does, so every command — root
+  // included — is configured explicitly here, once, regardless of how it was
+  // attached. Each subcommand's help lists the global options too.
   for (const command of [program, ...program.commands]) {
     command.configureOutput(outputConfiguration);
     command.exitOverride();
+    command.configureHelp({ showGlobalOptions: true });
     reportOptionNamesOnly(command);
   }
 

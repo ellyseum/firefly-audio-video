@@ -29,6 +29,16 @@ type OutputMode =
 /** How long a cancelled render waits for its cancel request to settle before exiting anyway. */
 const CANCEL_REQUEST_WAIT_MS = 10_000;
 
+const STORAGE_HELP = [
+  '',
+  'Storage: a render writes its output to --storage (or DGR_STORAGE) — one of',
+  "'s3://<bucket>[/<prefix>]', 'azure://<container>[/<prefix>]' or 'aio-files' —",
+  'and uploads a local --template or an .epr preset there, including the one an',
+  '--encode config becomes. Only a --spec whose outputs name their own',
+  'destinations, whose inputs are all URLs and whose presets are native needs no',
+  'storage.',
+].join('\n');
+
 export function buildRenderCommand(runtime: CliRuntime): Command {
   const command = new Command('render');
   command
@@ -42,6 +52,7 @@ export function buildRenderCommand(runtime: CliRuntime): Command {
       '--resolve-as <mode>',
       "how to resolve the output: 'url' (default) or 'file' (needs --out)",
     )
+    .addHelpText('after', STORAGE_HELP)
     .action(async (ownOptions: RenderOwnOptions, self: Command) => {
       await runRender(runtime, self.optsWithGlobals() as GlobalOptions & RenderOwnOptions);
     });

@@ -40,6 +40,26 @@ test('--help never mentions passing a secret on the command line as the preferre
   expect(collapsed).toContain('prefer the environment');
 });
 
+test("every command's help lists the global options", async () => {
+  for (const name of ['render', 'describe', 'presets', 'status', 'cancel', 'stage', 'encode']) {
+    const harness = createHarness();
+    await harness.run([name, '--help']);
+    const text = harness.stdoutText();
+    expect(text).toContain('Global Options:');
+    expect(text).toContain('--client-id <id>');
+    expect(text).toContain('--storage <uri>');
+    expect(harness.exit).toHaveBeenCalledExactlyOnceWith(0);
+  }
+});
+
+test('render --help says a render writes its output to --storage or DGR_STORAGE', async () => {
+  const harness = createHarness();
+  await harness.run(['render', '--help']);
+  const collapsed = harness.stdoutText().replace(/\s+/g, ' ');
+  expect(collapsed).toContain('Storage: a render writes its output to --storage (or DGR_STORAGE)');
+  expect(collapsed).toContain('needs no storage.');
+});
+
 test('an unknown command is a commander usage error mapped to exit 2, with no real process.exit', async () => {
   const harness = createHarness();
   await harness.run(['bogus-command']);

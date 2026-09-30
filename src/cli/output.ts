@@ -7,11 +7,13 @@
  * it (an {@link Asset}'s `toJSON()`), and a value a command exists to
  * produce is not scrubbed. A failure's message always goes through the
  * shared redaction: an {@link AudioVideoError}'s is redacted when the error
- * is built, and any other error's is redacted here.
+ * is built, and any other error's is redacted here. An SDK error's advice is
+ * restated in the CLI's terms first ({@link cliMessage}).
  */
 
 import { AudioVideoError } from '../core/errors.js';
 import { redactValue } from '../core/redact.js';
+import { cliMessage } from './advice.js';
 
 /** The streams a command's output goes to — a {@link CliRuntime} satisfies this. */
 export interface OutputStreams {
@@ -57,7 +59,7 @@ export function printFailure(streams: OutputStreams, json: boolean, error: unkno
 
 /** `{ code, message }` for any thrown value — the two fields a failure ever prints. */
 function errorShape(error: unknown): { code: string; message: string } {
-  if (error instanceof AudioVideoError) return { code: error.code, message: error.message };
+  if (error instanceof AudioVideoError) return { code: error.code, message: cliMessage(error) };
   if (error instanceof Error) {
     return { code: 'unexpected_error', message: redactValue(error.message) };
   }

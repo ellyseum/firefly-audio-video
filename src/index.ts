@@ -82,3 +82,11 @@ export type {
   AioFilesModule,
   AioFilesStorageProviderOptions,
 } from './storage/aio-files.js';
+export { S3StorageProvider } from './storage/s3.js';
+export type {
+  S3ClientLike,
+  S3ClientModule,
+  S3Credentials,
+  S3PresignerModule,
+  S3StorageProviderOptions,
+} from './storage/s3.js';

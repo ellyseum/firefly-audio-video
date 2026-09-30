@@ -219,6 +219,11 @@ const STORAGE_PROVIDERS = [
     peer: '@adobe/aio-lib-files',
     options: { namespace: 'runtime-smoke-ns', auth: 'runtime-smoke-auth' },
   },
+  {
+    name: 'S3StorageProvider',
+    peer: '@aws-sdk/client-s3',
+    options: { bucket: 'runtime-smoke-bucket', region: 'us-east-1' },
+  },
 ];
 
 /** True when `name` resolves from the package being tested — an optional peer that is installed. */

@@ -37,6 +37,7 @@ import {
   type PooledJobOutcome,
 } from '../core/pooled-job.js';
 import { normalizeAsset, type StageInput, type StorageProvider } from '../core/storage.js';
+import { appBuilderStorage } from '../storage/aio-files.js';
 import {
   createRenderBuilder,
   type FluentRenderer,
@@ -147,6 +148,11 @@ export interface ClientConfig {
    * inputs; and every output with no `destination`, fluent renders included.
    * Without it, any of those rejects `invalid_argument`; http(s) URLs never
    * need it.
+   *
+   * Omitted, a client in an App Builder environment — `__OW_NAMESPACE` or
+   * `AIO_runtime_namespace` set — uses an `AioFilesStorageProvider`, and any
+   * other client has none. A `storage` given here always wins; pass a
+   * `PassthroughStorageProvider` for a client that must never upload.
    */
   storage?: StorageProvider;
   /**
@@ -541,7 +547,7 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
     this.#pool =
       config.pool ??
       new InMemoryPool(config.concurrency === undefined ? {} : { concurrency: config.concurrency });
-    this.#storage = config.storage;
+    this.#storage = config.storage ?? appBuilderStorage();
     this.#http = new HttpClient({
       apiKey: clientId,
       tokenProvider,

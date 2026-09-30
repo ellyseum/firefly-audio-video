@@ -173,6 +173,62 @@ async function runBehaviourChecks(mod, label) {
       }
     },
   );
+
+  await check(`[${label}] every storage provider constructs without loading its SDK`, () => {
+    for (const { name, options } of STORAGE_PROVIDERS) {
+      const provider = new mod[name](options);
+      if (
+        typeof provider.stageRead !== 'function' ||
+        typeof provider.allocateOutput !== 'function'
+      ) {
+        throw new Error(`${name} does not implement stageRead() and allocateOutput()`);
+      }
+    }
+  });
+
+  for (const { name, peer, options } of STORAGE_PROVIDERS) {
+    // Where the peer is installed, using the provider would reach its real SDK; the
+    // missing-peer path is exercised wherever it is not, as in the production-only install.
+    if (resolvableFromDist(peer)) {
+      console.log(`ok - [${label}] ${name} with ${peer} missing # SKIP ${peer} is installed here`);
+      continue;
+    }
+    await check(
+      `[${label}] ${name} rejects missing_peer_dependency while ${peer} is missing`,
+      async () => {
+        const err = await new mod[name](options).allocateOutput().then(
+          () => undefined,
+          (error) => error,
+        );
+        if (
+          !(err instanceof mod.AudioVideoError) ||
+          err.code !== 'missing_peer_dependency' ||
+          !err.message.includes(`npm install ${peer}`)
+        ) {
+          throw new Error(`${name} without ${peer} did not reject missing_peer_dependency: ${err}`);
+        }
+      },
+    );
+  }
+}
+
+/** Every storage provider the package exports, with options that construct it offline and the peer it loads. */
+const STORAGE_PROVIDERS = [
+  {
+    name: 'AioFilesStorageProvider',
+    peer: '@adobe/aio-lib-files',
+    options: { namespace: 'runtime-smoke-ns', auth: 'runtime-smoke-auth' },
+  },
+];
+
+/** True when `name` resolves from the package being tested — an optional peer that is installed. */
+function resolvableFromDist(name) {
+  try {
+    createRequire(join(distDir, 'index.cjs')).resolve(name);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 if (cjs) await runBehaviourChecks(cjs, 'cjs');

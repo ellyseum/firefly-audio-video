@@ -76,3 +76,9 @@ export type { InMemoryPoolOptions, PoolBackend } from './core/pool.js';
 
 export { normalizeAsset, PassthroughStorageProvider } from './core/storage.js';
 export type { StageInput, StorageProvider } from './core/storage.js';
+export { AioFilesStorageProvider } from './storage/aio-files.js';
+export type {
+  AioFilesClient,
+  AioFilesModule,
+  AioFilesStorageProviderOptions,
+} from './storage/aio-files.js';

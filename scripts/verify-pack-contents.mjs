@@ -1,31 +1,44 @@
 #!/usr/bin/env node
 /**
- * Runs `npm publish --dry-run --json`, which builds the package via the
- * `prepublishOnly` script and reports exactly the file list a real publish
- * would upload, then asserts that list against the package's own contract:
- * the built `dist/`, `LICENSE`, `README.md` and `package.json`, and nothing
- * from the development tree. `package.json`'s `files` field is an allowlist,
- * so this is a regression guard against that field ever being loosened (or
- * removed, which would fall back to packing everything not `.npmignore`d) —
- * it fails the exact way a leaked `test/` or `.claude/` directory would.
+ * Runs `npm pack --dry-run --json`, which reports exactly the file list a
+ * real publish would upload without ever contacting the registry — unlike
+ * `npm publish --dry-run`, which checks whether the version is already
+ * published and refuses once it is. `package.json` stays at the released
+ * version between releases, so a publish-shaped dry run can only ever
+ * succeed once per version; a pack-shaped one always can, which is what
+ * lets this run on every push between releases. The reported list is
+ * asserted against the package's own contract: the built `dist/`,
+ * `LICENSE`, `README.md` and `package.json`, and nothing from the
+ * development tree. `package.json`'s `files` field is an allowlist, so
+ * this is a regression guard against that field ever being loosened (or
+ * removed, which would fall back to packing everything not `.npmignore`d)
+ * — it fails the exact way a leaked `test/` or `.claude/` directory would.
  *
- * `npm publish`'s own stdout is not pure JSON: lifecycle scripts (`prepare`,
- * `prepublishOnly` and the build it runs) write their own log lines to the
- * same stream before the JSON result, so the JSON is extracted by scanning
- * for the first `[` or `{` whose remainder parses, rather than assumed to be
- * the whole output.
+ * `npm pack` does not run the `prepublishOnly` script, so it packs
+ * whatever `dist/` already holds — including nothing, if it is absent.
+ * Callers run `npm run build` first; this script checks `dist/` exists
+ * before invoking `npm pack` and fails naming that, rather than letting an
+ * unbuilt tree quietly produce a file list with no `dist/` entries at all.
+ *
+ * `npm pack`'s own stdout is not pure JSON: lifecycle scripts (`prepare` on
+ * this package) write their own log lines to the same stream before the
+ * JSON result, so the JSON is extracted by scanning for the first `[` or
+ * `{` whose remainder parses, rather than assumed to be the whole output.
  *
  * The parsed value itself has more than one shape depending on the npm
- * version running it: a flat object with `files` at the top, an array of
- * one such object (`npm pack --json`'s shape), or an object keyed by the
- * package's own name whose value holds `files` (the npm bundled with
- * Node 24, seen in CI). `resolvePublishEntry` accepts all three.
+ * version and command that produced it: an array of one such object
+ * (`npm pack --json`'s own shape, and what this script normally sees), a
+ * flat object with `files` at the top, or an object keyed by the package's
+ * own name whose value holds `files` (the npm bundled with Node 24, seen in
+ * CI running `npm publish --dry-run --json`). `resolvePublishEntry` accepts
+ * all three, since the parsing has no reason to depend on which of the two
+ * commands produced the JSON.
  *
  * Usage: `node scripts/verify-pack-contents.mjs`
  */
 
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -133,19 +146,46 @@ export function checkPackedFiles(paths) {
   return violations;
 }
 
+/**
+ * Whether `root` already holds a built `dist/` — checked before running
+ * `npm pack`, which does not build the package itself and would otherwise
+ * silently pack whatever partial or absent output happens to be there.
+ * @param {string} root
+ * @returns {boolean}
+ */
+export function hasBuiltDist(root) {
+  return existsSync(join(root, 'dist'));
+}
+
+/**
+ * Runs the fixed, argument-free `npm pack --dry-run --json` in the package
+ * root — a command with no attacker-controlled input, so on Windows it runs
+ * through a shell to resolve the `npm.cmd` shim, passed as one string
+ * (rather than `shell: true` with an args array) to avoid Node's
+ * unescaped-argument-concatenation warning for that combination. Exported so
+ * a test can run the exact command this script runs, rather than a copy of
+ * it, and pin that the command is `npm pack` and never `npm publish`.
+ * @returns {{ stdout: string, stderr: string, status: number | null, error?: Error }}
+ */
+export function runPackDryRun() {
+  return process.platform === 'win32'
+    ? spawnSync('npm pack --dry-run --json', { encoding: 'utf8', shell: true })
+    : spawnSync('npm', ['pack', '--dry-run', '--json'], { encoding: 'utf8' });
+}
+
 function main() {
-  // A fixed, argument-free command line with no attacker-controlled input:
-  // on Windows this must run through a shell to resolve the `npm.cmd` shim,
-  // and passing the whole line as one string (rather than `shell: true`
-  // with an args array) avoids Node's unescaped-argument-concatenation
-  // warning for that combination.
-  const result =
-    process.platform === 'win32'
-      ? spawnSync('npm publish --dry-run --json', { encoding: 'utf8', shell: true })
-      : spawnSync('npm', ['publish', '--dry-run', '--json'], { encoding: 'utf8' });
+  if (!hasBuiltDist(ROOT)) {
+    console.error(
+      'dist/ is missing: npm pack does not build the package, so run `npm run build` first.',
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  const result = runPackDryRun();
 
   if (result.error) {
-    console.error(`failed to run npm publish --dry-run: ${result.error.message}`);
+    console.error(`failed to run npm pack --dry-run: ${result.error.message}`);
     process.exitCode = 1;
     return;
   }
@@ -154,7 +194,7 @@ function main() {
   try {
     manifest = extractTrailingJson(result.stdout);
   } catch (err) {
-    console.error('could not parse npm publish --dry-run --json output');
+    console.error('could not parse npm pack --dry-run --json output');
     console.error(err instanceof Error ? err.message : err);
     console.error('--- npm stdout ---');
     console.error(result.stdout);
@@ -167,7 +207,7 @@ function main() {
   const packageName = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).name;
   const { entry, topLevelKeys } = resolvePublishEntry(manifest, packageName);
   if (!entry || !Array.isArray(entry.files)) {
-    console.error('npm publish --dry-run --json produced no "files" array');
+    console.error('npm pack --dry-run --json produced no "files" array');
     console.error(`top-level keys seen: ${JSON.stringify(topLevelKeys)}`);
     process.exitCode = 1;
     return;

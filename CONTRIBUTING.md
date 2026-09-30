@@ -2,9 +2,9 @@
 
 ## Releasing
 
-`.github/workflows/release.yml` builds and packages the project on every push and pull request,
-regardless of the flags below. Nothing publishes to npm, and the pull-request preview channel does
-not run, until the repository is public and the steps in this section have been done once.
+`.github/workflows/release.yml` builds and packages the project on every push and pull request
+through `pack-contents`, independent of whether publishing is enabled. Everything else in this
+workflow, including the pull-request preview channel, runs only while the repository is public.
 
 ### Channels
 
@@ -17,32 +17,33 @@ not run, until the repository is public and the steps in this section have been 
 CI never moves an npm dist-tag itself. After a stable release ships to `latest`, the following
 push to `main` republishes `@next` from that new base.
 
-### The flip
+### How a release ships
 
-The repository is public and both environments exist; the package name is still unclaimed, so
-none of the above can run until:
+release-please watches conventional commits on `main` and keeps one open pull request whose diff
+is the next version bump and changelog. Merging it is what ships a stable release; every other
+green push to `main` republishes `@next` instead.
 
-1. **The repository is public — done.** On GitHub Free, environments — and the protection rules on
-   them — exist only on public repositories, which is why `release` and `npm-next` could not be
-   created before this.
-2. **Two GitHub environments exist — done.**
-   - `release` — required reviewer: the repository owner; deployment branches: `main`.
-   - `npm-next` — no required reviewer; deployment branches: `main`.
-3. **Add a repository secret `NPM_BOOTSTRAP_TOKEN`**: a classic npm automation token with publish
-   access to this package. npm has nothing to trust a workflow with for a package that has never
-   been published, so an npm trusted publisher cannot be configured yet and the very first publish
-   needs a real token. Both publish jobs already reference this secret as a fallback the npm CLI
-   only tries after OIDC, so no workflow change is needed at any later step.
-4. **Set the repository variable `PUBLISH_ENABLED` to `true`.**
-5. **Merge the release-please pull request.** This publishes `0.1.0` to `latest` with provenance,
-   authenticated by `NPM_BOOTSTRAP_TOKEN`.
-6. **On npmjs.com, add two trusted publishers** for the now-existing package, both pointing at
-   repository `ellyseum/firefly-audio-video` and workflow `release.yml`: one pinned to environment
-   `release`, one pinned to environment `npm-next`.
-7. **Delete `NPM_BOOTSTRAP_TOKEN` from the repository and revoke the token on npmjs.com.** An
-   absent secret resolves to an empty string; the npm CLI tries OIDC first regardless, so both
-   channels move to OIDC-only publishing at this point with no further edit.
-8. The next push to `main` publishes the first `@next` prerelease by OIDC.
+`verify` runs on every push once publishing is enabled, and gates both publish jobs: typecheck,
+lint, format check, build, test, the packed-file check (`scripts/verify-pack-contents.mjs`), and
+`scripts/runtime-smoke.mjs` against the built package on Node 18, 20, 22 and 24. Neither publish
+job starts until it passes on the commit being published.
+
+- **`publish-latest`** runs once `verify` passes on a commit release-please just tagged. It deploys
+  through the `release` environment, which requires the repository owner's approval before the job
+  proceeds, then publishes to the `latest` dist-tag.
+- **`publish-next`** runs on every other green push — one that is not itself a release commit, and
+  only once a `latest` version already exists on npm (`check-npm-tag`) — publishing to the `next`
+  dist-tag through the `npm-next` environment, which requires no approval.
+
+Both jobs authenticate to npm by trusted publishing, not a stored secret: `permissions: id-token:
+write` lets the job mint a short-lived OIDC token that npm exchanges for a publish grant, and
+`npm publish --provenance` attaches the resulting attestation. Neither job references any npm
+secret.
+
+Set the repository variable `PUBLISH_ENABLED` to `false` to pause the release path: `verify`,
+`check-npm-tag`, and both publish jobs are skipped, since none of them has anything to do while
+nothing may publish. `pack-contents` keeps running regardless — it only ever runs `npm pack
+--dry-run`, which never contacts the registry and never authenticates to npm.
 
 ### Floor for OIDC trusted publishing
 

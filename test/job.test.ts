@@ -475,6 +475,26 @@ test('status "failed" with no error detail → job_failed with empty items', asy
   expect(err?.message).toContain('"failed"');
 });
 
+test('an AudioVideoError mapResult throws on the terminal body names the job', async () => {
+  statusReplies({ status: 'completed' });
+  const job = runJob(http(), {
+    submit: submitJ1,
+    mapResult: () => {
+      throw new AudioVideoError({
+        message: 'The terminal status carried no outputs.',
+        code: 'invalid_response',
+      });
+    },
+    pollIntervalMs: 0,
+  });
+
+  const err = await rejectionOf(job);
+
+  expect(err?.jobId).toBe('j1');
+  expect(err?.code).toBe('invalid_response');
+  expect(err?.message).toBe('The terminal status carried no outputs.');
+});
+
 test('status "canceled" reported by the service → rejects cancelled', async () => {
   statusReplies({ status: 'canceled' });
   const job = runJob(http(), { submit: submitJ1, mapResult: () => 'unreached', pollIntervalMs: 0 });
@@ -830,7 +850,7 @@ test('a status poll that runs past the per-attempt timeout is retried, and the j
   }
 });
 
-test('a statusUrl on another origin is never polled: the job rejects invalid_response', async () => {
+test('a statusUrl on another origin is never polled: the job rejects invalid_response naming the job', async () => {
   let polled = 0;
   agent
     .get('https://other-host.example')
@@ -849,6 +869,7 @@ test('a statusUrl on another origin is never polled: the job rejects invalid_res
   const err = await rejectionOf(job);
 
   expect(err?.code).toBe('invalid_response');
+  expect(err?.jobId).toBe('j1');
   expect(polled).toBe(0);
 });
 
@@ -1266,7 +1287,7 @@ test('five consecutive 503s exhaust the default budget → job_poll_failed carry
 });
 
 test.each([403, 404])(
-  'a %i on a poll is final: the job rejects with that HTTP error after exactly one request',
+  'a %i on a poll is final: the job rejects with that HTTP error, naming the job, after exactly one request',
   async (status) => {
     const { polls } = failingForever(status);
     const cancels = cancelEndpoint();
@@ -1281,11 +1302,107 @@ test.each([403, 404])(
     expect(err).toBeInstanceOf(AudioVideoError);
     expect(err?.code).toBe(`http_${status}`);
     expect(err?.status).toBe(status);
+    expect(err?.jobId).toBe('j1');
     expect(polls()).toBe(1);
     expect(cancels()).toBe(0);
     expect(inspect(job)).toBe("{ jobId: 'j1', state: 'rejected' }");
   },
 );
+
+test('a final poll failure names the job and otherwise matches the redacted client error it keeps as cause', async () => {
+  const signed = 'https://acct.blob.core.windows.net/c/out.mov?sv=2021&sp=r&sig=POLL_BODY_SIG';
+  pool()
+    .intercept({ path: (path) => path.startsWith(STATUS_PATH), method: 'GET' })
+    .reply(
+      403,
+      { error: 'forbidden', output: signed },
+      { headers: { 'x-request-id': 'req-poll' } },
+    );
+  const job = runJob(http(), {
+    submit: () => Promise.resolve({ jobId: 'j1', statusUrl: `${STATUS_URL}?token=POLL_URL_TOKEN` }),
+    mapResult: () => 'unreached',
+    pollIntervalMs: 0,
+  });
+
+  const err = await rejectionOf(job);
+
+  expect(err?.jobId).toBe('j1');
+  expect(err).toBeInstanceOf(AudioVideoError);
+  const original = err?.cause as AudioVideoError;
+  expect(original).toBeInstanceOf(AudioVideoError);
+  expect(original.jobId).toBeUndefined();
+  expect(err?.code).toBe('http_403');
+  expect(err?.status).toBe(403);
+  expect(err?.requestId).toBe('req-poll');
+  expect(err?.message).toBe(`Request to ${STATUS_URL} failed with status 403.`);
+  expect(err?.items).toEqual([
+    { error: 'forbidden', output: 'https://acct.blob.core.windows.net/c/out.mov' },
+  ]);
+  expect({ ...err?.toJSON(), jobId: undefined }).toEqual(original.toJSON());
+  for (const printed of [JSON.stringify(err), inspect(err), String(err)]) {
+    expect(printed).not.toContain('POLL_BODY_SIG');
+    expect(printed).not.toContain('POLL_URL_TOKEN');
+  }
+});
+
+test('a 401 on a poll whose forced token re-mint fails rejects auth_failed naming the job', async () => {
+  const client = new HttpClient({
+    apiKey: 'key',
+    tokenProvider: {
+      getAccessToken: (opts) =>
+        opts?.forceRefresh === true
+          ? Promise.reject(new Error('IMS unreachable'))
+          : Promise.resolve('TOKEN'),
+    },
+  });
+  pool().intercept({ path: STATUS_PATH, method: 'GET' }).reply(401, { error: 'expired' });
+  const job = runJob(client, { submit: submitJ1, mapResult: () => 'unreached', pollIntervalMs: 0 });
+
+  const err = await rejectionOf(job);
+
+  expect(err?.jobId).toBe('j1');
+  expect(err?.code).toBe('auth_failed');
+  expect(err?.message).toBe('The token provider failed to supply an access token.');
+  expect(inspect(job)).toBe("{ jobId: 'j1', state: 'rejected' }");
+});
+
+test("one refusal shared by two jobs' forced re-mints names each job on its own rejection and leaves the shared error untouched", async () => {
+  // A token provider shares one in-flight mint, and so one rejection, among every caller.
+  const refusal = new AudioVideoError({
+    message: 'IMS refused the credential.',
+    code: 'auth_failed',
+  });
+  const client = new HttpClient({
+    apiKey: 'key',
+    tokenProvider: {
+      getAccessToken: (opts) =>
+        opts?.forceRefresh === true ? Promise.reject(refusal) : Promise.resolve('TOKEN'),
+    },
+  });
+  const ids = ['j1', 'j2'];
+  for (const id of ids) {
+    pool()
+      .intercept({ path: `/v1/status/${id}`, method: 'GET' })
+      .reply(401, { error: 'expired' });
+  }
+
+  const errors = await Promise.all(
+    ids.map((jobId) =>
+      rejectionOf(
+        runJob(client, {
+          submit: () => Promise.resolve({ jobId, statusUrl: `${DEFAULT_HOST}/v1/status/${jobId}` }),
+          mapResult: () => 'unreached',
+          pollIntervalMs: 0,
+        }),
+      ),
+    ),
+  );
+
+  expect(errors.map((err) => err?.jobId)).toEqual(ids);
+  expect(errors[0]?.cause).toBe(refusal);
+  expect(errors[1]?.cause).toBe(refusal);
+  expect(refusal.jobId).toBeUndefined();
+});
 
 test('cancel() during a retry backoff rejects cancelled at once, issues the cancel request, and polls no further', async () => {
   vi.useFakeTimers();

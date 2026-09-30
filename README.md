@@ -405,7 +405,9 @@ into fields; whether Azure Log Analytics splits the JSON keys into columns has n
 
 Every rejection and throw is an `AudioVideoError`: an `Error` with a stable `.code` to switch on,
 `.status` (HTTP), `.jobId`, `.requestId` (the response's `x-request-id`), `.items` (detail such as
-each failed output's errors) and a native `.cause`.
+each failed output's errors) and a native `.cause`. Once the service has accepted a job, every
+rejection that follows names it in `.jobId`, from a failed status poll to a failed download of its
+output, so `status(jobId)` still reaches the job.
 
 ```ts
 import { AudioVideoError, render, type RenderRequest } from 'firefly-audio-video';
@@ -447,8 +449,8 @@ Errors are redacted when they are built. `.message`, `.items`, `toJSON()`, `toSt
 SAS, AWS SigV4 and SigV2, Google Cloud Storage V4 and V2), a connection string's key, or a JWT.
 `.jobId` and `.requestId` stay as the service sent them. `.cause` holds the underlying error for
 inspection and is left out of every serialized form; a storage provider's or the official IMS token
-provider's failure keeps a redacted copy there, not the object it threw, so log the error rather
-than its cause.
+provider's failure keeps a redacted copy in the cause chain, not the object it threw, so log the
+error rather than its cause.
 
 ## CLI
 

@@ -547,6 +547,78 @@ test('the render signal cancels a resolveAs download in progress, writing nothin
   rmdirSync(dir);
 });
 
+// --- a job the service accepted is named on every rejection that follows -------------------
+
+/** The status endpoint for `jobId`, answering every poll with `status`, an error body and a request ID. */
+function pollFails(jobId: string, status: number): void {
+  api.agent
+    .get(API)
+    .intercept({ path: `/v1/status/${jobId}`, method: 'GET' })
+    .reply(status, { error: `status ${status}` }, { headers: { 'x-request-id': 'req-poll' } })
+    .persist();
+}
+
+test('a status poll answering 403 after the service accepted the render rejects http_403 naming the job', async () => {
+  api.submit(['job-ACCEPTED-1']);
+  pollFails('job-ACCEPTED-1', 403);
+
+  const error = await rejection(client().render(singleSpec(), { pollIntervalMs: 0 }));
+
+  expect(error.jobId).toBe('job-ACCEPTED-1');
+  expect(error.code).toBe('http_403');
+  expect(error.status).toBe(403);
+  expect(error.requestId).toBe('req-poll');
+  expect(error.items).toEqual([{ error: 'status 403' }]);
+});
+
+test('a 401 on a status poll whose forced token re-mint throws rejects auth_failed naming the job', async () => {
+  api.submit(['job-ACCEPTED-1']);
+  pollFails('job-ACCEPTED-1', 401);
+  const c = createClient({
+    clientId: 'client-id',
+    tokenProvider: {
+      getAccessToken: async (opts) => {
+        if (opts?.forceRefresh === true) throw new Error('IMS unreachable');
+        return 'PROVIDED_TOKEN';
+      },
+    },
+    logging: false,
+  });
+
+  const error = await rejection(c.render(singleSpec(), { pollIntervalMs: 0 }));
+
+  expect(error.jobId).toBe('job-ACCEPTED-1');
+  expect(error.code).toBe('auth_failed');
+});
+
+test('a describe whose status poll answers 403 rejects http_403 naming the job', async () => {
+  api.submit(['job-DESCRIBE-1'], { path: '/v1/templates/describe' });
+  pollFails('job-DESCRIBE-1', 403);
+
+  const error = await rejection(client().describe(CAPSULE, { pollIntervalMs: 0 }));
+
+  expect(error.jobId).toBe('job-DESCRIBE-1');
+  expect(error.code).toBe('http_403');
+});
+
+test('a resolveAs download that fails after the render succeeded rejects asset_fetch_failed naming the job', async () => {
+  api.submit(['job-ACCEPTED-1']);
+  succeedsAt('job-ACCEPTED-1');
+  api.agent
+    .get(STORAGE)
+    .intercept({ path: (path) => path.startsWith('/out/a.mov'), method: 'GET' })
+    .reply(404, 'gone')
+    .persist();
+
+  const error = await rejection(
+    client().render(singleSpec(), { resolveAs: 'buffer', pollIntervalMs: 0 }),
+  );
+
+  expect(error.jobId).toBe('job-ACCEPTED-1');
+  expect(error.code).toBe('asset_fetch_failed');
+  expect(error.status).toBe(404);
+});
+
 // --- logging -------------------------------------------------------------------------------
 
 /** Every string a record must never carry. */

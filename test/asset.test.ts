@@ -19,7 +19,7 @@ import { getGlobalDispatcher, MockAgent, setGlobalDispatcher } from 'undici';
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from 'vitest';
 import { AudioVideoError } from '../src/core/errors.js';
 import { Asset, resolveAsset } from '../src/core/asset.js';
-import type { AssetReadOptions, ResolveAs } from '../src/core/asset.js';
+import type { AssetOptions, AssetReadOptions, ResolveAs } from '../src/core/asset.js';
 import type { JobMeta } from '../src/core/job.js';
 import { flush, until } from './support/mock-api.js';
 import {
@@ -2006,4 +2006,95 @@ test('a fetch that ignores its signal and resolves after an abort still ends the
 
   expect(err).toBeInstanceOf(AudioVideoError);
   expect((err as AudioVideoError).code).toBe('cancelled');
+});
+
+// --- every failure names the job the asset came from ---------------------------------------
+
+/** An asset whose every request goes through `fetch`. */
+function fetchedBy(fetch: NonNullable<AssetOptions['fetch']>): Asset {
+  return new Asset({ url: SAS_URL, meta: sampleMeta(), fetch });
+}
+
+/** An asset served by `server`. */
+function servedBy(server: RangeServer): Asset {
+  return new Asset({ url: server.url, meta: sampleMeta() });
+}
+
+test.each<[label: string, fail: () => Promise<AudioVideoError>, code: string]>([
+  [
+    'a non-2xx response',
+    () =>
+      readFailure(
+        fetchedBy(async () => fakeResponse('forbidden', 403)),
+        'buffer',
+      ),
+    'asset_fetch_failed',
+  ],
+  [
+    'a fetch that rejects',
+    () =>
+      readFailure(
+        fetchedBy(async () => Promise.reject(new TypeError('fetch failed'))),
+        'stream',
+      ),
+    'asset_fetch_failed',
+  ],
+  [
+    'an aborted signal',
+    () =>
+      readFailure(
+        fetchedBy(async () => fakeResponse('bytes')),
+        'save',
+        {
+          signal: AbortSignal.abort(),
+        },
+      ),
+    'cancelled',
+  ],
+  [
+    'a refused resumption',
+    async () => readFailure(servedBy(await cutOnce(V1, () => ({ status: 403 }))), 'buffer'),
+    'asset_fetch_failed',
+  ],
+  [
+    'retries that run out',
+    async () =>
+      readFailure(
+        servedBy(await rangeServer({ resource: V1, handle: () => ({ cutAfter: 10_000 }) })),
+        'buffer',
+        { retries: 1 },
+      ),
+    'asset_fetch_failed',
+  ],
+  [
+    'a server that cannot resume',
+    async () => readFailure(servedBy(await cutOnce(V1, () => ({ ignoreRange: true }))), 'stream'),
+    'asset_fetch_failed',
+  ],
+  [
+    'a failed file-system step',
+    async () => {
+      const path = join(tempDir(), 'out.bin');
+      mkdirSync(path);
+      const asset = servedBy(await rangeServer({ resource: V1 }));
+      return (await asset.save(path).catch((e: unknown) => e)) as AudioVideoError;
+    },
+    'save_failed',
+  ],
+  [
+    'an invalid retries option',
+    () =>
+      readFailure(
+        fetchedBy(async () => fakeResponse('bytes')),
+        'buffer',
+        { retries: -1 },
+      ),
+    'invalid_argument',
+  ],
+])('%s fails the read naming the job the asset came from', async (_label, fail, code) => {
+  const err = await fail();
+
+  expect(err).toBeInstanceOf(AudioVideoError);
+  expect(err.jobId).toBe('job-1');
+  expect(err.code).toBe(code);
 });

@@ -12,7 +12,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, open, rename, rm, type FileHandle } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { Readable } from 'node:stream';
-import { AudioVideoError } from './errors.js';
+import { AudioVideoError, type AudioVideoErrorOptions } from './errors.js';
 import type { JobMeta } from './job.js';
 import { redactUrl, redactValue } from './redact.js';
 import { delay, linkSignals } from './signals.js';
@@ -129,6 +129,9 @@ export interface AssetJSON {
  * instead be *logged or displayed*: {@link Asset.toJSON}, {@link Asset.toString}, and
  * `console.log` (via the `util.inspect` custom hook) all report a scrubbed URL.
  *
+ * Every error a read raises names the job that produced the asset in `jobId`,
+ * the ID {@link Asset.meta} carries.
+ *
  * @example
  * ```ts
  * const asset = await render(spec);
@@ -143,6 +146,8 @@ export class Asset {
   readonly #url: string;
   /** Timing derived from the job that produced this asset. */
   readonly meta: JobMeta;
+  /** The job `meta` names, which every error a read of this asset raises carries as `jobId`. */
+  readonly #jobId: string | undefined;
   readonly #fetch: FetchLike;
 
   /**
@@ -151,6 +156,7 @@ export class Asset {
   constructor(options: AssetOptions) {
     this.#url = options.url;
     this.meta = options.meta;
+    this.#jobId = producingJob(options.meta);
     this.#fetch = options.fetch ?? (globalThis.fetch as FetchLike);
   }
 
@@ -187,7 +193,7 @@ export class Asset {
    */
   async buffer(options: AssetReadOptions = {}): Promise<Buffer> {
     const chunks: Buffer[] = [];
-    for await (const chunk of this.#download(readPlan(options))) {
+    for await (const chunk of this.#download(readPlan(options, this.#jobId))) {
       chunks.push(chunk);
     }
     return Buffer.concat(chunks);
@@ -225,7 +231,7 @@ export class Asset {
    *   when `options.retries` is not a non-negative integer.
    */
   stream(options: AssetReadOptions = {}): Readable {
-    const plan = readPlan(options);
+    const plan = readPlan(options, this.#jobId);
     const destroyed = new AbortController();
     const link = linkSignals(
       plan.signal === undefined ? [destroyed.signal] : [plan.signal, destroyed.signal],
@@ -285,7 +291,7 @@ export class Asset {
    *   `options.retries` is not a non-negative integer.
    */
   async save(path: string, options: AssetReadOptions = {}): Promise<void> {
-    const plan = readPlan(options);
+    const plan = readPlan(options, this.#jobId);
     let file: TempFile | undefined;
     const download = this.#download({
       ...plan,
@@ -506,6 +512,11 @@ export class Asset {
     }
   }
 
+  /** An {@link AudioVideoError} from `options`, naming the job that produced this asset. */
+  #error(options: Omit<AudioVideoErrorOptions, 'jobId'>): AudioVideoError {
+    return new AudioVideoError({ ...options, jobId: this.#jobId });
+  }
+
   /**
    * The error for a status that fails the download: the first request's
    * non-2xx, or a re-request's status that is neither resumable nor worth
@@ -513,7 +524,7 @@ export class Asset {
    */
   #statusFailure(status: number, afterInterruption: boolean): AudioVideoError {
     const when = afterInterruption ? ' after the download was interrupted' : '';
-    return new AudioVideoError({
+    return this.#error({
       message: `Fetching the asset at ${redactUrl(this.#url)} failed with status ${status}${when}.`,
       code: 'asset_fetch_failed',
       status,
@@ -532,7 +543,7 @@ export class Asset {
     signal: AbortSignal | undefined,
   ): AudioVideoError {
     if (retries === 0) return this.#wrapTransportError(last.cause, signal);
-    return new AudioVideoError({
+    return this.#error({
       message:
         `Fetching the asset at ${redactUrl(this.#url)} failed: the download was interrupted, ` +
         `and ${retries} ${retries === 1 ? 'retry' : 'retries'} did not complete it.`,
@@ -554,7 +565,7 @@ export class Asset {
     interruption: unknown,
     status?: number,
   ): AudioVideoError {
-    return new AudioVideoError({
+    return this.#error({
       message:
         `Fetching the asset at ${redactUrl(this.#url)} failed: the download was interrupted after ` +
         `${offset} bytes and could not be resumed, because ${reason}.`,
@@ -575,7 +586,7 @@ export class Asset {
   #saveFailure(path: string, err: unknown, signal: AbortSignal | undefined): AudioVideoError {
     if (err instanceof AudioVideoError) return err;
     if (err instanceof DiskStepFailure && signal?.aborted !== true) {
-      return new AudioVideoError({
+      return this.#error({
         message: `Saving the asset at ${redactUrl(this.#url)} to ${path} failed while ${err.step}.`,
         code: 'save_failed',
         cause: sanitizeTransportError(err.cause, this.#url),
@@ -595,13 +606,13 @@ export class Asset {
    */
   #wrapTransportError(cause: unknown, signal?: AbortSignal): AudioVideoError {
     if (signal?.aborted) {
-      return new AudioVideoError({
+      return this.#error({
         message: `Fetching the asset at ${redactUrl(this.#url)} was cancelled.`,
         code: 'cancelled',
         cause: sanitizeTransportError(signal.reason, this.#url),
       });
     }
-    return new AudioVideoError({
+    return this.#error({
       message: `Fetching the asset at ${redactUrl(this.#url)} failed.`,
       code: 'asset_fetch_failed',
       cause: sanitizeTransportError(cause, this.#url),
@@ -676,17 +687,28 @@ type Verdict =
   | { kind: 'retry' }
   | { kind: 'fatal' };
 
-/** The read options every accessor takes, validated, with the default retry budget filled in. */
-function readPlan(options: AssetReadOptions): DownloadPlan {
+/**
+ * The read options every accessor takes, validated, with the default retry
+ * budget filled in. An invalid `retries` throws naming `jobId`, the job that
+ * produced the asset.
+ */
+function readPlan(options: AssetReadOptions, jobId: string | undefined): DownloadPlan {
   const { signal, retries = DEFAULT_RETRIES } = options;
   if (!Number.isSafeInteger(retries) || retries < 0) {
     const given = typeof retries === 'number' ? String(retries) : `a ${typeof retries}`;
     throw new AudioVideoError({
       message: `retries must be a non-negative integer; got ${given}.`,
       code: 'invalid_argument',
+      jobId,
     });
   }
   return { signal, retries };
+}
+
+/** The job ID `meta` names, or `undefined` when it names none: no meta, or an ID that is not a non-empty string. */
+function producingJob(meta: JobMeta | undefined): string | undefined {
+  const jobId: unknown = meta?.jobId;
+  return typeof jobId === 'string' && jobId !== '' ? jobId : undefined;
 }
 
 /** A fresh {@link DownloadState} for the representation `res` carries. */

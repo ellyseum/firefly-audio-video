@@ -240,7 +240,8 @@ const POLL_RETRY_MAX_MS = 30_000;
  * {@link AudioVideoError} whose `code` is `job_failed`, `job_poll_failed`,
  * `submit_failed`, `callback_failed`, `cancelled` or `job_timeout` — or, when
  * a submit or a final poll failure was already one (a `404`, say — repeating
- * the request cannot change it), that same error unchanged.
+ * the request cannot change it), that error. Every rejection after the
+ * service has accepted the job names it in `jobId`.
  *
  * `util.inspect` / `console.log` print only `{ jobId, state }` — never a URL or a
  * status body — so a job can be logged freely.
@@ -447,7 +448,8 @@ export class AsyncJob<T> implements PromiseLike<T> {
    * Turns the raw rejection of an aborted run into the `cancelled` / `job_timeout`
    * error the abort stands for. A rejection that is itself an {@link AudioVideoError}
    * passes through even when the signal is aborted: it describes a definite outcome
-   * (`job_failed`, an HTTP failure) that a same-instant cancel must not mask.
+   * (`job_failed`, an HTTP failure) that a same-instant cancel must not mask. Once
+   * the service has accepted the job, that error names it ({@link namingJob}).
    *
    * A cancel that came from the caller's own signal keeps that signal's abort
    * reason as `cause` exactly as given, by design: it is the caller's own value,
@@ -456,7 +458,8 @@ export class AsyncJob<T> implements PromiseLike<T> {
    */
   #mapRejection(err: unknown): unknown {
     const { signal } = this.#controller;
-    if (!signal.aborted || err instanceof AudioVideoError) return err;
+    if (err instanceof AudioVideoError) return namingJob(err, this.#jobId);
+    if (!signal.aborted) return err;
     if (signal.reason === ABORT_TIMEOUT) {
       return new AudioVideoError({
         message:
@@ -517,6 +520,10 @@ export class AsyncJob<T> implements PromiseLike<T> {
  *   rejects with anything other than an {@link AudioVideoError}; a submit
  *   rejecting with one (`http_429`, an auth failure, …) rejects the job with that
  *   same error, unchanged. The submit is never retried.
+ *
+ * Every rejection after the service accepts the job names it in `jobId`: an
+ * error the HTTP client or `mapResult` raised without one is rebuilt with it,
+ * every other field unchanged and the original as `cause`.
  *
  * `job.meta` is populated from any terminal body, failed ones included. A status
  * body that is not a JSON object is treated as "not yet terminal" and polling
@@ -889,6 +896,27 @@ function callbackFailure(jobId: string, terminal: boolean, cause: unknown): Audi
     code: 'callback_failed',
     jobId,
     cause,
+  });
+}
+
+/**
+ * `error` naming the job `jobId`: `error` itself when it already names one or
+ * no ID is known yet, otherwise a new {@link AudioVideoError} with `jobId` set,
+ * `code`, `status`, `requestId`, `items` and `message` as they were, and
+ * `error` as its `cause`. It is a new error, never an edit of `error`: one
+ * error can reach several jobs, as a token provider sharing one mint among
+ * its callers rejects each of them with the same error.
+ */
+function namingJob(error: AudioVideoError, jobId: string | undefined): AudioVideoError {
+  if (jobId === undefined || error.jobId !== undefined) return error;
+  return new AudioVideoError({
+    message: error.message,
+    code: error.code,
+    status: error.status,
+    jobId,
+    requestId: error.requestId,
+    items: error.items,
+    cause: error,
   });
 }
 

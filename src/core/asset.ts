@@ -86,7 +86,11 @@ export interface AssetReadOptions {
    *   download already knew, is appended and the download goes on.
    * - A `416` whose `Content-Range` gives as the complete length both the
    *   total an earlier response reported and the bytes already delivered
-   *   means nothing is missing: every accessor finishes normally.
+   *   means nothing is missing: every accessor finishes normally. It takes a
+   *   total the download already knew — the first response's
+   *   `Content-Length`, or the length in an accepted `206`'s `Content-Range`:
+   *   a download that never learned its length, such as a chunked response,
+   *   cannot prove it has every byte, so its `416` falls under the next case.
    * - A `200` (the whole asset: it changed, or the server ignores ranges),
    *   another `2xx`, any other `416`, or a `206` that does not continue where
    *   the download stopped means the server cannot resume.
@@ -256,10 +260,11 @@ export class Asset {
    *
    * A body cut off mid-transfer resumes as {@link AssetReadOptions.retries}
    * describes. When the server cannot resume — it answers the `Range` request
-   * with `200`, with a `416` that does not show the download already complete,
-   * or with a `Content-Range` that does not continue where the download
-   * stopped — the download starts over from byte zero in a fresh temp file,
-   * the partial one deleted, within the same retry budget.
+   * with `200`, with a `416` that does not show the download already complete
+   * (which takes a total length the download already knew), or with a
+   * `Content-Range` that does not continue where the download stopped — the
+   * download starts over from byte zero in a fresh temp file, the partial one
+   * deleted, within the same retry budget.
    *
    * @param path - The destination file path.
    * @param options - See {@link AssetReadOptions}.

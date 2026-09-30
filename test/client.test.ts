@@ -2,6 +2,7 @@ import { existsSync, mkdtempSync, rmdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Readable } from 'node:stream';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { inspect } from 'node:util';
 import { afterAll, afterEach, beforeAll, beforeEach, expect, expectTypeOf, test } from 'vitest';
 import { Asset } from '../src/core/asset.js';
@@ -1097,6 +1098,46 @@ test('stage uploads through storage and resolves its read URL', async () => {
   const url = await client({ storage }).stage(input, { contentType: 'image/png', key: 'logo.png' });
   expect(url).toBe(`${STORAGE}/staged/1.epr?sv=2021&sp=r&sig=STAGE_SIG_1`);
   expect(storage.staged).toEqual([{ input, opts: { key: 'logo.png', contentType: 'image/png' } }]);
+});
+
+test('stage hands its signal to the provider, and an abort mid-upload rejects cancelled at once, even from a provider that ignores it', async () => {
+  const logger = recordingLogger();
+  const handed: Array<AbortSignal | undefined> = [];
+  const storage = {
+    stageRead: (_input: unknown, opts?: { signal?: AbortSignal }): Promise<string> => {
+      handed.push(opts?.signal);
+      return new Promise<string>(() => undefined);
+    },
+    allocateOutput: async () => ({ writeUrl: `${STORAGE}/w`, readUrl: `${STORAGE}/r` }),
+  };
+  const controller = new AbortController();
+  const staging = client({ storage, logging: logger }).stage(Buffer.from('x'), {
+    signal: controller.signal,
+  });
+  await until(() => handed.length === 1);
+  expect(handed[0]).toBe(controller.signal);
+
+  controller.abort(new Error('caller gave up'));
+  const outcome = await Promise.race([
+    rejection(staging),
+    sleep(2_000).then(() => 'still pending' as const),
+  ]);
+
+  expect(outcome).toBeInstanceOf(AudioVideoError);
+  expect((outcome as AudioVideoError).code).toBe('cancelled');
+  expect(logger.records.map((record) => [record.level, record.msg])).toEqual([
+    ['warn', 'stage cancelled'],
+  ]);
+});
+
+test('an already-aborted signal rejects stage cancelled without calling the provider', async () => {
+  const storage = fakeStorage();
+  const error = await rejection(
+    client({ storage }).stage(Buffer.from('x'), { signal: AbortSignal.abort() }),
+  );
+  expect(error.code).toBe('cancelled');
+  await flush();
+  expect(storage.staged).toEqual([]);
 });
 
 test('stage passes an http(s) URL through with no storage, and refuses a string that is neither a URL nor a file before any storage call', async () => {

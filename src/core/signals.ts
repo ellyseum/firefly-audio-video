@@ -1,6 +1,6 @@
 /**
  * Abort-signal helpers that work on every Node release the package supports:
- * combining signals, and a delay a signal cuts short. `AbortSignal.any`
+ * combining signals, and a delay or a wait a signal cuts short. `AbortSignal.any`
  * arrived in Node 18.17 and 20.3 and the package promises Node 18.0 and
  * later, so signals are combined with listeners instead.
  */
@@ -59,6 +59,26 @@ export function delay(ms: number, signal?: AbortSignal): Promise<void> {
       resolve();
     }, ms);
     signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/**
+ * Settles as `promise` does, unless `signal` aborts first — then rejects with
+ * `signal.reason` at once, and at once when it already has. `promise` is left
+ * to settle on its own, its outcome observed so a late rejection is never
+ * unhandled, and the abort listener goes as soon as it settles.
+ *
+ * @internal
+ */
+export function untilAborted<V>(promise: Promise<V>, signal: AbortSignal): Promise<V> {
+  if (signal.aborted) {
+    void promise.catch(noop);
+    return Promise.reject(signal.reason as Error);
+  }
+  return new Promise<V>((resolve, reject) => {
+    const onAbort = (): void => reject(signal.reason as Error);
+    signal.addEventListener('abort', onAbort, { once: true });
+    void promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
   });
 }
 

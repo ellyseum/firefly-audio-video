@@ -30,6 +30,7 @@ import {
   type LoggingOption,
 } from '../core/logging.js';
 import { InMemoryPool, type PoolBackend } from '../core/pool.js';
+import { untilAborted } from '../core/signals.js';
 import {
   rejectedJob,
   runPooledJob,
@@ -160,9 +161,10 @@ export interface ClientConfig {
    * admitted, just before its submit, so a staged URL is fresh when DGR is
    * sent it however long the job queued. `AioFilesStorageProvider` and `S3StorageProvider` read a
    * `Readable` into memory before uploading it — the store needs its length —
-   * so pass a file path to stream a large input from disk. Only the calls
-   * holding a slot stage, so at most `concurrency` calls hold such bytes in
-   * memory at once.
+   * so pass a file path to stream a large input from disk. A render or a
+   * describe stages while it holds its slot, so at most `concurrency` of them
+   * hold such bytes in memory at once; `stage()` takes no slot, and each call
+   * holding a `Readable` adds its own.
    *
    * Omitted, a client in an App Builder environment — `__OW_NAMESPACE` or
    * `AIO_runtime_namespace` set — uses an `AioFilesStorageProvider`, and any
@@ -247,6 +249,12 @@ export interface StageOptions {
   contentType?: string;
   /** How long the returned URL stays valid, in seconds. */
   expiresIn?: number;
+  /**
+   * Aborts the upload: the provider's `stageRead` is handed it, and the call
+   * rejects `cancelled` the moment it aborts, whether or not the provider
+   * stops. An already-aborted signal rejects without calling the provider.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -442,7 +450,8 @@ export interface Client {
    * a `file:` URL) uploaded through this client's storage, as the presigned
    * read URL it returns. Takes no pool slot. A string that is neither an
    * http(s) URL nor an existing file rejects `invalid_argument`, as does an
-   * upload with no `storage` configured.
+   * upload with no `storage` configured. `options.signal` aborts the upload,
+   * rejecting `cancelled` at once whether or not the provider stops.
    *
    * @example
    * ```ts
@@ -718,10 +727,12 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
   async stage(input: StageInput, options: StageOptions = {}): Promise<string> {
     const target = this.#targetOrLog(options, 'stage', STAGE_ENDPOINT, undefined);
     if (target !== this) return target.stage(input, options);
-    const { key, contentType, expiresIn } = options;
-    return this.#logged('stage', STAGE_ENDPOINT, undefined, undefined, () =>
-      normalizeAsset(input, this.#storage, { key, contentType, expiresIn }),
-    );
+    const { key, contentType, expiresIn, signal } = options;
+    return this.#logged('stage', STAGE_ENDPOINT, undefined, signal, () => {
+      signal?.throwIfAborted();
+      const staged = normalizeAsset(input, this.#storage, { key, contentType, expiresIn, signal });
+      return signal === undefined ? staged : untilAborted(staged, signal);
+    });
   }
 
   /** @internal Starts a fluent render; see {@link FluentRenderer}. */

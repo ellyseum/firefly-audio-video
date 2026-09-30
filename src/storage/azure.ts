@@ -265,7 +265,7 @@ export class AzureBlobStorageProvider implements StorageProvider {
     input: StageInput,
     opts: { key?: string; contentType?: string; expiresIn?: number; signal?: AbortSignal } = {},
   ): Promise<string> {
-    const body = await uploadBody(input, NAME);
+    const body = await uploadBody(input, NAME, this.#secrets);
     const key = objectKey(this.#prefix, opts.key, 'staged', body);
     const expiresIn = this.#expiry(opts.expiresIn, READ_EXPIRY_SECONDS);
     const contentType = checkContentType(opts.contentType);

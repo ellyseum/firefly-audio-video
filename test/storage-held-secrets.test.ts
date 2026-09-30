@@ -2,21 +2,24 @@
  * A storage provider's failure never shows a credential it holds, in any
  * spelling an encoder could have given it: not in the error's message or any
  * printed form of it, and not on any level of its cause chain. Each provider
- * runs its three failure paths — initializing, presigning, and an upload
- * failing in transit — against fakes whose errors quote one held secret in one
- * spelling on every level of a three-level chain: a message, a `code`, and a
- * string cause below them.
+ * runs its four failure paths — initializing, presigning, reading a local
+ * input file, and an upload failing in transit — against fakes whose errors
+ * quote one held secret in one spelling on every level of a three-level chain:
+ * a message, a `code`, and a string cause below them.
  *
  * A leak is found by the secret's runs of letters and digits, which no
  * percent-encoding, form-decoding or base64url spelling changes: any of them
  * appearing anywhere means some spelling of the secret got through.
  */
 
+import { mkdtempSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { inspect } from 'node:util';
 import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import * as azureSdk from '@azure/storage-blob';
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
-import { afterEach, beforeEach, expect, test } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from 'vitest';
 import { AudioVideoError } from '../src/core/errors.js';
 import { AioFilesStorageProvider, type AioFilesClient } from '../src/storage/aio-files.js';
 import {
@@ -36,8 +39,41 @@ const S3_CREDENTIALS = {
 };
 const AIO_AUTH = 'aio-runtime-uuid:AioAuthLeft+AioAuthMiddle/AioAuthRight==';
 
+/**
+ * What the next `stat` calls do, in order: an error to reject with, or
+ * `undefined` to pass the call through to the file system — as every call
+ * does once the queue is empty. A file that is found and then cannot be read
+ * is `[undefined, error]`.
+ */
+const statFailures = vi.hoisted((): Array<Error | undefined> => []);
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    stat: (async (...args: Parameters<typeof actual.stat>) => {
+      const failure = statFailures.shift();
+      if (failure !== undefined) throw failure;
+      return actual.stat(...args);
+    }) as typeof actual.stat,
+  };
+});
+
 let agent: MockAgent;
 const original = getGlobalDispatcher();
+let dir: string;
+let inputFile: string;
+
+beforeAll(() => {
+  dir = mkdtempSync(join(tmpdir(), 'fav-held-secrets-'));
+  inputFile = join(dir, 'input.mogrt');
+  writeFileSync(inputFile, 'capsule bytes on disk');
+});
+
+afterAll(() => {
+  unlinkSync(inputFile);
+  rmdirSync(dir);
+});
 
 beforeEach(() => {
   agent = new MockAgent();
@@ -46,6 +82,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  statFailures.length = 0;
   await agent.close();
   setGlobalDispatcher(original);
 });
@@ -219,6 +256,15 @@ const PATHS: readonly FailurePath[] = [
   ['Azure', 'presigning', [AZURE_KEY], (thrown) => azure({ sign: thrown }).allocateOutput()],
   [
     'Azure',
+    'reading the input file',
+    [AZURE_KEY],
+    (thrown) => {
+      statFailures.push(undefined, thrown);
+      return azure({}).stageRead(inputFile);
+    },
+  ],
+  [
+    'Azure',
     'an upload in transit',
     [AZURE_KEY],
     (thrown) => azure({ upload: thrown }).stageRead(Buffer.from('x')),
@@ -234,6 +280,15 @@ const PATHS: readonly FailurePath[] = [
     'presigning',
     Object.values(S3_CREDENTIALS),
     (thrown) => s3({ presign: thrown }).allocateOutput(),
+  ],
+  [
+    'S3',
+    'reading the input file',
+    Object.values(S3_CREDENTIALS),
+    (thrown) => {
+      statFailures.push(undefined, thrown);
+      return s3({}).stageRead(inputFile);
+    },
   ],
   [
     'S3',
@@ -253,6 +308,15 @@ const PATHS: readonly FailurePath[] = [
     [AIO_AUTH],
     (thrown) =>
       aioFiles({ files: { generatePresignURL: () => Promise.reject(thrown) } }).allocateOutput(),
+  ],
+  [
+    'App Builder Files',
+    'reading the input file',
+    [AIO_AUTH],
+    (thrown) => {
+      statFailures.push(undefined, thrown);
+      return aioFiles({ files: presigning }).stageRead(inputFile);
+    },
   ],
   [
     'App Builder Files',

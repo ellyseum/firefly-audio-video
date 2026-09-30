@@ -615,7 +615,7 @@ test('a spec with thousands of problems rejects invalid_argument naming ten and 
 
   expect(error.code).toBe('invalid_argument');
   expect(error.message.split('; ')).toHaveLength(11);
-  expect(error.message).toMatch(/; and 14990 more$/);
+  expect(error.message).toMatch(/; and 9990 more$/);
   expect(api.submitted()).toEqual([]);
 });
 

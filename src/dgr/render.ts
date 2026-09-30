@@ -1,25 +1,34 @@
 /**
  * The render pipeline behind `render()`, in the three steps a pooled call
- * runs it: validate the spec and resolve its presets; stage generated `.epr`
- * files, allocate output locations and build the wire body — both before the
- * job takes a pool slot; and map the terminal status back onto the spec's
- * outputs as {@link Asset}s.
+ * runs it: validate the spec, resolve its presets and read which inputs need
+ * uploading — checking that storage is there for every one of them; upload
+ * those inputs, stage generated `.epr` files, allocate output locations and
+ * build the wire body — all before the job takes a pool slot; and map the
+ * terminal status back onto the spec's outputs as {@link Asset}s.
  */
 
 import * as z from 'zod';
 import { Asset } from '../core/asset.js';
 import { AudioVideoError } from '../core/errors.js';
 import type { JobItemLike, JobMeta, JobStatusLike } from '../core/job.js';
-import { storageFailure, type StorageProvider } from '../core/storage.js';
+import {
+  classifyAsset,
+  noStorage,
+  normalizeAsset,
+  storageFailure,
+  type StageInput,
+  type StorageProvider,
+} from '../core/storage.js';
 import { NAMED, nameForPresetId } from '../presets/catalog.js';
 import { describeIssues } from '../presets/codecs.js';
-import { buildRenderBody } from './build-body.js';
+import { buildRenderBody, checkAssetIndices } from './build-body.js';
 import { resolvePreset, toPreset, type Preset, type PresetInput } from './preset.js';
 import {
   PresetRefSchema,
   RenderRequestSchema,
   type EncodeConfig,
   type PresetRef,
+  type PresetRefInput,
   type RenderRequestOutput,
   type RenderSpec,
 } from './schemas.js';
@@ -28,12 +37,20 @@ import type { RenderBodyWire } from './types.js';
 /** A template to render or describe: an http(s) URL as a string, a `URL`, or `{ url }`. */
 export type TemplateSource = string | URL | { url: string };
 
+/**
+ * @internal A render input as validation leaves it: a URL DGR reads as it is,
+ * or an input {@link materializeRender} uploads through storage first.
+ */
+export type PreparedAsset = { readonly url: string } | { readonly stage: StageInput };
+
 /** @internal A preset as validation resolves it, before anything is staged. */
 export interface PreparedPreset {
-  /** The resolved reference — absent while {@link PreparedPreset.xml} still needs staging. */
+  /** The resolved reference — absent while {@link PreparedPreset.xml} or {@link PreparedPreset.stage} still needs staging. */
   readonly ref?: PresetRef;
   /** `.epr` XML {@link materializeRender} stages before the job is submitted. */
   readonly xml?: string;
+  /** An `.epr` given as a file, a `Buffer` or a `Readable`, which {@link materializeRender} uploads before the job is submitted. */
+  readonly stage?: StageInput;
   /** What the call's log record names the preset: its DGR `presetId`, else its catalog name, else its kind. */
   readonly label: string;
   /** The preset's codec, when known. */
@@ -54,9 +71,9 @@ export interface PreparedOutput {
 
 /** @internal A render validated and normalized, before any storage call. */
 export interface PreparedRender {
-  readonly source: string;
+  readonly source: PreparedAsset;
   readonly presets: readonly PreparedPreset[];
-  readonly assets?: string[];
+  readonly assets?: readonly PreparedAsset[];
   readonly variations?: RenderSpec['variations'];
   readonly outputs: readonly PreparedOutput[];
 }
@@ -79,12 +96,17 @@ export interface FluentRenderInput {
 
 /**
  * @internal Validates a `render()` spec, checks every output's indices against
- * its presets and variations, and resolves every preset — leaving the staging
- * of any `.epr` to {@link materializeRender}. Performs no remote call.
+ * its presets and variations and every `assetIndex` against its assets,
+ * resolves every preset, and reads which inputs need uploading — leaving
+ * every upload, `.epr` staging and output allocation to
+ * {@link materializeRender}. Consults only the local filesystem, to tell a
+ * file path from a mistyped one; performs no remote call.
  *
- * @throws {@link AudioVideoError} `invalid_argument` for an invalid spec, or
- *   for a preset that needs staging when no storage is configured;
- *   `invalid_preset` for a preset that cannot resolve.
+ * @throws {@link AudioVideoError} `invalid_argument` for an invalid spec, an
+ *   input that is neither an http(s) URL nor a local file, a `Buffer` or a
+ *   `Readable`, or anything that needs storage — an input to upload, an
+ *   `.epr` to stage, an output with no destination — when none is
+ *   configured; `invalid_preset` for a preset that cannot resolve.
  */
 export async function prepareRequest(
   request: unknown,
@@ -99,17 +121,26 @@ export async function prepareRequest(
   const outputs = spec.outputs.map((output, index) =>
     prepareOutput(output, index, spec.presets.length, variationCount),
   );
+  checkIndices(spec);
   const presets = await Promise.all(
     spec.presets.map((entry, index) => preparePreset(entry, `presets[${index}]`)),
   );
-  requireStorageForStaging(presets, storage);
-  return {
-    source: spec.source,
+  const source = await prepareAsset(spec.source, 'source');
+  const assets =
+    spec.assets === undefined
+      ? undefined
+      : await Promise.all(
+          spec.assets.map((asset, index) => prepareAsset(asset, `assets[${index}]`)),
+        );
+  const prepared: PreparedRender = {
+    source,
     presets,
-    ...(spec.assets !== undefined ? { assets: spec.assets } : {}),
+    ...(assets !== undefined ? { assets } : {}),
     ...(spec.variations !== undefined ? { variations: spec.variations } : {}),
     outputs,
   };
+  requireStorage(prepared, storage);
+  return prepared;
 }
 
 /**
@@ -143,7 +174,7 @@ export async function prepareFluent(
     throw invalidArgument('fileName must be a non-empty string when provided.');
   }
   return {
-    source,
+    source: { url: source },
     presets: [await preparePreset(input.preset, 'The preset')],
     outputs: [
       {
@@ -156,29 +187,36 @@ export async function prepareFluent(
 }
 
 /**
- * @internal Stages every deferred `.epr` and allocates every output that has
- * no destination, then builds the wire body. Runs before the job takes a
- * pool slot, so no storage call ever waits on the pool.
+ * @internal Uploads every input that needs it, stages every deferred `.epr`,
+ * and allocates every output that has no destination — concurrently — then
+ * builds the wire body. Runs before the job takes a pool slot, so no storage
+ * call ever waits on the pool.
  *
  * @throws {@link AudioVideoError} `storage_failed` when the storage provider
- *   throws or resolves with something other than the URLs it owes.
+ *   throws or resolves with something other than the URLs it owes (an
+ *   {@link AudioVideoError} it throws keeps its own code); each message names
+ *   the field it came from.
  */
 export async function materializeRender(
   prepared: PreparedRender,
   storage: StorageProvider | undefined,
 ): Promise<{ body: RenderBodyWire; outputs: MaterializedOutput[] }> {
-  const [presets, outputs] = await Promise.all([
-    Promise.all(
-      prepared.presets.map(
-        (preset, index) => preset.ref ?? stageEpr(storage, preset.xml ?? '', index),
-      ),
-    ),
+  const [source, assets, presets, outputs] = await Promise.all([
+    materializeAsset(prepared.source, storage, 'source'),
+    prepared.assets === undefined
+      ? undefined
+      : Promise.all(
+          prepared.assets.map((asset, index) =>
+            materializeAsset(asset, storage, `assets[${index}]`),
+          ),
+        ),
+    Promise.all(prepared.presets.map((preset, index) => materializePreset(preset, storage, index))),
     Promise.all(prepared.outputs.map((output) => materializeOutput(output, storage))),
   ]);
   const spec: RenderSpec = {
-    source: prepared.source,
+    source,
     presets,
-    ...(prepared.assets !== undefined ? { assets: prepared.assets } : {}),
+    ...(assets !== undefined ? { assets } : {}),
     ...(prepared.variations !== undefined ? { variations: prepared.variations } : {}),
     outputs: outputs.map((output) => ({
       variationIndex: output.variationIndex,
@@ -289,6 +327,9 @@ export function invalidArgument(message: string, cause?: unknown): AudioVideoErr
 /** Placeholder `resolvePreset` receives while the real staging waits for {@link materializeRender}; never sent anywhere. */
 const DEFERRED_STAGE_URL = 'deferred:epr';
 
+/** The content type a staged `.epr` is uploaded with. */
+const EPR_CONTENT_TYPE = 'application/xml';
+
 function prepareOutput(
   output: RenderRequestOutput,
   index: number,
@@ -308,37 +349,51 @@ function prepareOutput(
         : `outputs[${index}].variationIndex is ${variationIndex}, but the spec has ${plural(variationCount, 'variation')}.`,
     );
   }
+  if (output.destination === undefined && output.readUrl !== undefined) {
+    throw invalidArgument(
+      `outputs[${index}] has a readUrl but no destination: an output without a destination ` +
+        'gets both of its URLs from storage, so leave readUrl out too.',
+    );
+  }
   return {
     variationIndex,
     presetIndex: output.presetIndex,
     ...(output.fileName !== undefined ? { fileName: output.fileName } : {}),
-    destination: output.destination,
+    ...(output.destination !== undefined ? { destination: output.destination } : {}),
     ...(output.readUrl !== undefined ? { readUrl: output.readUrl } : {}),
   };
 }
 
 /**
- * Resolves one preset input: a `{ presetId }` / `{ url }` reference passes
- * through; anything else goes through `toPreset` and `resolvePreset`, with any
- * `.epr` XML kept for staging later. Errors name the preset they came from.
+ * Resolves one preset input: a `{ presetId }` reference passes through; a
+ * `{ url }` reference passes through when `url` is an http(s) URL and is kept
+ * for staging when it names a file, a `Buffer` or a `Readable`; anything else
+ * goes through `toPreset` and `resolvePreset`, with any `.epr` XML kept for
+ * staging later. Errors name the preset they came from.
  */
 async function preparePreset(
-  entry: PresetInput | PresetRef,
+  entry: PresetInput | PresetRefInput,
   where: string,
 ): Promise<PreparedPreset> {
+  if (isUrlRef(entry)) return prepareUrlRef(entry.url, `${where}.url`);
   try {
     const ref = PresetRefSchema.safeParse(entry);
     if (ref.success) return preparedRef(ref.data);
     return await preparedPreset(toPreset(entry as PresetInput));
   } catch (error) {
-    throw error instanceof AudioVideoError
-      ? new AudioVideoError({
-          message: `${where}: ${error.message}`,
-          code: error.code,
-          cause: error,
-        })
-      : error;
+    throw fieldError(where, error);
   }
+}
+
+/** True for a `{ url }` preset reference: a plain object whose one key is `url`. */
+function isUrlRef(entry: unknown): entry is { url: unknown } {
+  return isRecord(entry) && Object.keys(entry).length === 1 && 'url' in entry;
+}
+
+/** A `{ url }` reference: used as it is for an http(s) URL, kept for staging for anything that must be uploaded. */
+async function prepareUrlRef(url: unknown, where: string): Promise<PreparedPreset> {
+  const asset = await prepareAsset(url as StageInput, where);
+  return 'url' in asset ? { ref: { url: asset.url }, label: 'epr' } : { ...asset, label: 'epr' };
 }
 
 function preparedRef(ref: PresetRef): PreparedPreset {
@@ -375,18 +430,98 @@ function configFields(config: Readonly<Partial<EncodeConfig>> | undefined): {
   });
 }
 
-function requireStorageForStaging(
-  presets: readonly PreparedPreset[],
+/**
+ * Checks that storage is configured when anything in `prepared` needs it,
+ * naming the first thing that does: an input to upload, an `.epr` to stage,
+ * or an output to allocate.
+ */
+function requireStorage(prepared: PreparedRender, storage: StorageProvider | undefined): void {
+  if (storage !== undefined) return;
+  if ('stage' in prepared.source) throw noStorage('source');
+  const asset = prepared.assets?.findIndex((entry) => 'stage' in entry) ?? -1;
+  if (asset !== -1) throw noStorage(`assets[${asset}]`);
+  for (const [index, preset] of prepared.presets.entries()) {
+    if (preset.stage !== undefined) throw noStorage(`presets[${index}].url`);
+    if (preset.xml !== undefined) {
+      throw invalidArgument(
+        `presets[${index}] resolves to an .epr that must be staged for DGR to read, and no storage ` +
+          'is configured: pass a StorageProvider as the storage option of configure() or ' +
+          "createClient(), or use a native preset — a catalog name such as 'h264Land1080pHq' or " +
+          "'prores', or a DGR presetId.",
+      );
+    }
+  }
+  const output = prepared.outputs.findIndex((entry) => entry.destination === undefined);
+  if (output !== -1) {
+    throw invalidArgument(
+      `outputs[${output}] has no destination, and no storage is configured to allocate one: ` +
+        'give it a destination, or pass a StorageProvider as the storage option of configure() ' +
+        'or createClient().',
+    );
+  }
+}
+
+/** A render input as validation leaves it; errors name `where`. */
+async function prepareAsset(input: StageInput, where: string): Promise<PreparedAsset> {
+  try {
+    const asset = await classifyAsset(input);
+    return asset.kind === 'url' ? { url: asset.url } : { stage: input };
+  } catch (error) {
+    throw fieldError(where, error);
+  }
+}
+
+/** The URL DGR reads a prepared input from, uploading it first when it needs that; errors name `where`. */
+async function materializeAsset(
+  asset: PreparedAsset,
   storage: StorageProvider | undefined,
-): void {
-  const index = presets.findIndex((preset) => preset.xml !== undefined);
-  if (index === -1 || storage !== undefined) return;
-  throw invalidArgument(
-    `presets[${index}] resolves to an .epr that must be staged for DGR to read, and no storage ` +
-      'is configured: pass a StorageProvider as the storage option of configure() or ' +
-      "createClient(), or use a native preset — a catalog name such as 'h264Land1080pHq' or " +
-      "'prores', or a DGR presetId.",
-  );
+  where: string,
+  opts?: { contentType?: string },
+): Promise<string> {
+  if ('url' in asset) return asset.url;
+  try {
+    return await normalizeAsset(asset.stage, storage, opts);
+  } catch (error) {
+    throw fieldError(where, error);
+  }
+}
+
+/** The reference a prepared preset is submitted as, staging its `.epr` first when it has one to stage. */
+async function materializePreset(
+  preset: PreparedPreset,
+  storage: StorageProvider | undefined,
+  index: number,
+): Promise<PresetRef> {
+  if (preset.ref !== undefined) return preset.ref;
+  if (preset.stage !== undefined) {
+    const url = await materializeAsset({ stage: preset.stage }, storage, `presets[${index}].url`, {
+      contentType: EPR_CONTENT_TYPE,
+    });
+    return { url };
+  }
+  return stageEpr(storage, preset.xml ?? '', index);
+}
+
+/**
+ * `checkAssetIndices`, with a variable whose `assetIndex` points past the end
+ * of `assets` reported as `invalid_argument` — before anything is uploaded.
+ */
+function checkIndices(spec: Parameters<typeof checkAssetIndices>[0]): void {
+  try {
+    checkAssetIndices(spec);
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      throw invalidArgument(`Invalid render spec: ${describeIssues(error)}`, error);
+    }
+    throw error;
+  }
+}
+
+/** `error` with `where` in front of its message when it is an {@link AudioVideoError}, the original kept as `cause`. */
+function fieldError(where: string, error: unknown): unknown {
+  return error instanceof AudioVideoError
+    ? new AudioVideoError({ message: `${where}: ${error.message}`, code: error.code, cause: error })
+    : error;
 }
 
 async function stageEpr(
@@ -399,7 +534,7 @@ async function stageEpr(
   }
   let url: unknown;
   try {
-    url = await storage.stageRead(Buffer.from(xml), { contentType: 'application/xml' });
+    url = await storage.stageRead(Buffer.from(xml), { contentType: EPR_CONTENT_TYPE });
   } catch (cause) {
     throw storageFailure(`Staging the .epr for presets[${index}] failed.`, cause);
   }

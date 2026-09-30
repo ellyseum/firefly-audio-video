@@ -62,7 +62,7 @@ import {
   type PreparedRender,
   type TemplateSource,
 } from './render.js';
-import type { PresetRef, RenderRequest, RenderRequestOutput } from './schemas.js';
+import type { PresetRefInput, RenderRequest, RenderRequestOutput } from './schemas.js';
 
 /**
  * The handle `render()` and `describe()` return: awaitable like a promise,
@@ -96,7 +96,7 @@ export type RenderJob<T> = JobHandle<T>;
  * ```
  */
 export type SingleOutputRenderRequest = Omit<RenderRequest, 'presets' | 'outputs'> & {
-  presets: readonly (PresetInput | PresetRef)[];
+  presets: readonly (PresetInput | PresetRefInput)[];
   outputs: readonly [RenderRequestOutput];
 };
 
@@ -141,9 +141,12 @@ export interface ClientConfig {
    */
   logging?: LoggingOption;
   /**
-   * Stages what DGR must read from a URL and allocates the outputs a fluent
-   * render writes: generated `.epr` presets, `stage()` inputs, fluent-render
-   * outputs. Without it, any of those rejects `invalid_argument`.
+   * Uploads what DGR must read from a URL, and allocates the locations it
+   * writes to: a spec's `source`, `assets` and `{ url }` presets given as a
+   * file, a `Buffer` or a `Readable`; generated `.epr` presets; `stage()`
+   * inputs; and every output with no `destination`, fluent renders included.
+   * Without it, any of those rejects `invalid_argument`; http(s) URLs never
+   * need it.
    */
   storage?: StorageProvider;
   /**
@@ -292,12 +295,15 @@ export interface Client {
   /**
    * Renders `spec` and resolves with its finished {@link Asset} once the
    * render is done — `asset.url` is the output's `readUrl` (or its
-   * `destination` without one), nothing downloaded yet.
+   * `destination` without one; for an output with no `destination`, the read
+   * URL `storage` allocated), nothing downloaded yet.
    *
    * The job runs inside this client's pool from the submit until it settles.
    * Every preset is resolved first — a native match becomes a `presetId`,
-   * anything else a generated `.epr` staged through `storage` — and storage
-   * calls run before the job takes its slot. The service's `202` carries the
+   * anything else a generated `.epr` staged through `storage` — and every
+   * `source`, `assets` entry or `{ url }` preset given as a file, a `Buffer`
+   * or a `Readable` is uploaded through `storage`; storage calls run before
+   * the job takes its slot. The service's `202` carries the
    * `jobId`, `statusUrl` and `cancelUrl`; `statusUrl` is polled until the job
    * is terminal. Every render submit answers with `Retry-After: 1`, `202`
    * included, and only a `429` is retried, so an accepted submit is never
@@ -328,7 +334,8 @@ export interface Client {
    * output, or with `Asset[]` in `spec.outputs` order when it has several — so
    * a spec whose `outputs` is not a one-element literal is typed
    * `Asset | Asset[]`. Each asset's URL is its output's `readUrl` (or its
-   * `destination` without one), and its `meta` is that output's own timing
+   * `destination` without one, or the read URL `storage` allocated for an
+   * output with no `destination`), and its `meta` is that output's own timing
    * (see the single-output overload for how exact it is). The service lists a
    * job's outputs in no particular order; each is matched to its spec output
    * by `variationIndex` and `presetIndex`.

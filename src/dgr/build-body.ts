@@ -74,10 +74,13 @@ export function buildRenderBody(spec: RenderSpec): RenderBodyWire {
 }
 
 /**
- * Throws a `ZodError` naming every variable whose `assetIndex` points past the
- * end of `spec.assets`.
+ * @internal Throws a `ZodError` naming every variable whose `assetIndex`
+ * points past the end of `spec.assets`.
  */
-function checkAssetIndices(spec: RenderSpec): void {
+export function checkAssetIndices(spec: {
+  assets?: readonly unknown[];
+  variations?: RenderSpec['variations'];
+}): void {
   const assetCount = spec.assets?.length ?? 0;
   const issues: z.core.$ZodIssue[] = [];
   spec.variations?.forEach((variation, v) => {

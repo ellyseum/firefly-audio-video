@@ -37,6 +37,7 @@ export type {
   RenderOutput,
   RenderVariable,
   PresetRef,
+  PresetRefInput,
   EncodeConfig,
   PresetName,
   Codec,

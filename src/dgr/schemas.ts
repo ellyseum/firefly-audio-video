@@ -8,6 +8,7 @@
  */
 
 import * as z from 'zod';
+import { isReadable, type StageInput } from '../core/storage.js';
 import { quoted } from '../presets/codecs.js';
 import { PRESET_NAMES } from '../presets/names.js';
 import type { PresetInput } from './preset.js';
@@ -282,13 +283,70 @@ export const RenderSpecSchema = z.strictObject({
 export type RenderSpec = z.infer<typeof RenderSpecSchema>;
 
 /**
- * One deliverable of a {@link RenderRequest}: a {@link RenderOutput} plus an
- * optional `readUrl`, the URL the finished file is read back from. DGR writes
- * to `destination`, and a presigned write URL usually cannot be read, so pass
- * the read URL of the same object here. Without one, the asset's URL is
- * `destination` itself, which works only when that URL also grants read access.
+ * A render input where a {@link RenderRequest} names one — the template
+ * `source`, an entry in `assets`, a preset's `{ url }`: an http(s) URL, as a
+ * string or a `URL`, used as it is; or a local file path, a `file:` URL, a
+ * `Buffer` or a `Readable`, uploaded through the client's storage before the
+ * job is submitted. See `StageInput`.
+ *
+ * @param what - Names the field in the error message, e.g. `'source'`.
+ */
+function stageInputSchema(what: string): z.ZodType<StageInput> {
+  return z.custom<StageInput>(
+    (value) =>
+      typeof value === 'string'
+        ? value !== ''
+        : value instanceof URL || Buffer.isBuffer(value) || isReadable(value),
+    {
+      error: (issue) =>
+        issue.input === ''
+          ? `${what} must not be empty`
+          : `${what} must be an http(s) URL, a file path, a URL, a Buffer or a Readable`,
+    },
+  );
+}
+
+/**
+ * A reference to a render preset as a {@link RenderRequest} takes it: the
+ * {@link PresetRef} forms, with `url` accepting any render input — an http(s)
+ * URL used as it is, or an `.epr` given as a file path, a `file:` URL, a
+ * `Buffer` or a `Readable`, which the client stages before the job is
+ * submitted. Exactly one of `url` or `presetId` may be present.
+ *
+ * @example
+ * ```ts
+ * const staged: PresetRefInput = { url: 'https://example.com/preset.epr?sig=…' };
+ * const local: PresetRefInput = { url: './masters/My Preset.epr' };
+ * const inMemory: PresetRefInput = { url: await readFile('./My Preset.epr') };
+ * ```
+ */
+export const PresetRefInputSchema = z.union(
+  [
+    z.strictObject({ url: stageInputSchema('url') }),
+    z.strictObject({ presetId: z.string().min(1, 'presetId must not be empty') }),
+  ],
+  { error: 'a preset ref must be either { url } or { presetId }, not both and not neither' },
+);
+
+/** A {@link PresetRefInputSchema} input: `{ url }` (any render input naming an `.epr`) or `{ presetId }`. */
+export type PresetRefInput = z.infer<typeof PresetRefInputSchema>;
+
+/**
+ * One deliverable of a {@link RenderRequest}: a {@link RenderOutput} whose
+ * `destination` may be left out, plus an optional `readUrl`, the URL the
+ * finished file is read back from.
+ *
+ * - With a `destination`, DGR writes there. A presigned write URL usually
+ *   cannot be read, so pass the read URL of the same object as `readUrl`;
+ *   without one, the asset's URL is `destination` itself, which works only
+ *   when that URL also grants read access.
+ * - Without a `destination`, the client's storage allocates the location
+ *   (`StorageProvider.allocateOutput()`): DGR writes to its write URL and the
+ *   asset reads from its read URL. `readUrl` then has nothing to pair with and
+ *   must be left out too.
  */
 export const RenderRequestOutputSchema = RenderOutputSchema.extend({
+  destination: z.string().min(1, 'destination must not be empty when provided').optional(),
   readUrl: z.string().min(1, 'readUrl must not be empty when provided').optional(),
 });
 
@@ -296,33 +354,47 @@ export const RenderRequestOutputSchema = RenderOutputSchema.extend({
 export type RenderRequestOutput = z.infer<typeof RenderRequestOutputSchema>;
 
 /**
- * The spec `render()` takes: a {@link RenderSpec} whose `presets[]` entries may
- * be any preset input — a `Preset`, an `EncodeConfig`, a catalog name, a DGR
- * `presetId`, an `.epr` file path, raw `.epr` XML, an http(s) URL to a staged
- * `.epr`, or a `{ presetId }` / `{ url }` reference — and whose outputs may
- * carry a `readUrl`. Every preset is resolved, and every generated `.epr`
- * staged through the client's storage, before the wire body is built.
+ * The spec `render()` takes. It has the shape of a {@link RenderSpec}, with
+ * three differences:
+ *
+ * - `source`, every entry in `assets`, and a preset's `{ url }` accept any
+ *   render input: an http(s) URL — a string or a `URL` — used as it is, or a
+ *   local file path, a `file:` URL, a `Buffer` or a `Readable`, uploaded
+ *   through the client's storage before the job is submitted.
+ * - A `presets[]` entry may be any preset input — a `Preset`, an
+ *   `EncodeConfig`, a catalog name, a DGR `presetId`, an `.epr` file path, raw
+ *   `.epr` XML, an http(s) URL to a staged `.epr`, or a `{ presetId }` /
+ *   `{ url }` reference ({@link PresetRefInput}); every generated `.epr` is
+ *   staged through the client's storage.
+ * - An output may carry a `readUrl`, or leave out `destination` for storage
+ *   to allocate ({@link RenderRequestOutput}).
+ *
+ * Everything that needs storage is checked before any upload, and every
+ * upload and allocation finishes before the wire body is built.
  *
  * @example
  * ```ts
  * const spec: RenderRequest = {
- *   source: 'https://example.com/capsule.mogrt?sig=…',
+ *   source: './capsule.mogrt', // uploaded through storage
  *   presets: [presets.hevc1080p10bit, 'h264Land1080pHq'],
+ *   assets: [await readFile('./logo.png'), 'https://example.com/headshot.png'],
  *   outputs: [
- *     { presetIndex: 0, destination: hevcWriteUrl, readUrl: hevcReadUrl },
+ *     { presetIndex: 0 }, // storage allocates the location
  *     { presetIndex: 1, destination: h264WriteUrl, readUrl: h264ReadUrl },
  *   ],
  * };
  * ```
  */
 export const RenderRequestSchema = RenderSpecSchema.extend({
+  source: stageInputSchema('source'),
   presets: z
     .array(
-      z.custom<PresetInput | PresetRef>((value) => value !== undefined && value !== null, {
+      z.custom<PresetInput | PresetRefInput>((value) => value !== undefined && value !== null, {
         error: 'a preset must not be null or undefined',
       }),
     )
     .min(1, 'at least one preset is required'),
+  assets: z.array(stageInputSchema('asset')).optional(),
   outputs: z.array(RenderRequestOutputSchema).min(1, 'at least one output is required'),
 });
 

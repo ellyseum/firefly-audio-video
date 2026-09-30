@@ -795,6 +795,21 @@ test('a forced refresh after a 401 that fails with a plain error rejects auth_fa
   expect((err.cause as Error).name).toBe('TypeError');
 });
 
+test('a token provider failing under a caller signal rejects auth_failed and leaves no listener on the signal', async () => {
+  const { signal } = new AbortController();
+  getAccessTokenMock.mockReset().mockRejectedValue(new Error('provider down'));
+
+  const err = await rejection(
+    new HttpClient({ apiKey: 'key', tokenProvider }).request('GET', '/v1/presets', undefined, {
+      signal,
+    }),
+  );
+
+  expect(err.code).toBe('auth_failed');
+  expect((err.cause as Error).message).toBe('provider down');
+  expect(getEventListeners(signal, 'abort')).toHaveLength(0);
+});
+
 test('an AudioVideoError from the token provider passes through unchanged', async () => {
   const failure = new AudioVideoError({ message: 'no token', code: 'auth_failed' });
   getAccessTokenMock.mockReset().mockRejectedValue(failure);

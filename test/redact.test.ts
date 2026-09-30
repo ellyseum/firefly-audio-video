@@ -382,6 +382,19 @@ test('AudioVideoError: construction never throws — hostile items, a throwing o
   expect(new AudioVideoError({ message: 42 as unknown as string }).message).toBe('42');
 });
 
+test('AudioVideoError: a message whose string form throws still constructs', () => {
+  const unprintable = {
+    toString(): string {
+      throw new Error('no string form');
+    },
+  };
+
+  const err = new AudioVideoError({ message: unprintable as unknown as string, code: 'c' });
+
+  expect(err.message).toBe('[Unreadable message]');
+  expect(err.code).toBe('c');
+});
+
 test('redactValue: never throws on a circular array', () => {
   const circular: unknown[] = [1, 2];
   circular.push(circular);

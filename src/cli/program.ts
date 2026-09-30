@@ -9,6 +9,7 @@
  */
 
 import { Command, CommanderError } from 'commander';
+import { redactValue } from '../core/redact.js';
 import { VERSION } from '../index.js';
 import type { Client } from '../dgr/client.js';
 import { buildCancelCommand } from './commands/cancel.js';
@@ -83,9 +84,9 @@ export function createProgram(options: CreateProgramOptions = {}): Command {
     writeErr: (text: string) => {
       runtime.stderr.write(text);
     },
-    // Commander's usage-error text: with --json the JSON document takes its place.
+    // Commander's usage-error text, redacted: with --json the JSON document takes its place.
     outputError: (text: string, write: (text: string) => void) => {
-      if (!parse.json) write(text);
+      if (!parse.json) write(redactValue(text));
     },
   };
 
@@ -181,7 +182,8 @@ function onProcessSigint(listener: () => void): () => void {
  * lets commander's `exitOverride` throw escape: a `CommanderError` (usage
  * errors, `--help`, `--version`) maps to its own exit code; anything else —
  * which no command action should let through, since each catches its own
- * errors — reports as exit `1`. A usage error under `--json` also prints
+ * errors — prints as any command's failure does, redacted, and exits `1`.
+ * A usage error under `--json` also prints
  * `{ ok: false, error: { code: 'invalid_argument', message } }` on stdout.
  */
 function wrapParseAsync(program: Command, runtime: CliRuntime, parse: ParseState): void {
@@ -198,8 +200,7 @@ function wrapParseAsync(program: Command, runtime: CliRuntime, parse: ParseState
         }
         runtime.exit(code);
       } else {
-        const message = error instanceof Error ? error.message : String(error);
-        runtime.stderr.write(`Error: ${message}\n`);
+        printFailure(runtime, parse.json, error);
         runtime.exit(1);
       }
     }

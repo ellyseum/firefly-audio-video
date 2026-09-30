@@ -1,15 +1,17 @@
 /**
  * The CLI's two result renderers. `--json` prints exactly one JSON document
  * to stdout, success or failure; without it, a command prints its result to
- * stdout in a readable form and an error to stderr. Every value passed here
- * is the command's own product — a URL it staged, a rendered output, a
- * status body — so nothing here redacts it: the SDK already redacted
- * anything that needed it (an {@link AudioVideoError}'s message, an
- * {@link Asset}'s `toJSON()`), and a value a command exists to produce is
- * printed intact.
+ * stdout in a readable form and an error to stderr. A success value is the
+ * command's own product — a URL it staged, a rendered output, a status body
+ * — and prints intact: the SDK already redacted anything in it that needed
+ * it (an {@link Asset}'s `toJSON()`), and a value a command exists to
+ * produce is not scrubbed. A failure's message always goes through the
+ * shared redaction: an {@link AudioVideoError}'s is redacted when the error
+ * is built, and any other error's is redacted here.
  */
 
 import { AudioVideoError } from '../core/errors.js';
+import { redactValue } from '../core/redact.js';
 
 /** The streams a command's output goes to — a {@link CliRuntime} satisfies this. */
 export interface OutputStreams {
@@ -40,8 +42,8 @@ export function printSuccess(
  * Prints a command's failure. `--json` writes
  * `{ ok: false, error: { code, message } }` to stdout; otherwise the error's
  * code and message go to stderr. Never prints anything but `error.code` and
- * `error.message` (already redacted for an {@link AudioVideoError}), so a
- * credential passed on the command line never reaches either stream.
+ * the redacted message, so a credential passed on the command line or
+ * carried in an error's text never reaches either stream.
  */
 export function printFailure(streams: OutputStreams, json: boolean, error: unknown): void {
   const shape = errorShape(error);
@@ -56,8 +58,10 @@ export function printFailure(streams: OutputStreams, json: boolean, error: unkno
 /** `{ code, message }` for any thrown value — the two fields a failure ever prints. */
 function errorShape(error: unknown): { code: string; message: string } {
   if (error instanceof AudioVideoError) return { code: error.code, message: error.message };
-  if (error instanceof Error) return { code: 'unexpected_error', message: error.message };
-  return { code: 'unexpected_error', message: String(error) };
+  if (error instanceof Error) {
+    return { code: 'unexpected_error', message: redactValue(error.message) };
+  }
+  return { code: 'unexpected_error', message: redactValue(String(error)) };
 }
 
 function writeJsonLine(stream: NodeJS.WritableStream, value: unknown): void {

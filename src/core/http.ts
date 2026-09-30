@@ -511,6 +511,19 @@ async function toAudioVideoError(res: Response, url: URL): Promise<AudioVideoErr
     code: `http_${res.status}`,
     status: res.status,
     requestId,
-    items: body === undefined ? undefined : Array.isArray(body) ? body : [body],
+    items: body === undefined ? undefined : Array.isArray(body) ? body : [boundedBody(body)],
   });
+}
+
+/** How much of a non-JSON error body — an HTML error page, say — `.items` keeps. */
+const MAX_TEXT_BODY_CHARS = 4_096;
+
+/**
+ * A text body cut to {@link MAX_TEXT_BODY_CHARS}, with its full length noted
+ * after the cut; a parsed JSON body as it is.
+ */
+function boundedBody(body: unknown): unknown {
+  return typeof body === 'string' && body.length > MAX_TEXT_BODY_CHARS
+    ? `${body.slice(0, MAX_TEXT_BODY_CHARS)}… (${body.length} characters in all)`
+    : body;
 }

@@ -521,6 +521,32 @@ test('a non-2xx response throws AudioVideoError whose serialized form has no sig
   }
 });
 
+test('a non-JSON error body is cut to 4096 characters in .items, noting its full length, and still redacted', async () => {
+  const page = `<html><a href="https://h.example/f?sv=1&amp;sig=HTMLSIG">retry</a>${'x'.repeat(1_000_000)}</html>`;
+  pool().intercept({ path: '/v1/presets', method: 'GET' }).reply(502, page);
+
+  const err = await rejection(
+    new HttpClient({ apiKey: 'key', tokenProvider }).request('GET', '/v1/presets'),
+  );
+
+  expect(err.code).toBe('http_502');
+  const [item] = err.items as string[];
+  expect(item).toMatch(new RegExp(`… \\(${page.length} characters in all\\)$`));
+  expect(item?.length).toBeLessThan(4_200);
+  expect(item).not.toContain('HTMLSIG');
+});
+
+test('a JSON error body is kept whole in .items', async () => {
+  const body = { error: 'bad_gateway', detail: 'y'.repeat(5_000) };
+  pool().intercept({ path: '/v1/presets', method: 'GET' }).reply(502, body);
+
+  const err = await rejection(
+    new HttpClient({ apiKey: 'key', tokenProvider }).request('GET', '/v1/presets'),
+  );
+
+  expect(err.items).toEqual([body]);
+});
+
 // --- 401 auth-retry ---------------------------------------------------------------
 
 test('401 forces a token refresh and retries once, then resolves on 200', async () => {

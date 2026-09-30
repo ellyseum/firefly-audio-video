@@ -95,6 +95,13 @@ function stripSecretParamsFromRawString(u: string): string {
   return `${stripped.slice(0, separator)}?${stripped.slice(separator + 1)}`;
 }
 
+/**
+ * The origin a relative reference is resolved against so the URL parser can read
+ * its query string. `.invalid` is a reserved top-level domain, so no real URL
+ * names this host.
+ */
+const RELATIVE_BASE = 'http://redact.invalid';
+
 /** `u` with its secret query parameters removed through the URL parser, or the raw fallback. */
 function stripParsedSecrets(u: string): string {
   try {
@@ -103,10 +110,12 @@ function stripParsedSecrets(u: string): string {
     // Not an absolute URL (no scheme/host) — fall through to relative resolution.
   }
   try {
-    const base = 'http://redact.invalid';
-    const resolved = stripSecrets(new URL(u, base));
+    const url = new URL(u, RELATIVE_BASE);
+    const resolved = stripSecrets(url);
     if (resolved === undefined) return u;
-    return resolved.startsWith(base) ? resolved.slice(base.length) : resolved;
+    // Only a reference that resolved onto the base goes back to being relative; one
+    // naming its own origin (`//host/…`) keeps the resolved form.
+    return url.origin === RELATIVE_BASE ? `${url.pathname}${url.search}${url.hash}` : resolved;
   } catch {
     // Not parseable even as a relative reference — fall through to the raw scrub.
   }

@@ -71,6 +71,27 @@ test('redactUrl: a protocol-relative URL is resolved and still redacted', () => 
   expect(out).toContain('rest=keep');
 });
 
+test.each([
+  ['a relative path comes back relative', '/v1/f?sig=SECRET&rest=keep', '/v1/f?rest=keep'],
+  [
+    'a protocol-relative URL keeps the origin it names',
+    '//cdn.example/f?sig=SECRET&rest=keep',
+    'http://cdn.example/f?rest=keep',
+  ],
+  [
+    'a host that merely begins with the resolution base keeps its own origin',
+    '//redact.invalid.example/f?sig=SECRET&rest=keep',
+    'http://redact.invalid.example/f?rest=keep',
+  ],
+  [
+    'the resolution base host on another port keeps its own origin',
+    '//redact.invalid:8080/f?sig=SECRET&rest=keep',
+    'http://redact.invalid:8080/f?rest=keep',
+  ],
+])('redactUrl: %s', (_case, input, expected) => {
+  expect(redactUrl(input)).toBe(expected);
+});
+
 // --- every credential-bearing parameter ------------------------------------------------
 
 const SECRET_PARAMS = [

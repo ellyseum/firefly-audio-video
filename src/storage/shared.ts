@@ -16,7 +16,11 @@ import { classifyAsset, type StageInput } from '../core/storage.js';
 /** @internal The prefix every key a provider writes goes under unless its `prefix` option says otherwise. */
 export const DEFAULT_PREFIX = 'firefly-audio-video/';
 
-/** @internal Seconds a staged input's URL lasts unless a caller says otherwise: long enough for a queued job to start reading it. */
+/**
+ * @internal Seconds a staged input's URL lasts unless a caller says otherwise.
+ * The URL is minted in the job's pool slot just before the submit, so it has
+ * to last from the submit until the render has read the input.
+ */
 export const READ_EXPIRY_SECONDS = 3_600;
 
 /** @internal Seconds an output's URLs last unless a caller says otherwise: they must outlive the render and the download after it. */

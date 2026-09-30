@@ -109,19 +109,17 @@ function bundle(contents, format, minify = false) {
   });
 }
 
-/** The application: constructs every provider, stages bytes through each, and prints each outcome as JSON. */
-function application(format) {
-  const names = ['AudioVideoError', ...PROVIDERS.map(({ name }) => name)].join(', ');
-  const load =
-    format === 'esm'
-      ? `import { ${names} } from '${pkg.name}';`
-      : `const { ${names} } = require('${pkg.name}');`;
-  const body = `
+/**
+ * The application's body, fixed source text: it constructs every provider
+ * `BUNDLE_SMOKE_PROVIDERS` names (JSON, read when the bundle runs), stages bytes
+ * through each, and prints each outcome as JSON. The providers arrive as data,
+ * so no value is ever spliced into code.
+ */
+const APPLICATION_BODY = `
 globalThis.fetch = async () => { throw new Error('the bundle made a network call'); };
-const providers = ${JSON.stringify(PROVIDERS.map(({ name, options }) => ({ name, options })))};
-const classes = { ${PROVIDERS.map(({ name }) => name).join(', ')} };
+const classes = { AioFilesStorageProvider, S3StorageProvider, AzureBlobStorageProvider };
 const outcomes = [];
-for (const { name, options } of providers) {
+for (const { name, options } of JSON.parse(process.env.BUNDLE_SMOKE_PROVIDERS)) {
   const provider = new classes[name](options);
   const error = await provider.stageRead(Buffer.from('bundle smoke')).then(() => undefined, (e) => e);
   outcomes.push({
@@ -133,8 +131,17 @@ for (const { name, options } of providers) {
 }
 process.stdout.write(JSON.stringify(outcomes));
 `;
-  return format === 'esm' ? `${load}\n${body}` : `${load}\n(async () => {${body}})();`;
-}
+
+/**
+ * The application per output format: the package imported by its name, as an
+ * application would, then the body — inside an async function for CommonJS. A
+ * provider in PROVIDERS that is not imported here cannot be constructed when the
+ * bundle runs, which fails that check.
+ */
+const APPLICATIONS = {
+  esm: `import { AudioVideoError, AioFilesStorageProvider, S3StorageProvider, AzureBlobStorageProvider } from 'firefly-audio-video';\n${APPLICATION_BODY}`,
+  cjs: `const { AudioVideoError, AioFilesStorageProvider, S3StorageProvider, AzureBlobStorageProvider } = require('firefly-audio-video');\n(async () => {${APPLICATION_BODY}})();`,
+};
 
 /** True when `specifier` resolves from `directory`. */
 function resolvesFrom(directory, specifier) {
@@ -158,11 +165,14 @@ await check('the built entries exist — run `npm run build` first', () => {
 });
 
 await check('the guard fails a bundle that imports a peer by its name', async () => {
-  const outcome = await bundle(`export const load = () => import('${PEERS[0]}');\n`, 'esm').then(
+  const outcome = await bundle(
+    "export const load = () => import('@adobe/aio-lib-files');\n",
+    'esm',
+  ).then(
     () => 'built',
     (error) => String(error.message),
   );
-  if (!outcome.includes(`${PEERS[0]} is not installed`)) {
+  if (!outcome.includes('@adobe/aio-lib-files is not installed')) {
     throw new Error(`the peers-not-installed guard did not fire: ${outcome}`);
   }
 });
@@ -193,7 +203,7 @@ for (const [format, minify, file] of [
   await check(
     `[${label}] an application importing the built package bundles without the peers`,
     async () => {
-      const result = await bundle(application(format), format, minify);
+      const result = await bundle(APPLICATIONS[format], format, minify);
       if (result.errors.length > 0) throw new Error(JSON.stringify(result.errors));
       const code = result.outputFiles[0]?.text ?? '';
       for (const peer of PEERS) {
@@ -212,7 +222,13 @@ for (const [format, minify, file] of [
       const stdout = execFileSync(process.execPath, [written], {
         cwd: OUT,
         encoding: 'utf8',
-        env: { ...process.env, NODE_PATH: '' },
+        env: {
+          ...process.env,
+          NODE_PATH: '',
+          BUNDLE_SMOKE_PROVIDERS: JSON.stringify(
+            PROVIDERS.map(({ name, options }) => ({ name, options })),
+          ),
+        },
       });
       const outcomes = JSON.parse(stdout);
       for (const { name, peer } of PROVIDERS) {

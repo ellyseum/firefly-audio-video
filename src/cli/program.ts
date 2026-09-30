@@ -129,10 +129,33 @@ export function createProgram(options: CreateProgramOptions = {}): Command {
   for (const command of [program, ...program.commands]) {
     command.configureOutput(outputConfiguration);
     command.exitOverride();
+    reportOptionNamesOnly(command);
   }
 
   wrapParseAsync(program, runtime, parse);
   return program;
+}
+
+/**
+ * Makes `command` name an unknown option without whatever was written after
+ * its name — `--name=value` reports as `--name`, `-xvalue` as `-x` — so a
+ * mistyped option never prints the value typed with it, in either output
+ * mode. Commander hands the whole token to its `unknownOption()`, which
+ * builds that error's message and its "Did you mean" suggestion.
+ */
+function reportOptionNamesOnly(command: Command): void {
+  const reporter = command as unknown as { unknownOption(flag: string): void };
+  const report = reporter.unknownOption.bind(command);
+  reporter.unknownOption = (flag) => report(optionName(flag));
+}
+
+/** The option a command-line token names: a long option up to any `=`, a short one's first letter. */
+function optionName(token: string): string {
+  if (token.startsWith('--')) {
+    const equals = token.indexOf('=');
+    return equals === -1 ? token : token.slice(0, equals);
+  }
+  return token.slice(0, 2);
 }
 
 /**

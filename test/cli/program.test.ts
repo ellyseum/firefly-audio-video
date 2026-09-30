@@ -95,6 +95,72 @@ test.each(USAGE_ERRORS)(
   },
 );
 
+const TYPED_VALUE = 'TYPED_VALUE_MUST_NEVER_PRINT';
+
+test.each<[form: string, args: string[], named: string]>([
+  [
+    '--name=value on a subcommand',
+    ['stage', 'x', `--client-secrt=${TYPED_VALUE}`],
+    '--client-secrt',
+  ],
+  ['--name=value before the command', [`--bogus=${TYPED_VALUE}`, 'status', 'job-1'], '--bogus'],
+  ['-xvalue', ['stage', 'x', `-z${TYPED_VALUE}`], '-z'],
+])(
+  'an unknown option written as %s is named without its value, in human and --json output',
+  async (_form, args, named) => {
+    const human = createHarness({ client: createFakeClient() });
+    await human.run(args);
+    expect(human.stderrText()).toContain(`error: unknown option '${named}'`);
+    expect(human.stdoutText() + human.stderrText()).not.toContain(TYPED_VALUE);
+    expect(human.exit).toHaveBeenCalledExactlyOnceWith(2);
+
+    const json = createHarness({ client: createFakeClient() });
+    await json.run([...args, '--json']);
+    const lines = stdoutLines(json.stdoutText());
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0] ?? '')).toEqual({
+      ok: false,
+      error: { code: 'invalid_argument', message: expect.stringContaining(`'${named}'`) },
+    });
+    expect(json.stdoutText() + json.stderrText()).not.toContain(TYPED_VALUE);
+    expect(json.exit).toHaveBeenCalledExactlyOnceWith(2);
+  },
+);
+
+test('an unknown option is matched against the real options by its name alone', async () => {
+  const harness = createHarness({ client: createFakeClient() });
+  await harness.run(['stage', 'x', `--client-secrt=${TYPED_VALUE}`]);
+  expect(harness.stderrText()).toContain('(Did you mean --client-secret?)');
+});
+
+const CLOUD_SECRET = 'CLOUD_SECRET_VALUE_MUST_NEVER_PRINT';
+
+test.each<[flag: string]>([['--aws-secret-access-key'], ['--azure-storage-connection-string']])(
+  '%s is refused as a flag, exit 2 before any render, and its value is never printed',
+  async (flag) => {
+    for (const given of [[flag, CLOUD_SECRET], [`${flag}=${CLOUD_SECRET}`]]) {
+      for (const mode of [[], ['--json']]) {
+        const render = vi.fn();
+        const harness = createHarness({ client: createFakeClient({ render }) });
+        await harness.run([
+          'render',
+          '--template',
+          't.mogrt',
+          '--preset',
+          'prores',
+          ...given,
+          ...mode,
+        ]);
+        const printed = harness.stdoutText() + harness.stderrText();
+        expect(printed).toContain(`unknown option '${flag}'`);
+        expect(printed).not.toContain(CLOUD_SECRET);
+        expect(render).not.toHaveBeenCalled();
+        expect(harness.exit).toHaveBeenCalledExactlyOnceWith(2);
+      }
+    }
+  },
+);
+
 test('a usage error honors --json given after the subcommand, and not a --json that follows --', async () => {
   const after = createHarness({ client: createFakeClient() });
   await after.run(['stage', 'x', '--bogus', '--json']);

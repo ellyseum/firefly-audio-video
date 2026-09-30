@@ -162,13 +162,11 @@ test('buildStorageProvider builds an AzureBlobStorageProvider from AZURE_STORAGE
   expect(provider).toBeInstanceOf(AzureBlobStorageProvider);
 });
 
-test('buildStorageProvider refuses azure:// with no AZURE_STORAGE_CONNECTION_STRING, and never accepts one as a flag', async () => {
+test('buildStorageProvider refuses azure:// with no AZURE_STORAGE_CONNECTION_STRING', async () => {
   const descriptor: StorageDescriptor = { kind: 'azure', container: 'c' };
   const error = await rejection(() => buildStorageProvider(descriptor, {}));
   expect(error.code).toBe('invalid_argument');
   expect(error.message).toContain('AZURE_STORAGE_CONNECTION_STRING');
-  // No option on StorageDescriptor carries a connection string — it is only ever read from env.
-  expect(Object.keys(descriptor)).not.toContain('connectionString');
 });
 
 test('buildStorageProvider treats a blank AZURE_STORAGE_CONNECTION_STRING as absent', async () => {

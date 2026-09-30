@@ -2,15 +2,11 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from 'vitest';
-import { checkReleaseGate } from '../scripts/check-release-gate.mjs';
+import { VERSION_FILE, checkReleaseGate } from '../scripts/check-release-gate.mjs';
+import { VERSION } from '../src/index.js';
 
-const WORKFLOW_PATH = join(
-  dirname(fileURLToPath(import.meta.url)),
-  '..',
-  '.github',
-  'workflows',
-  'release.yml',
-);
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+const WORKFLOW_PATH = join(ROOT, '.github', 'workflows', 'release.yml');
 const BASE = readFileSync(WORKFLOW_PATH, 'utf8');
 
 function ids(violations: { id: string; message: string }[]) {
@@ -410,4 +406,41 @@ test('mutation: the built version checked before the build reddens publish-next-
   const violations = checkReleaseGate(mutated);
   expect(ids(violations)).toEqual(['publish-next-version']);
   expect(onlyMessage(violations)).toMatch(/must be checked after npm run build/);
+});
+
+/** publish-next's stamp of the prerelease version, as the committed workflow writes it. */
+const STAMP_STEP = [
+  '      - name: stamp the prerelease version into src/version.ts',
+  "        run: sed -i -E \"s/^export const VERSION = '[^']*';/export const VERSION = '${VERSION}';/\" src/version.ts",
+  '        env:',
+  '          VERSION: ${{ steps.version.outputs.version }}',
+  '',
+].join('\n');
+
+test('the file publish-next must stamp holds the VERSION literal the package exports, where the stamp matches it', () => {
+  const lines = readFileSync(join(ROOT, VERSION_FILE), 'utf8').split('\n');
+  expect(lines.some((line) => line.startsWith(`export const VERSION = '${VERSION}';`))).toBe(true);
+});
+
+test('mutation: the stamp aimed at src/index.ts reddens publish-next-stamp', () => {
+  const violations = checkReleaseGate(mutate(BASE, '/" src/version.ts\n', '/" src/index.ts\n'));
+  expect(ids(violations)).toEqual(['publish-next-stamp']);
+  expect(onlyMessage(violations)).toMatch(/stamped with sed into src\/version\.ts/);
+});
+
+test('mutation: no stamp step reddens publish-next-stamp', () => {
+  const violations = checkReleaseGate(mutate(BASE, STAMP_STEP, ''));
+  expect(ids(violations)).toEqual(['publish-next-stamp']);
+});
+
+test('mutation: the stamp after the build reddens publish-next-stamp', () => {
+  const withoutStamp = mutate(BASE, STAMP_STEP, '');
+  const mutated = mutate(
+    withoutStamp,
+    '      - run: npm run build\n      - name: check the built package',
+    '      - run: npm run build\n' + STAMP_STEP + '      - name: check the built package',
+  );
+  const violations = checkReleaseGate(mutated);
+  expect(ids(violations)).toEqual(['publish-next-stamp']);
+  expect(onlyMessage(violations)).toMatch(/before npm run build/);
 });

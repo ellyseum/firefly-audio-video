@@ -28,6 +28,11 @@
  *    the built package's `dist/cli.cjs --version` after the build and
  *    before `npm publish`, so a prerelease never ships reporting another
  *    version.
+ *  - `publish-next` stamps the prerelease version with `sed` into
+ *    `src/version.ts`, the file that holds the `VERSION` literal the build
+ *    bakes into the package, before `npm run build`. A stamp aimed at any
+ *    other file matches nothing and exits 0, which only the post-build
+ *    version check would catch, at release time.
  *  - neither publish job references a `secrets.*` value that looks like a
  *    stored npm auth token: one named `NPM_...`, or any secret at all fed
  *    into `NODE_AUTH_TOKEN` — that env var is what `npm publish` reads
@@ -299,6 +304,16 @@ function stepIndex(lines, pattern) {
   return lines.findIndex((line) => !isBlankOrComment(line) && pattern.test(line));
 }
 
+/** The file that holds the `VERSION` literal the build bakes into the package. */
+export const VERSION_FILE = 'src/version.ts';
+
+/** A line that rewrites the `export const VERSION` literal in {@link VERSION_FILE} with `sed`. */
+const STAMP_STEP = new RegExp(
+  String.raw`\bsed\b.*\bexport const VERSION\b.*\s` +
+    VERSION_FILE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') +
+    String.raw`(?:\s|$)`,
+);
+
 /** Every trimmed line invoking `npm publish` or `npm stage publish` without `--provenance`, in a job's body. */
 function npmPublishLinesWithoutProvenance(lines) {
   return lines
@@ -456,6 +471,13 @@ export function checkReleaseGate(text) {
       push(
         'publish-next-version',
         "the built package's dist/cli.cjs --version must be checked after npm run build and before npm publish",
+      );
+    }
+    const stampAt = stepIndex(next, STAMP_STEP);
+    if (stampAt === -1 || buildAt === -1 || stampAt > buildAt) {
+      push(
+        'publish-next-stamp',
+        `the prerelease version must be stamped with sed into ${VERSION_FILE}, the file that holds the VERSION literal, before npm run build`,
       );
     }
     const env = findEnvironmentName(next);

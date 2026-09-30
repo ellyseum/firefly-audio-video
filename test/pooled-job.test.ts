@@ -1,4 +1,5 @@
-import { getEventListeners } from 'node:events';
+import { getEventListeners, once } from 'node:events';
+import { PassThrough } from 'node:stream';
 import { inspect } from 'node:util';
 import { afterAll, afterEach, beforeAll, expect, test } from 'vitest';
 import { AudioVideoError } from '../src/core/errors.js';
@@ -443,6 +444,48 @@ test('a caller signal aborting while the call finishes aborts the finish signal,
     await expect(job).rejects.toBe(reason);
     expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
   });
+});
+
+test('a stream the call resolves with stays cancellable until it closes, and then leaves no listener on the caller signal', async () => {
+  const controller = new AbortController();
+  let finishSignal: AbortSignal | undefined;
+  const job = runPooledJob<string, PassThrough>({
+    pool: new InMemoryPool(),
+    signal: controller.signal,
+    prepare: () => nothingToStage(() => controlledJob('job-a', Promise.resolve('raw'))),
+    finish: (_value, signal) => {
+      finishSignal = signal;
+      return new PassThrough();
+    },
+  });
+
+  const stream = await job;
+  expect(getEventListeners(controller.signal, 'abort')).toHaveLength(1);
+  await job.cancel();
+  expect(finishSignal?.aborted).toBe(true);
+
+  stream.destroy();
+  await once(stream, 'close');
+  expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+});
+
+test('once a stream the call resolved with has closed, cancel() is a no-op', async () => {
+  let finishSignal: AbortSignal | undefined;
+  const job = runPooledJob<string, PassThrough>({
+    pool: new InMemoryPool(),
+    prepare: () => nothingToStage(() => controlledJob('job-a', Promise.resolve('raw'))),
+    finish: (_value, signal) => {
+      finishSignal = signal;
+      return new PassThrough();
+    },
+  });
+
+  const stream = await job;
+  stream.end();
+  stream.resume();
+  await once(stream, 'close');
+  await job.cancel();
+  expect(finishSignal?.aborted).toBe(false);
 });
 
 test('onSettle runs exactly once, after finish, and a throwing onSettle changes nothing', async () => {

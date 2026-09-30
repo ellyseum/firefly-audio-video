@@ -205,9 +205,10 @@ export interface RenderOptions {
   savePath?: string;
   /**
    * Cancels the render when it aborts, including the download `resolveAs`
-   * performs: before the job is submitted nothing is submitted; after, the
-   * service is asked to stop the job. The render rejects `cancelled` with the
-   * abort reason as `cause`.
+   * performs — for `'stream'`, until the stream closes: before the job is
+   * submitted nothing is submitted; after, the service is asked to stop the
+   * job. The render rejects `cancelled` with the abort reason as `cause`, and
+   * a stream it resolved with emits it as an `'error'`.
    */
   signal?: AbortSignal;
   /**

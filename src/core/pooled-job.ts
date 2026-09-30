@@ -15,6 +15,7 @@
  * has been sent. Capability-neutral: nothing here knows what a job produces.
  */
 
+import { Readable } from 'node:stream';
 import { AudioVideoError } from './errors.js';
 import type { AsyncJob, JobMeta } from './job.js';
 import type { PoolBackend } from './pool.js';
@@ -52,7 +53,9 @@ export interface JobHandle<T> extends PromiseLike<T> {
    * the job it creates is asked to stop, and the call's pool slot stays held
    * until then, so the pool still bounds the jobs running on the service.
    * While a finished job's result is being downloaded, the download is
-   * aborted. Calling this on a settled call, or a second time, is a no-op.
+   * aborted — a stream the call resolved with included, for as long as that
+   * stream is open, since its download runs after the call has settled.
+   * Calling this on a settled call otherwise, or a second time, is a no-op.
    */
   cancel(): Promise<void>;
   /** Attaches a rejection handler to the call's settlement. */
@@ -109,7 +112,8 @@ export interface PooledJobOptions<J, T> {
   /**
    * Turns the job's result into the call's value once the job has released
    * its slot. `signal` aborts if the call is cancelled, or
-   * {@link PooledJobOptions.signal} aborts, during this phase.
+   * {@link PooledJobOptions.signal} aborts, during this phase — and, when the
+   * value is a stream, until that stream closes.
    */
   finish: (value: J, signal: AbortSignal) => Promise<T> | T;
   /**
@@ -146,6 +150,8 @@ export class PooledJob<J, T> implements JobHandle<T> {
   #job: AsyncJob<J> | undefined;
   #state: CallState = 'pending';
   #detachSignal: (() => void) | undefined;
+  /** True while a stream the call resolved with is still open, reading the job's result. */
+  #streaming = false;
 
   constructor(options: PooledJobOptions<J, T>) {
     const external = options.signal;
@@ -206,7 +212,12 @@ export class PooledJob<J, T> implements JobHandle<T> {
 
   /** See {@link JobHandle.cancel}. */
   cancel(): Promise<void> {
-    if (this.#state !== 'pending') return Promise.resolve();
+    if (this.#state !== 'pending') {
+      if (this.#streaming) {
+        this.#finishing.abort(cancelledError(undefined, 'while its result was being read'));
+      }
+      return Promise.resolve();
+    }
     // A call the caller explicitly cancelled and never awaits is not an unhandled rejection.
     this.#promise.catch(noop);
     this.#finishing.abort(cancelledError(undefined, 'while its result was being read'));
@@ -235,14 +246,42 @@ export class PooledJob<J, T> implements JobHandle<T> {
     // Finishing runs outside the slot; a job that settled with nothing left on the service frees it at once.
     await released;
     const { signal } = options;
-    if (signal === undefined) return options.finish(value, this.#finishing.signal);
-    // Released once finish settles: the caller's signal can outlive this call by far.
-    const link = linkSignals([this.#finishing.signal, signal]);
-    try {
-      return await options.finish(value, link.signal);
-    } finally {
-      link.release();
+    if (signal === undefined) {
+      const result = await options.finish(value, this.#finishing.signal);
+      this.#holdWhileStreaming(result, noop);
+      return result;
     }
+    // Released once finish settles, or once the stream it resolves with closes: the caller's
+    // signal can outlive this call by far.
+    const link = linkSignals([this.#finishing.signal, signal]);
+    let result: T;
+    try {
+      result = await options.finish(value, link.signal);
+    } catch (error) {
+      link.release();
+      throw error;
+    }
+    this.#holdWhileStreaming(result, link.release);
+    return result;
+  }
+
+  /**
+   * Keeps a stream the call resolves with — its result, still downloading
+   * after the call has settled — reachable by the call's cancellation: until
+   * it closes, `cancel()` and the caller's signal still abort the signal
+   * `finish` handed it, and `release` runs only then. Any other value
+   * releases at once.
+   */
+  #holdWhileStreaming(result: T, release: () => void): void {
+    if (!(result instanceof Readable) || result.closed) {
+      release();
+      return;
+    }
+    this.#streaming = true;
+    result.once('close', () => {
+      this.#streaming = false;
+      release();
+    });
   }
 
   /**

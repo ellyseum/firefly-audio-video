@@ -3,7 +3,7 @@
 ## Releasing
 
 `.github/workflows/release.yml` builds and packages the project on every push and pull request
-through `dry-run-publish`, independent of whether publishing is enabled. Everything else in this
+through `pack-contents`, independent of whether publishing is enabled. Everything else in this
 workflow, including the pull-request preview channel, runs only while the repository is public.
 
 ### Channels
@@ -42,8 +42,8 @@ secret.
 
 Set the repository variable `PUBLISH_ENABLED` to `false` to pause the release path: `verify`,
 `check-npm-tag`, and both publish jobs are skipped, since none of them has anything to do while
-nothing may publish. `dry-run-publish` keeps running regardless — it only ever checks the packed
-file list, and never authenticates to npm.
+nothing may publish. `pack-contents` keeps running regardless — it only ever runs `npm pack
+--dry-run`, which never contacts the registry and never authenticates to npm.
 
 ### Floor for OIDC trusted publishing
 

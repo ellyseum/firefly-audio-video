@@ -584,7 +584,7 @@ Runnable here:
 | `npm run coverage`                      | the unit suite with coverage and its thresholds                                                                                                                                                             |
 | `npm run runtime-smoke`                 | exercises the built `dist/` on the running Node, with no dependencies (after `npm run build`)                                                                                                               |
 | `npm run bundle-smoke`                  | bundles an application against the built package without the storage peers; each provider must reject `missing_peer_dependency` (after `npm run build`)                                                     |
-| `node scripts/verify-pack-contents.mjs` | a dry-run publish whose file list must be `dist/`, `LICENSE`, `README.md` and `package.json`                                                                                                                |
+| `node scripts/verify-pack-contents.mjs` | a dry-run pack whose file list must be `dist/`, `LICENSE`, `README.md` and `package.json`                                                                                                                   |
 | `node scripts/check-release-gate.mjs`   | checks the publish gates in `release.yml`                                                                                                                                                                   |
 | `npm run smoke`                         | live renders, one per codec path, each checked by the FourCC it asked for; billed, and skipped unless `IMS_OAUTH_S2S_CLIENT_ID` is set (the top of `test/smoke/render.smoke.test.ts` lists its environment) |
 

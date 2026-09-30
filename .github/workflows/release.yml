@@ -16,8 +16,11 @@ jobs:
   # Runs on every push and pull request, independent of the flags below: it
   # proves the package.json "files" allowlist still produces exactly the
   # public surface — the built dist/, LICENSE, README.md and package.json —
-  # and nothing from the development tree.
-  dry-run-publish:
+  # and nothing from the development tree. A dry-run pack, never a dry-run
+  # publish: it never contacts the registry, so it keeps working on every
+  # push between releases, while package.json still carries the released
+  # version.
+  pack-contents:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

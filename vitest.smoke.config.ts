@@ -5,8 +5,9 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['test/smoke/**/*.test.ts'],
-    // A render queues, encodes on the service and downloads; allow for a slow farm.
-    testTimeout: 15 * 60_000,
+    // A render queues, encodes on the service and downloads; the farm has held a job in its
+    // queue for 45 minutes before rendering it in 28 seconds.
+    testTimeout: 55 * 60_000,
     hookTimeout: 5 * 60_000,
   },
 });

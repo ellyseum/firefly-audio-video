@@ -36,7 +36,7 @@ import { randomBytes } from 'node:crypto';
 import { mkdirSync, mkdtempSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, test } from 'vitest';
+import { afterAll, beforeAll, describe, expect, test, type ExpectStatic } from 'vitest';
 import { normalizeScope } from '../../src/dgr/client.js';
 import {
   AioFilesStorageProvider,
@@ -51,15 +51,22 @@ import {
 } from '../../src/index.js';
 import { videoSampleEntry } from './fourcc.js';
 
+/** A render leg: the preset, the FourCC its output must carry, and that output's file extension. */
+interface Leg {
+  readonly preset: PresetName;
+  readonly fourcc: string;
+  readonly extension: string;
+}
+
 /** One render per codec path: DGR's native ProRes preset, and the two presets the client generates as `.epr` files. */
 const CODEC_LEGS = [
   { preset: 'prores', fourcc: 'ap4h', extension: '.mov' },
   { preset: 'prores4444xq', fourcc: 'ap4x', extension: '.mov' },
   { preset: 'hevc1080p10bit', fourcc: 'hvc1', extension: '.mp4' },
-] as const satisfies readonly { preset: PresetName; fourcc: string; extension: string }[];
+] as const satisfies readonly Leg[];
 
 /** What the S3 and Azure legs render: the native ProRes preset, so each leg tests only its store. */
-const STORE_LEG = CODEC_LEGS[0];
+const STORE_LEG: Leg = CODEC_LEGS[0];
 
 const REQUIRED = [
   'IMS_OAUTH_S2S_CLIENT_SECRET',
@@ -72,14 +79,14 @@ const REQUIRED = [
 /** The key prefix every object of this run goes under. */
 const RUN_PREFIX = `smoke-${new Date().toISOString().slice(0, 10).replaceAll('-', '')}-${randomBytes(4).toString('hex')}/`;
 
-/** A store the run writes to: the provider the client stages through, and how to read and delete one of its objects. */
+/** A store the run writes to: the provider configured with its prefix, and how to read and delete one of its objects. */
 interface SmokeStore {
   readonly name: string;
-  /** The prefix every key of this run goes under in this store. */
+  /** The prefix every key of this run goes under in this store; `provider` is configured with it. */
   readonly prefix: string;
+  readonly provider: StorageProvider;
   /** Every object key the run wrote here, recorded before the write. */
   readonly keys: string[];
-  readonly storage: StorageProvider;
   /** Set once a render through this store has saved its output. */
   rendered: boolean;
   exists(key: string): Promise<boolean>;
@@ -92,7 +99,6 @@ describe.skipIf(!process.env.IMS_OAUTH_S2S_CLIENT_ID)('live render round trip', 
   let template: string;
   let outDir: string;
   let files: SmokeStore;
-  let client: Client;
 
   beforeAll(async () => {
     const missing = REQUIRED.filter((name) => !process.env[name]?.trim());
@@ -120,7 +126,6 @@ describe.skipIf(!process.env.IMS_OAUTH_S2S_CLIENT_ID)('live render round trip', 
     console.info(`Renders are saved in ${outDir}; objects go under ${RUN_PREFIX}`);
     files = await aioFilesStore();
     stores.push(files);
-    client = clientFor(files);
   });
 
   afterAll(async () => {
@@ -129,24 +134,29 @@ describe.skipIf(!process.env.IMS_OAUTH_S2S_CLIENT_ID)('live render round trip', 
     expect(failures).toEqual([]);
   });
 
-  test.for(CODEC_LEGS)(
+  test.concurrent.for(CODEC_LEGS)(
     '$preset renders through App Builder Files to a file whose video sample entry is $fourcc',
-    async (leg, { signal }) => {
-      await renderAndCheck(client, files, leg, leg.preset, signal);
+    async (leg, { signal, expect }) => {
+      await renderAndCheck(files, leg, leg.preset, signal, expect);
     },
   );
 
-  test('S3: a render staged in and written to S3StorageProvider', async ({ signal, skip }) => {
+  test('S3: a render staged in and written to S3StorageProvider', async ({
+    signal,
+    skip,
+    expect,
+  }) => {
     const target = process.env.DGR_SMOKE_S3?.trim();
     if (!target) return skip('DGR_SMOKE_S3 is not set (s3://<bucket>/<prefix>)');
     const store = await s3Store(target);
     stores.push(store);
-    await renderAndCheck(clientFor(store), store, STORE_LEG, 's3', signal);
+    await renderAndCheck(store, STORE_LEG, 's3', signal, expect);
   });
 
   test('Azure: a render staged in and written to AzureBlobStorageProvider', async ({
     signal,
     skip,
+    expect,
   }) => {
     const target = process.env.DGR_SMOKE_AZURE?.trim();
     const connectionString = process.env.AZURE_STORAGE_CONNECTION_STRING?.trim();
@@ -156,31 +166,32 @@ describe.skipIf(!process.env.IMS_OAUTH_S2S_CLIENT_ID)('live render round trip', 
     }
     const store = await azureStore(target, connectionString);
     stores.push(store);
-    await renderAndCheck(clientFor(store), store, STORE_LEG, 'azure', signal);
+    await renderAndCheck(store, STORE_LEG, 'azure', signal, expect);
   });
 
-  /** A client on the proven credential that stages through `store`; a `429` is not retried, so each render is one submit. */
-  function clientFor(store: SmokeStore): Client {
-    return createClient({
-      clientId: env('IMS_OAUTH_S2S_CLIENT_ID'),
-      tokenProvider: tokens,
-      storage: store.storage,
-      retry: { maxRetries: 0 },
-    });
-  }
-
-  /** Renders the template with `leg.preset` through `on`, saves the output, and checks its size and FourCC. */
+  /**
+   * Renders the template with `leg.preset` on a client that stages through
+   * `store`, saves the output, and checks its size and FourCC. Every object
+   * the render writes is keyed under `name/`; a `429` is not retried, so the
+   * render is exactly one submit.
+   */
   async function renderAndCheck(
-    on: Client,
     store: SmokeStore,
-    leg: (typeof CODEC_LEGS)[number],
+    leg: Leg,
     name: string,
     signal: AbortSignal,
+    check: ExpectStatic,
   ): Promise<void> {
+    const client: Client = createClient({
+      clientId: env('IMS_OAUTH_S2S_CLIENT_ID'),
+      tokenProvider: tokens,
+      storage: recording(store, name),
+      retry: { maxRetries: 0 },
+    });
     const path = join(outDir, `${name}${leg.extension}`);
     // The service refuses a render with no `variations` (422), so the spec carries one variation
     // that overrides nothing: every control keeps the template's default.
-    const asset = await on.render(
+    const asset = await client.render(
       {
         source: template,
         presets: [leg.preset],
@@ -198,20 +209,19 @@ describe.skipIf(!process.env.IMS_OAUTH_S2S_CLIENT_ID)('live render round trip', 
       `${name}: job ${jobId}, preset ${leg.preset}, FourCC requested ${leg.fourcc} found ${found}, ` +
         `queue ${queueMs} ms, render ${renderMs} ms, total ${totalMs} ms, ${bytes} bytes`,
     );
-    expect(bytes).toBeGreaterThan(0);
-    expect(found).toBe(leg.fourcc);
+    check(bytes).toBeGreaterThan(0);
+    check(found).toBe(leg.fourcc);
   }
 
   /** The App Builder Files store the Runtime credentials in the environment name. */
   async function aioFilesStore(): Promise<SmokeStore> {
-    const keys: string[] = [];
     const filesLib = await import('@adobe/aio-lib-files');
-    const files = await filesLib.init({
+    const client = await filesLib.init({
       ow: { namespace: env('AIO_runtime_namespace'), auth: env('AIO_runtime_auth') },
     });
     /** The status a presigned `method` request for `key` answers; the URL itself never leaves this function. */
     const statusOf = async (key: string, method: 'HEAD' | 'DELETE'): Promise<number> => {
-      const url = await files.generatePresignURL(key, {
+      const url = await client.generatePresignURL(key, {
         expiryInSeconds: 600,
         permissions: method === 'HEAD' ? 'r' : 'd',
         urlType: 'external',
@@ -223,8 +233,8 @@ describe.skipIf(!process.env.IMS_OAUTH_S2S_CLIENT_ID)('live render round trip', 
     return {
       name: 'App Builder Files',
       prefix: RUN_PREFIX,
-      keys,
-      storage: recording(new AioFilesStorageProvider({ prefix: RUN_PREFIX }), RUN_PREFIX, keys),
+      provider: new AioFilesStorageProvider({ prefix: RUN_PREFIX }),
+      keys: [],
       rendered: false,
       async exists(key) {
         const status = await statusOf(key, 'HEAD');
@@ -243,14 +253,13 @@ describe.skipIf(!process.env.IMS_OAUTH_S2S_CLIENT_ID)('live render round trip', 
 async function s3Store(target: string): Promise<SmokeStore> {
   const { root, prefix: base } = parseTarget(target, 's3:');
   const prefix = `${base}${RUN_PREFIX}`;
-  const keys: string[] = [];
   const { S3Client, HeadObjectCommand, DeleteObjectCommand } = await import('@aws-sdk/client-s3');
   const s3 = new S3Client({});
   return {
     name: `S3 bucket ${root}`,
     prefix,
-    keys,
-    storage: recording(new S3StorageProvider({ bucket: root, prefix }), prefix, keys),
+    provider: new S3StorageProvider({ bucket: root, prefix }),
+    keys: [],
     rendered: false,
     async exists(key) {
       try {
@@ -275,19 +284,14 @@ async function s3Store(target: string): Promise<SmokeStore> {
 async function azureStore(target: string, connectionString: string): Promise<SmokeStore> {
   const { root, prefix: base } = parseTarget(target, 'azure:');
   const prefix = `${base}${RUN_PREFIX}`;
-  const keys: string[] = [];
   const { BlobServiceClient } = await import('@azure/storage-blob');
   const container =
     BlobServiceClient.fromConnectionString(connectionString).getContainerClient(root);
   return {
     name: `Azure container ${root}`,
     prefix,
-    keys,
-    storage: recording(
-      new AzureBlobStorageProvider({ container: root, connectionString, prefix }),
-      prefix,
-      keys,
-    ),
+    provider: new AzureBlobStorageProvider({ container: root, connectionString, prefix }),
+    keys: [],
     rendered: false,
     exists: (key) => container.getBlockBlobClient(key).exists(),
     async remove(key) {
@@ -319,8 +323,9 @@ async function sweep(store: SmokeStore): Promise<string[]> {
   }
   const control = `${store.prefix}never-written`;
   try {
-    if (await store.exists(control))
+    if (await store.exists(control)) {
       failures.push(`${store.name}: never-written ${control} reads as present.`);
+    }
   } catch (error) {
     failures.push(`${store.name}: ${control}: ${(error as Error).message}`);
   }
@@ -336,26 +341,29 @@ async function sweep(store: SmokeStore): Promise<string[]> {
 }
 
 /**
- * `provider` with every object it writes given a key recorded in `keys` (as
- * `prefix` plus that key) before the write starts, so cleanup finds it even if
- * the write fails part-way. `provider` must be configured with `prefix`.
+ * `store.provider`, with every object it writes keyed under `folder/` and
+ * recorded in `store.keys` (with the store's prefix) before the write starts,
+ * so cleanup finds it even if the write fails part-way.
  */
-function recording(provider: StorageProvider, prefix: string, keys: string[]): StorageProvider {
+function recording(store: SmokeStore, folder: string): StorageProvider {
   let count = 0;
   const claim = (key: string | undefined, name: string): string => {
     count += 1;
-    const chosen = key ?? `${String(count).padStart(2, '0')}-${name}`;
-    keys.push(`${prefix}${chosen}`);
+    const chosen = key ?? `${folder}/${String(count).padStart(2, '0')}-${name}`;
+    store.keys.push(`${store.prefix}${chosen}`);
     return chosen;
   };
   return {
     stageRead: (input, opts = {}) =>
-      provider.stageRead(input, {
+      store.provider.stageRead(input, {
         ...opts,
         key: claim(opts.key, stagedName(input, opts.contentType)),
       }),
     allocateOutput: (opts = {}) =>
-      provider.allocateOutput({ ...opts, key: claim(opts.key, 'output') }),
+      store.provider.allocateOutput({
+        ...opts,
+        key: claim(opts.key, 'output'),
+      }),
   };
 }
 

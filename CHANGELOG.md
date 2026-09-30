@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.1](https://github.com/ellyseum/firefly-audio-video/compare/firefly-audio-video-v0.1.0...firefly-audio-video-v0.1.1) (2026-09-30)
+
+
+### Bug Fixes
+
+* **core:** key the shared default client and class identity by package version ([52251b4](https://github.com/ellyseum/firefly-audio-video/commit/52251b456377b154dab995b289129f7c6fa924c8))
+* **core:** key the shared default client and class identity by package version ([97ff8c2](https://github.com/ellyseum/firefly-audio-video/commit/97ff8c2ed20eabb9b6db239d96fdaef48d26e500))
+
 ## 0.1.0 (2026-09-30)
 
 

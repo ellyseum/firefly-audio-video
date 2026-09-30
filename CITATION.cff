@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: 'If you use this software, please cite it as below.'
 title: 'firefly-audio-video'
-version: '0.1.0' # x-release-please-version
+version: '0.1.1' # x-release-please-version
 abstract: >-
   Node/TypeScript client for Adobe Firefly Services' audio/video (DGR) API —
   promises that resolve with the finished asset, native preset/.epr authoring,

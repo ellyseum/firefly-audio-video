@@ -89,7 +89,10 @@ const RAW_SECRET_PARAM_RE = new RegExp(
  */
 function stripSecretParamsFromRawString(u: string): string {
   const stripped = u.replace(RAW_SECRET_PARAM_RE, '');
-  return u.includes('?') && !stripped.includes('?') ? stripped.replace('&', '?') : stripped;
+  if (!u.includes('?') || stripped.includes('?')) return stripped;
+  const separator = stripped.indexOf('&');
+  if (separator === -1) return stripped;
+  return `${stripped.slice(0, separator)}?${stripped.slice(separator + 1)}`;
 }
 
 /** `u` with its secret query parameters removed through the URL parser, or the raw fallback. */

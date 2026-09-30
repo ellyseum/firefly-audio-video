@@ -54,6 +54,12 @@ test('redactUrl: never throws on a malformed URL, and still redacts what it can'
   expect(out).toBe('http://[bad-host]?rest=keep');
 });
 
+test('redactUrl: on an unparseable URL, only the first surviving & takes the place of a removed ?', () => {
+  expect(redactUrl('http://[bad-host]?sig=SECRET&rest=keep&more=1')).toBe(
+    'http://[bad-host]?rest=keep&more=1',
+  );
+});
+
 test('redactUrl: never throws on a string with no URL structure at all', () => {
   expect(() => redactUrl('not a url in any sense')).not.toThrow();
 });

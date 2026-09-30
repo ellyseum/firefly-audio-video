@@ -1,8 +1,9 @@
 /**
  * The SDK's single typed error, {@link AudioVideoError} — every rejection or throw
- * this package produces is one of these. Every field a caller might observe is
- * redacted at construction time by the SDK's single redaction pass: there is
- * no unredacted form of this error to accidentally log or display.
+ * this package produces is one of these. Every field that carries text from a
+ * request or a response is redacted at construction time by the SDK's single
+ * redaction pass: there is no unredacted form of it to accidentally log or
+ * display.
  */
 
 import { redactValue } from './redact.js';
@@ -57,8 +58,12 @@ export interface AudioVideoErrorJSON {
  * Every surface a caller might use to observe this error is pre-redacted:
  * `.message`, `toJSON()` (used by `JSON.stringify`), `toString()`, and the
  * `util.inspect` custom hook (used by `console.log`) — none of them can leak a
- * bearer token, an `x-api-key`, or a presigned URL's SAS/SigV4 signature, because
- * every field they read was redacted at construction time.
+ * bearer token, an `x-api-key`, or a presigned URL's signature, because the
+ * fields that carry request or response text, `.message` and `.items`, are
+ * redacted at construction time. The identifiers are kept as they are: `.code`
+ * is one this SDK chooses, and `.jobId` and `.requestId` are exactly what the
+ * service sent — the ID `status()` and `cancel()` take, and the one support
+ * asks for.
  *
  * `.cause` is the one field kept exactly as given, for programmatic inspection
  * (`err.cause`), and it is deliberately excluded from all three serialized forms

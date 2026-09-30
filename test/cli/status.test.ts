@@ -112,3 +112,29 @@ test("--json mode prints an output's write URL without its signature", async () 
   expect(harness.stdoutText()).not.toContain(WRITE_SIGNATURE);
   expect(JSON.parse(harness.stdoutText().trim())).toEqual({ ok: true, job: REDACTED_STATUS });
 });
+
+test("a failed request's response body reaches the --json document, and its reason the error line", async () => {
+  const body = { error_code: '403003', message: 'Api Key is invalid' };
+  const failure = new AudioVideoError({
+    message: 'Request to https://audio-video-api.adobe.io/v1/status/job-1 failed with status 403.',
+    code: 'http_403',
+    status: 403,
+    items: [body],
+  });
+  const client = createFakeClient({ status: vi.fn(async () => Promise.reject(failure)) });
+
+  const human = createHarness({ client });
+  await human.run(['status', 'job-1']);
+  expect(human.stderrText()).toBe(
+    'Error: Request to https://audio-video-api.adobe.io/v1/status/job-1 failed with status 403. ' +
+      'Reason: 403003: Api Key is invalid\nCode: http_403\n',
+  );
+
+  const json = createHarness({ client });
+  await json.run(['status', 'job-1', '--json']);
+  expect(JSON.parse(json.stdoutText().trim())).toEqual({
+    ok: false,
+    error: { code: 'http_403', message: failure.message, items: [body] },
+  });
+  expect(json.exit).toHaveBeenCalledExactlyOnceWith(5);
+});

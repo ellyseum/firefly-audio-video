@@ -12,6 +12,7 @@
  */
 
 import { AudioVideoError } from '../core/errors.js';
+import { withFailureReason } from '../core/failure-reason.js';
 import { redactValue } from '../core/redact.js';
 import { cliMessage } from './advice.js';
 
@@ -42,12 +43,14 @@ export function printSuccess(
 
 /**
  * Prints a command's failure. `--json` writes
- * `{ ok: false, error: { code, message, jobId?, requestId? } }` to stdout —
- * the job and request IDs an {@link AudioVideoError} carries, when it
- * carries them, so a caller can pass the job to `dgr status`; otherwise the
- * error's code and message go to stderr. Nothing else from the error is
- * printed, and the message is redacted, so a credential passed on the
- * command line or carried in an error's text never reaches either stream.
+ * `{ ok: false, error: { code, message, jobId?, requestId?, items? } }` to
+ * stdout — the job and request IDs an {@link AudioVideoError} carries, when
+ * it carries them, so a caller can pass the job to `dgr status`, and its
+ * `items`, the service's own reasons; otherwise the error's message, with
+ * the first of those reasons after it ({@link withFailureReason}), and its
+ * code go to stderr. Nothing else from the error is printed, and all of it
+ * is redacted, so a credential passed on the command line or carried in an
+ * error's text never reaches either stream.
  */
 export function printFailure(streams: OutputStreams, json: boolean, error: unknown): void {
   const shape = errorShape(error);
@@ -55,16 +58,21 @@ export function printFailure(streams: OutputStreams, json: boolean, error: unkno
     writeJsonLine(streams.stdout, { ok: false, error: shape });
     return;
   }
-  streams.stderr.write(`Error: ${shape.message}\n`);
+  streams.stderr.write(`Error: ${withFailureReason(shape.message, shape.items)}\n`);
   streams.stderr.write(`Code: ${shape.code}\n`);
 }
 
-/** What a failure prints: its code and message, and the job and request it concerns when known. */
+/**
+ * What a failure prints: its code and message, the job and request it
+ * concerns when known, and the service's reasons when it gave any.
+ */
 interface FailureShape {
   code: string;
   message: string;
   jobId?: string;
   requestId?: string;
+  /** An {@link AudioVideoError}'s `items`, redacted when the error was built. */
+  items?: unknown[];
 }
 
 function errorShape(error: unknown): FailureShape {
@@ -74,6 +82,7 @@ function errorShape(error: unknown): FailureShape {
       message: cliMessage(error),
       ...(error.jobId !== undefined ? { jobId: error.jobId } : {}),
       ...(error.requestId !== undefined ? { requestId: error.requestId } : {}),
+      ...(error.items !== undefined ? { items: error.items } : {}),
     };
   }
   if (error instanceof Error) {

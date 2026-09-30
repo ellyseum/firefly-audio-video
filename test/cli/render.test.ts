@@ -277,6 +277,81 @@ test('the --json failure document carries the job and request IDs the error has'
   expect(harness.exit).toHaveBeenCalledExactlyOnceWith(4);
 });
 
+/** A failed job's items, as the SDK builds them from the status body's `outputs[].errors`. */
+const MISSING_FONT_ITEMS = [
+  {
+    index: 0,
+    errors: [
+      {
+        code: 'missing_font',
+        message: 'The template uses font AdobeClean-Bold, which must be uploaded with the render.',
+      },
+    ],
+  },
+];
+
+function missingFontFailure(): AudioVideoError {
+  return new AudioVideoError({
+    message: 'Job job-1 failed: errors on output 0.',
+    code: 'job_failed',
+    jobId: 'job-1',
+    items: MISSING_FONT_ITEMS,
+  });
+}
+
+test("a failed job's first reason follows the message on the error line", async () => {
+  const render = vi.fn(() => settledJob<string>({ error: missingFontFailure() }));
+  const harness = createHarness({ client: createFakeClient({ render }) });
+  await harness.run(['render', '--template', 't.mogrt', '--preset', 'prores']);
+  expect(harness.stderrText()).toBe(
+    'Error: Job job-1 failed: errors on output 0. Reason: missing_font: ' +
+      'The template uses font AdobeClean-Bold, which must be uploaded with the render.\n' +
+      'Code: job_failed\n',
+  );
+  expect(harness.exit).toHaveBeenCalledExactlyOnceWith(4);
+});
+
+test("the --json failure document carries every reason the error's items hold", async () => {
+  const render = vi.fn(() => settledJob<string>({ error: missingFontFailure() }));
+  const harness = createHarness({ client: createFakeClient({ render }) });
+  await harness.run(['render', '--template', 't.mogrt', '--preset', 'prores', '--json']);
+  expect(JSON.parse(harness.stdoutText().trim())).toEqual({
+    ok: false,
+    error: {
+      code: 'job_failed',
+      message: 'Job job-1 failed: errors on output 0.',
+      jobId: 'job-1',
+      items: MISSING_FONT_ITEMS,
+    },
+  });
+  expect(harness.exit).toHaveBeenCalledExactlyOnceWith(4);
+});
+
+test("a signed URL in a failure's reason reaches neither stream", async () => {
+  const signature = 'REASON_WRITE_SIG_MUST_NOT_PRINT';
+  const writeUrl = `https://acct.blob.core.windows.net/c/out.mov?sv=2021&sp=cw&sig=${signature}`;
+  const failure = new AudioVideoError({
+    message: 'Job job-1 failed: errors on output 0.',
+    code: 'job_failed',
+    items: [{ index: 0, errors: [{ message: `could not write ${writeUrl}` }] }],
+  });
+  const render = vi.fn(() => settledJob<string>({ error: failure }));
+
+  const human = createHarness({ client: createFakeClient({ render }) });
+  await human.run(['render', '--template', 't.mogrt', '--preset', 'prores']);
+  expect(human.stderrText()).toContain(
+    'Reason: could not write https://acct.blob.core.windows.net/c/out.mov\n',
+  );
+  expect(human.stderrText()).not.toContain(signature);
+
+  const json = createHarness({ client: createFakeClient({ render }) });
+  await json.run(['render', '--template', 't.mogrt', '--preset', 'prores', '--json']);
+  expect(json.stdoutText()).toContain(
+    'could not write https://acct.blob.core.windows.net/c/out.mov',
+  );
+  expect(json.stdoutText()).not.toContain(signature);
+});
+
 test('a cancelled error this process did not initiate maps to exit 4, not 130', async () => {
   const failure = new AudioVideoError({
     message: 'cancelled by another caller',

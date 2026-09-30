@@ -127,5 +127,8 @@
     "*.ts": [
       "eslint --fix"
     ]
+  },
+  "overrides": {
+    "esbuild": "^0.28.2"
   }
 }

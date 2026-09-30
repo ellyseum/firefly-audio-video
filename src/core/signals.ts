@@ -1,7 +1,8 @@
 /**
- * Combining abort signals on every Node release the package supports.
- * `AbortSignal.any` arrived in Node 18.17 and 20.3; the package promises
- * Node 18.0 and later, so nothing calls it without {@link anySignal}'s check.
+ * Abort-signal helpers that work on every Node release the package supports:
+ * combining signals, and a delay a signal cuts short. `AbortSignal.any`
+ * arrived in Node 18.17 and 20.3; the package promises Node 18.0 and later,
+ * so nothing calls it without {@link anySignal}'s check.
  */
 
 /**
@@ -51,6 +52,30 @@ export function anySignal(signals: readonly AbortSignal[]): AbortSignal {
   return typeof native === 'function'
     ? native.call(AbortSignal, [...signals])
     : linkSignals(signals).signal;
+}
+
+/**
+ * Resolves after `ms` milliseconds, or rejects with `signal.reason` as soon as
+ * `signal` aborts — at once when it already has. Built on the global
+ * `setTimeout`, so fake timers drive it. Settling either way clears the other
+ * half: the abort listener goes when the timer fires, and the timer goes when
+ * the signal aborts.
+ *
+ * @internal
+ */
+export function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(signal.reason as Error);
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(signal?.reason as Error);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 function noop(): void {}

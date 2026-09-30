@@ -1,6 +1,6 @@
 import { getEventListeners } from 'node:events';
 import { expect, test, vi } from 'vitest';
-import { anySignal, linkSignals } from '../src/core/signals.js';
+import { anySignal, delay, linkSignals } from '../src/core/signals.js';
 
 test('linkSignals: aborts with the reason of whichever input aborts first', () => {
   const a = new AbortController();
@@ -76,5 +76,73 @@ test('anySignal: falls back to linked listeners where AbortSignal.any is missing
     expect(signal.reason).toBe(reason);
   } finally {
     if (native !== undefined) Object.defineProperty(AbortSignal, 'any', native);
+  }
+});
+
+test('delay: resolves once its time has passed, leaving no listener on the signal', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    const controller = new AbortController();
+    let settled = false;
+    const waiting = delay(250, controller.signal).then(() => {
+      settled = true;
+    });
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(249);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await waiting;
+
+    expect(settled).toBe(true);
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('delay: an abort mid-wait rejects with the reason at once and clears the timer and the listener', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    const controller = new AbortController();
+    const waiting = delay(10_000, controller.signal);
+    expect(vi.getTimerCount()).toBe(1);
+
+    const reason = new Error('stopped');
+    controller.abort(reason);
+
+    await expect(waiting).rejects.toBe(reason);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('delay: a signal that has already aborted rejects at once, starting no timer', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    const reason = new Error('already');
+    const waiting = delay(10_000, AbortSignal.abort(reason));
+
+    expect(vi.getTimerCount()).toBe(0);
+    await expect(waiting).rejects.toBe(reason);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('delay: without a signal it simply waits', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    let settled = false;
+    const waiting = delay(5).then(() => {
+      settled = true;
+    });
+    await vi.advanceTimersByTimeAsync(5);
+    await waiting;
+    expect(settled).toBe(true);
+  } finally {
+    vi.useRealTimers();
   }
 });

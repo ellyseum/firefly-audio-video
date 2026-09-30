@@ -367,6 +367,68 @@ test('a failing presign rejects storage_failed with its reason, redacted', async
   expect(empty.message).toBe('generatePresignURL() resolved without a URL.');
 });
 
+test('a presign failure quoting the Runtime auth key comes out scrubbed, whether the key came from the options or the environment', async () => {
+  const quoting: AioFilesClient = {
+    generatePresignURL: () => Promise.reject(new Error(`TVM refused auth ${AUTH} for this key`)),
+  };
+  const fromOptions = await rejection(
+    new AioFilesStorageProvider({
+      namespace: 'ns',
+      auth: AUTH,
+      module: fakeModule(quoting),
+    }).allocateOutput(),
+  );
+  vi.stubEnv('__OW_NAMESPACE', 'action-ns');
+  vi.stubEnv('__OW_API_KEY', AUTH);
+  const fromEnvironment = await rejection(
+    new AioFilesStorageProvider({ module: fakeModule(quoting) }).stageRead(Buffer.from('x')),
+  );
+
+  expect(fromOptions.message).toBe(
+    'Presigning write access to the object failed: TVM refused auth REDACTED for this key',
+  );
+  expect(fromEnvironment.message).toBe(
+    'Presigning read-write access to the object failed: TVM refused auth REDACTED for this key',
+  );
+  for (const error of [fromOptions, fromEnvironment]) {
+    expect(error.code).toBe('storage_failed');
+    expect(everythingPrinted(error)).not.toContain('RUNTIME_AUTH_SECRET_VALUE');
+  }
+});
+
+test('an upload failing in transit, or a stream failing while it is read, has the Runtime auth key scrubbed too', async () => {
+  agent
+    .get(BLOB)
+    .intercept({ path: (path) => path.startsWith('/fav/'), method: 'PUT' })
+    .replyWithError(new Error(`socket closed while sending for ${AUTH}`));
+  const transit = await rejection(
+    new AioFilesStorageProvider({
+      namespace: 'ns',
+      auth: AUTH,
+      module: fakeModule(fakeFiles()),
+    }).stageRead(Buffer.from('x')),
+  );
+  const broken = new Readable({
+    read() {
+      this.destroy(new Error(`stream broke near ${AUTH}`));
+    },
+  });
+  const stream = await rejection(
+    new AioFilesStorageProvider({ namespace: 'ns', auth: AUTH, files: fakeFiles() }).stageRead(
+      broken,
+    ),
+  );
+
+  expect(transit.message.startsWith('Uploading the object failed before a response arrived')).toBe(
+    true,
+  );
+  expect(stream.message).toBe('Reading the input stream failed: stream broke near REDACTED');
+  for (const error of [transit, stream]) {
+    expect(error.code).toBe('storage_failed');
+    expect(everythingPrinted(error)).not.toContain('RUNTIME_AUTH_SECRET_VALUE');
+  }
+});
+
 // --- init, credentials, and loading the SDK ---------------------------------------------
 
 test('init runs once, with the credentials from the options, for every later call', async () => {

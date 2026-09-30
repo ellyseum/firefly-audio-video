@@ -23,6 +23,14 @@ release-please watches conventional commits on `main` and keeps one open pull re
 is the next version bump and changelog. Merging it is what ships a stable release; every other
 green push to `main` republishes `@next` instead.
 
+That pull request bumps the version in `package.json`, `CITATION.cff` and `src/version.ts`
+together. `src/version.ts` holds the `VERSION` literal the build bakes into the package: `dgr -V`
+prints it, and each copy of the package keys the default client and class identity it shares in
+one process by it. The unit suite holds it to `package.json`'s version, so a release where the two
+disagree fails `verify` and is never staged. `publish-next` stamps its prerelease version into
+`package.json` and `src/version.ts` before building, and a build that reports another version is
+never published.
+
 `verify` runs on every push once publishing is enabled, and gates both publish jobs: typecheck,
 lint, format check, build, test, the packed-file check (`scripts/verify-pack-contents.mjs`), and
 `scripts/runtime-smoke.mjs` against the built package on Node 18, 20, 22 and 24. Neither publish

@@ -1,8 +1,8 @@
 /**
  * Abort-signal helpers that work on every Node release the package supports:
  * combining signals, and a delay a signal cuts short. `AbortSignal.any`
- * arrived in Node 18.17 and 20.3; the package promises Node 18.0 and later,
- * so nothing calls it without {@link anySignal}'s check.
+ * arrived in Node 18.17 and 20.3 and the package promises Node 18.0 and
+ * later, so signals are combined with listeners instead.
  */
 
 /**
@@ -36,22 +36,6 @@ export function linkSignals(signals: readonly AbortSignal[]): {
       for (const signal of signals) signal.removeEventListener('abort', onAbort);
     },
   };
-}
-
-/**
- * `AbortSignal.any(signals)` where the running Node has it, and an equivalent
- * from {@link linkSignals} where it does not (before 18.17 and 20.3). Only the
- * native form lets go of its inputs when the combined signal is dropped, so a
- * caller that can say when it is done with the signal should prefer
- * {@link linkSignals} and call `release`.
- *
- * @internal
- */
-export function anySignal(signals: readonly AbortSignal[]): AbortSignal {
-  const native = (AbortSignal as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
-  return typeof native === 'function'
-    ? native.call(AbortSignal, [...signals])
-    : linkSignals(signals).signal;
 }
 
 /**

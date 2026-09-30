@@ -145,15 +145,16 @@ export class HttpClient {
    * fetched rejects `cancelled` at once, whether or not the provider honors
    * the signal itself.
    *
+   * Every rejection is an {@link AudioVideoError}, and each one is redacted:
+   * its `.message` names the URL through {@link redactUrl}, and a `.cause` is
+   * a redacted copy of the original error, never the error itself.
+   *
    * @typeParam T - The shape of the parsed JSON response body.
    * @param method - The HTTP verb to send.
    * @param path - A relative path or an absolute URL.
    * @param body - A JSON-serializable request body; omit for a bodyless request.
    * @param init - Per-call signal/header overrides; see {@link HttpRequestInit}.
    * @returns The status, headers, and parsed body of the eventual success response.
-   * Every rejection is an {@link AudioVideoError}, and each one is redacted:
-   * its `.message` names the URL through {@link redactUrl}, and a `.cause` is
-   * a redacted copy of the original error, never the error itself.
    *
    * @throws {@link AudioVideoError} — `code: 'http_<status>'` — for any non-2xx
    *   response left after retries are exhausted, with `.items` holding the

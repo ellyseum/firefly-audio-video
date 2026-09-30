@@ -68,8 +68,10 @@ export interface AudioVideoErrorJSON {
  *
  * @example
  * ```ts
+ * // The message is redacted as the error is built: a presigned URL in it
+ * // loses its signature.
  * throw new AudioVideoError({
- *   message: `Render failed for ${redactUrl(sourceUrl)}`,
+ *   message: `Render failed for ${sourceUrl}`,
  *   code: 'render_failed',
  *   status: 403,
  *   jobId,

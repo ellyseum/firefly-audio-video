@@ -3,9 +3,8 @@
  * Render) render request — plain strings for URLs and paths, no wire-format nesting.
  * These are the shapes a caller writes by hand, and the single source of truth for
  * both runtime validation (`.parse()`) and the exported TypeScript input types
- * (`z.infer`). `buildRenderBody` (./build-body.ts) validates a {@link RenderSpec}
- * with {@link RenderSpecSchema} before transforming it into the wire body DGR
- * actually expects (see ./types.ts and the proven substrate + gotchas).
+ * (`z.infer`). A spec is validated against these schemas before it is turned
+ * into the wire body DGR actually expects.
  */
 
 import * as z from 'zod';
@@ -71,9 +70,9 @@ export type RenderVariable = z.infer<typeof RenderVariableSchema>;
 /**
  * One deliverable of a render job: which variation and preset produce it, and where
  * the finished asset should land. `destination` is a plain presigned write URL here
- * — `buildRenderBody` is what wraps it in the `{ url }` object the wire format
- * expects (the published API spec types `destination` as a bare string,
- * which is wrong; DGR requires the object form).
+ * — the SDK wraps it in the `{ url }` object the wire format expects (the
+ * published API spec types `destination` as a bare string, which is wrong; DGR
+ * requires the object form).
  *
  * @example
  * ```ts
@@ -258,8 +257,8 @@ export type PresetName = z.infer<typeof PresetNameSchema>;
 /**
  * The friendly, top-level input to a DGR render: one `.mogrt` capsule, the preset(s)
  * to encode it with, any assets referenced by template variables, per-variation
- * variable overrides, and the deliverables to produce. `buildRenderBody` validates a
- * value against this schema and then transforms it into the wire body DGR's
+ * variable overrides, and the deliverables to produce. A spec is validated against
+ * this schema before it is turned into the wire body DGR's
  * `POST /v1/templates/render` expects.
  *
  * @example
@@ -279,7 +278,7 @@ export const RenderSpecSchema = z.strictObject({
   outputs: z.array(RenderOutputSchema).min(1, 'at least one output is required'),
 });
 
-/** A friendly {@link RenderSpecSchema} input — the argument to `buildRenderBody`, and a valid spec for `render()`. */
+/** A friendly {@link RenderSpecSchema} input — a valid spec for `render()`. */
 export type RenderSpec = z.infer<typeof RenderSpecSchema>;
 
 /**

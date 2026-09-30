@@ -3,7 +3,7 @@
  * runs it: validate the spec and resolve its presets; stage generated `.epr`
  * files, allocate output locations and build the wire body — both before the
  * job takes a pool slot; and map the terminal status back onto the spec's
- * outputs as {@link Asset}s. `buildRenderBody` alone produces the wire shape.
+ * outputs as {@link Asset}s.
  */
 
 import * as z from 'zod';

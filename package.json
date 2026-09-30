@@ -71,25 +71,42 @@
     "prepublishOnly": "npm run build"
   },
   "peerDependencies": {
-    "@adobe/aio-lib-files": "*"
+    "@adobe/aio-lib-files": "^4.0.0",
+    "@aws-sdk/client-s3": "^3.0.0",
+    "@aws-sdk/s3-request-presigner": "^3.0.0",
+    "@azure/storage-blob": "^12.4.0"
   },
   "peerDependenciesMeta": {
     "@adobe/aio-lib-files": {
+      "optional": true
+    },
+    "@aws-sdk/client-s3": {
+      "optional": true
+    },
+    "@aws-sdk/s3-request-presigner": {
+      "optional": true
+    },
+    "@azure/storage-blob": {
       "optional": true
     }
   },
   "dependencies": {
     "@adobe/firefly-services-common-apis": "^2.0.0",
-    "zod": "^4.6.5",
     "commander": "^13.1.0",
-    "dotenv": "^18.0.4"
+    "dotenv": "^18.0.4",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
+    "@adobe/aio-lib-files": "^4.1.4",
+    "@aws-sdk/client-s3": "^3.1143.0",
+    "@aws-sdk/s3-request-presigner": "^3.1143.0",
+    "@azure/storage-blob": "^12.34.0",
     "@commitlint/cli": "^21.2.3",
     "@commitlint/config-conventional": "^21.2.3",
     "@eslint/js": "^10.0.1",
     "@types/node": "^24.19.0",
     "@vitest/coverage-v8": "^5.0.2",
+    "esbuild": "^0.27.7",
     "eslint": "^10.11.0",
     "globals": "^17.12.0",
     "husky": "^9.1.7",

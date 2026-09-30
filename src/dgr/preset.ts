@@ -88,7 +88,7 @@ const EMPTY_CONFIG: Readonly<Partial<EncodeConfig>> = Object.freeze({});
 /** Validates a `with()` overrides object: every field optional, no unknown keys. */
 const OVERRIDES_SCHEMA = EncodeConfigSchema.partial();
 
-/** The key every copy of the package reads a preset's state through, a preset another copy built included. */
+/** The key every copy of this version of the package reads a preset's state through, a preset another copy built included. */
 const PRESET_STATE = sharedKey('Preset.state');
 
 let stateOf: (preset: Preset) => PresetState;

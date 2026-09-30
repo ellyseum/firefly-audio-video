@@ -172,12 +172,13 @@ jobs:
           echo "version=${version}" >> "$GITHUB_OUTPUT"
       # The version is set before the build, in both places it lives:
       # package.json, which npm publishes under, and the VERSION literal in
-      # src/index.ts, which the build bakes into the package and `dgr -V`
-      # prints. Neither change is committed, so the repository keeps its
-      # release-please-owned version.
+      # src/version.ts, which the build bakes into the package: `dgr -V`
+      # prints it, and the keys each copy of the package shares in one
+      # process carry it. Neither change is committed, so the repository keeps
+      # its release-please-owned version.
       - run: npm version "${{ steps.version.outputs.version }}" --no-git-tag-version
-      - name: stamp the prerelease version into src/index.ts
-        run: sed -i -E "s/^export const VERSION = '[^']*';/export const VERSION = '${VERSION}';/" src/index.ts
+      - name: stamp the prerelease version into src/version.ts
+        run: sed -i -E "s/^export const VERSION = '[^']*';/export const VERSION = '${VERSION}';/" src/version.ts
         env:
           VERSION: ${{ steps.version.outputs.version }}
       - run: npm run build

@@ -79,8 +79,9 @@ environment. Every function takes `{ client }`, and a client has the same method
 A process that loads both this package's ESM and CommonJS build — an ESM application with a
 CommonJS dependency, say — shares one default client and one class identity between the two:
 `configure()` through either build is seen by both, and `instanceof AudioVideoError` (and every
-other exported class) holds for an instance either one made. That sharing is keyed by name, not by
-package version, so it is not a promise across two different installed versions of this package.
+other exported class) holds for an instance either one made. That sharing is keyed by package
+version: two different installed versions in one process each keep their own default client, and
+neither recognizes the other's instances or accepts the other's client as `{ client }`.
 
 ### Calls
 
@@ -560,6 +561,7 @@ publish flow and its gates are in
 | Path                                                                                                                                                      | Holds                                                                                                                                                                                        |
 | --------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `src/index.ts`                                                                                                                                            | every public export                                                                                                                                                                          |
+| `src/version.ts`                                                                                                                                          | the `VERSION` literal: release-please bumps it on each release, `release.yml` stamps the `next` prerelease into it, and copies of the package key what they share in one process by it       |
 | `src/dgr/`                                                                                                                                                | the client and top-level functions, the fluent builder, render and describe, `Preset`, and the zod input schemas                                                                             |
 | `src/core/`                                                                                                                                               | the capability-neutral spine: auth, HTTP with `429` retries, the job poller, the pool, `Asset`, logging, redaction, errors and the `StorageProvider` interface                               |
 | `src/presets/`                                                                                                                                            | the catalog and the `.epr` generator with its embedded templates                                                                                                                             |

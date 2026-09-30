@@ -112,9 +112,10 @@ jobs:
             echo "::notice::no @latest version exists on npm yet — the next channel is skipped until the first stable release ships"
           fi
 
-  # Publishes the stable release to the default npm dist-tag (`latest`) the
-  # moment release-please tags one and `verify` passes on that commit, with
-  # provenance and no long-lived token.
+  # Stages the stable release to npm the moment release-please tags a
+  # commit and `verify` passes on it, with provenance and no long-lived
+  # token. The staged version keeps the default `latest` tag; it does not
+  # go live until a maintainer approves it on npm with 2FA.
   publish-latest:
     needs: [release-please, verify]
     if: needs.release-please.outputs.release_created == 'true' && vars.PUBLISH_ENABLED == 'true'
@@ -134,7 +135,7 @@ jobs:
           package-manager-cache: false
       - run: npm ci
       - run: npm run build
-      - run: npm publish --provenance --access public
+      - run: npm stage publish --provenance --access public
 
   # Publishes every green push to main that is not itself a release commit
   # to the `next` dist-tag, so a dependent can track main without waiting

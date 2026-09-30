@@ -1,6 +1,10 @@
-/** `dgr status <jobId>`: a render job's current status. */
+/**
+ * `dgr status <jobId>`: a render job's current status, redacted — the body
+ * echoes each output's presigned write URL.
+ */
 
 import { Command } from 'commander';
+import { redactValue } from '../../core/redact.js';
 import { resolveClient } from '../client.js';
 import { runCommand } from '../run-command.js';
 import type { CliRuntime, GlobalOptions } from '../runtime.js';
@@ -14,7 +18,7 @@ export function buildStatusCommand(runtime: CliRuntime): Command {
       const options = self.optsWithGlobals() as GlobalOptions;
       await runCommand(runtime, options.json === true, async () => {
         const client = resolveClient(runtime, options);
-        const status = await client.status(jobId);
+        const status = redactValue(await client.status(jobId));
         return { result: status, json: { job: status } };
       });
     });

@@ -1,14 +1,14 @@
 /**
  * The CLI's two result renderers. `--json` prints exactly one JSON document
  * to stdout, success or failure; without it, a command prints its result to
- * stdout in a readable form and an error to stderr. A success value is the
- * command's own product — a URL it staged, a rendered output, a status body
- * — and prints intact: the SDK already redacted anything in it that needed
- * it (an {@link Asset}'s `toJSON()`), and a value a command exists to
- * produce is not scrubbed. A failure's message always goes through the
- * shared redaction: an {@link AudioVideoError}'s is redacted when the error
- * is built, and any other error's is redacted here. An SDK error's advice is
- * restated in the CLI's terms first ({@link cliMessage}).
+ * stdout in a readable form and an error to stderr. A success value prints
+ * as its command hands it over: a value a command exists to produce — a URL
+ * it staged, a rendered output's read URL — is not scrubbed, and `status`
+ * and `cancel` redact the service's body before handing it over, since it
+ * echoes each output's presigned write URL. A failure's message always goes
+ * through the shared redaction: an {@link AudioVideoError}'s is redacted when
+ * the error is built, and any other error's is redacted here. An SDK error's
+ * advice is restated in the CLI's terms first ({@link cliMessage}).
  */
 
 import { AudioVideoError } from '../core/errors.js';

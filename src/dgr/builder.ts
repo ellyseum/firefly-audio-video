@@ -313,15 +313,16 @@ class FluentRender implements Omit<RenderBuilder, PresetName> {
   }
 
   /**
-   * The options a terminal's underlying `Asset` read observes: the caller's
-   * own signal, this builder's `signal` option, and this builder's own
-   * `cancel()` — whichever fires first.
+   * The options a terminal's underlying `Asset` read observes: a signal that
+   * fires with whichever of the caller's own signal, this builder's `signal`
+   * option, and this builder's own `cancel()` fires first, and the caller's
+   * `retries`.
    */
   #readOptions(options: AssetReadOptions | undefined): AssetReadOptions {
     const signals = [this.#reading.signal, this.#options.signal, options?.signal].filter(
       (signal): signal is AbortSignal => signal !== undefined,
     );
-    return { signal: anySignal(signals) };
+    return { signal: anySignal(signals), retries: options?.retries };
   }
 
   static {

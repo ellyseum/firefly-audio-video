@@ -204,7 +204,7 @@ export async function classifyAsset(input: unknown): Promise<ClassifiedAsset> {
   if (input instanceof URL) {
     if (input.protocol !== 'file:') {
       throw invalidInput(
-        `The input is a ${input.protocol} URL: DGR reads http(s) URLs, and a file: URL names a local file to upload.`,
+        `The input is ${schemeArticle(input.protocol)} ${input.protocol} URL: DGR reads http(s) URLs, and a file: URL names a local file to upload.`,
       );
     }
     return { kind: 'stage', input: await existingFile(filePathOf(input)) };
@@ -313,6 +313,21 @@ async function isFile(path: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * The indefinite article a URL scheme takes when read aloud. A scheme with
+ * no vowel is an initialism, spelled out letter by letter, so the name of its
+ * first letter decides: `an ftp:`, `an s3:`, `a ws:`. Any other scheme is
+ * read as a word and takes `an` before a vowel: `a data:`, `an about:`. A
+ * scheme said against those rules — `ldap:` spelled out, `unix:` read with a
+ * "you" — gets the article the rules give, not the one it is said with.
+ */
+function schemeArticle(protocol: string): 'a' | 'an' {
+  const scheme = protocol.replace(/:$/, '').toLowerCase();
+  const first = scheme.charAt(0);
+  if (!/[aeiou]/.test(scheme)) return 'aefhilmnorsx'.includes(first) ? 'an' : 'a';
+  return 'aeiou'.includes(first) ? 'an' : 'a';
 }
 
 /** A string for an error message, quoted and cut short. */

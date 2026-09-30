@@ -1,12 +1,13 @@
 /**
  * `dgr render`: renders a template from `--spec <file>` or from
  * `--template`/`--preset`/`--encode`, and resolves the one output as a URL
- * (the default) or a local file. Ctrl+C cancels the in-flight job.
+ * (the default) or a local file. The first Ctrl+C cancels the job and, once
+ * the job rejects, waits up to ten seconds for the cancel request to reach
+ * the service before exiting 130; a second Ctrl+C ends the process at once.
  */
 
 import { Command } from 'commander';
 import { AudioVideoError } from '../../core/errors.js';
-import type { RenderJob } from '../../dgr/client.js';
 import type { RenderRequest } from '../../dgr/schemas.js';
 import { resolveClient } from '../client.js';
 import { invalidArgument } from '../errors.js';
@@ -24,6 +25,9 @@ interface RenderOwnOptions extends RenderFlags {
 
 type OutputMode =
   { readonly resolveAs: 'url' } | { readonly resolveAs: 'file'; readonly savePath: string };
+
+/** How long a cancelled render waits for its cancel request to settle before exiting anyway. */
+const CANCEL_REQUEST_WAIT_MS = 10_000;
 
 export function buildRenderCommand(runtime: CliRuntime): Command {
   const command = new Command('render');
@@ -49,36 +53,35 @@ async function runRender(
   options: GlobalOptions & RenderOwnOptions,
 ): Promise<void> {
   const json = options.json === true;
-  let job: RenderJob<string> | undefined;
-  let sigintCount = 0;
   let exited = false;
-
   const doExit = (code: number): void => {
     if (exited) return;
     exited = true;
     runtime.exit(code);
   };
-  const onCtrlC = (): void => {
-    sigintCount += 1;
-    if (sigintCount === 1) {
-      runtime.stderr.write('Cancelling the render...\n');
-      void job?.cancel();
-    } else if (!exited) {
-      exited = true;
-      runtime.forceExit(130);
-    }
-  };
 
+  let interrupted = false;
+  // Settles once the cancel request has been sent — after the submit, when one is still in flight.
+  let cancelRequest: Promise<void> = Promise.resolve();
   let stopListening = (): void => undefined;
   try {
     const spec = buildSpec(options);
     const mode = resolveOutputMode(options);
     const client = resolveClient(runtime, options);
-    job =
+    const job =
       mode.resolveAs === 'file'
         ? client.render(spec, { resolveAs: 'file', savePath: mode.savePath })
         : client.render(spec, { resolveAs: 'url' });
-    stopListening = runtime.onInterrupt(onCtrlC);
+    stopListening = runtime.onInterrupt(() => {
+      if (!interrupted) {
+        interrupted = true;
+        runtime.stderr.write('Cancelling the render...\n');
+        cancelRequest = job.cancel();
+      } else if (!exited) {
+        exited = true;
+        runtime.forceExit(130);
+      }
+    });
     const output = await job;
     printSuccess(runtime, json, output, {
       jobId: job.jobId,
@@ -90,13 +93,29 @@ async function runRender(
     doExit(0);
   } catch (error) {
     const cancelledByUser =
-      sigintCount > 0 && error instanceof AudioVideoError && error.code === 'cancelled';
+      interrupted && error instanceof AudioVideoError && error.code === 'cancelled';
     printFailure(runtime, json, error);
+    if (interrupted) await settledWithin(cancelRequest, CANCEL_REQUEST_WAIT_MS);
     doExit(exitCodeForError(error, { cancelledByUser }));
   } finally {
     stopListening();
   }
 }
+
+/** Resolves once `promise` settles or `ms` pass, whichever comes first; never rejects. */
+async function settledWithin(promise: Promise<unknown>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const elapsed = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, ms);
+  });
+  try {
+    await Promise.race([promise.then(ignore, ignore), elapsed]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function ignore(): void {}
 
 /** The spec `client.render()` validates: `--spec`'s file, or the flags assembled into one. */
 function buildSpec(options: RenderOwnOptions): RenderRequest {

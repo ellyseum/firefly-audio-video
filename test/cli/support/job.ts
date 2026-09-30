@@ -32,12 +32,15 @@ export interface DeferredJob<T> {
   readonly cancelCalls: number;
   settle(value: T): void;
   fail(error: unknown): void;
+  /** Settles the promise every `.cancel()` call returned: the cancel request has been sent. */
+  finishCancel(): void;
 }
 
 /**
  * A {@link RenderJob} that settles only when the test calls `settle`/`fail`.
- * `.cancel()` only counts its own calls — it never settles the job itself,
- * so a test controls exactly when (and whether) the job's promise resolves.
+ * `.cancel()` counts its own calls and returns a promise that stays pending
+ * until `finishCancel()` — it never settles the job itself, so a test
+ * controls exactly when (and whether) the job and its cancel request settle.
  */
 export function deferredJob<T>(extra: JobExtra = {}): DeferredJob<T> {
   let settleValue!: (value: T) => void;
@@ -56,6 +59,10 @@ export function deferredJob<T>(extra: JobExtra = {}): DeferredJob<T> {
     };
   });
   let cancelCalls = 0;
+  let finishCancel!: () => void;
+  const cancelSent = new Promise<void>((resolve) => {
+    finishCancel = resolve;
+  });
   return {
     job: {
       jobId: extra.jobId,
@@ -63,8 +70,9 @@ export function deferredJob<T>(extra: JobExtra = {}): DeferredJob<T> {
       then: (onFulfilled, onRejected) => promise.then(onFulfilled, onRejected),
       catch: (onRejected) => promise.catch(onRejected),
       finally: (onFinally) => promise.finally(onFinally),
-      cancel: async () => {
+      cancel: () => {
         cancelCalls += 1;
+        return cancelSent;
       },
     },
     get cancelCalls() {
@@ -72,6 +80,7 @@ export function deferredJob<T>(extra: JobExtra = {}): DeferredJob<T> {
     },
     settle: settleValue,
     fail: failValue,
+    finishCancel,
   };
 }
 

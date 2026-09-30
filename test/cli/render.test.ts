@@ -6,7 +6,7 @@ import { createProgram } from '../../src/cli/program.js';
 import { AudioVideoError } from '../../src/core/errors.js';
 import type { JobMeta } from '../../src/core/job.js';
 import type { RenderRequest } from '../../src/dgr/schemas.js';
-import { until } from '../support/mock-api.js';
+import { flush, until } from '../support/mock-api.js';
 import { createFakeClient } from './support/fake-client.js';
 import { createHarness } from './support/harness.js';
 import { cancelledError, deferredJob, settledJob } from './support/job.js';
@@ -307,28 +307,78 @@ test('no secret given via --client-secret or the environment ever reaches stdout
   expect(viaEnv.stderrText()).not.toContain(SECRET);
 });
 
-test('Ctrl+C cancels the job exactly once, prints one notice to stderr, and exits 130', async () => {
+test('Ctrl+C cancels the job once and exits 130 only after its cancel request has been sent', async () => {
   const dj = deferredJob<string>({ jobId: 'job-1', meta: META });
-  const render = vi.fn(() => dj.job);
-  const harness = createHarness({ client: createFakeClient({ render }) });
+  const harness = createHarness({ client: createFakeClient({ render: vi.fn(() => dj.job) }) });
 
   const run = harness.run(['render', '--template', 't.mogrt', '--preset', 'prores']);
   await until(() => harness.interruptListeners() === 1);
   harness.interrupt();
   expect(dj.cancelCalls).toBe(1);
   dj.fail(cancelledError());
+  await until(() => harness.stderrText().includes('Code: cancelled'));
+  await flush();
+
+  // The job has rejected and its failure is printed; the cancel request is still in flight.
+  expect(harness.exit).not.toHaveBeenCalled();
+  dj.finishCancel();
   await run;
 
   expect(harness.stderrText()).toBe(
     'Cancelling the render...\nError: The job was cancelled.\nCode: cancelled\n',
   );
   expect(harness.exit).toHaveBeenCalledExactlyOnceWith(130);
+  expect(harness.forceExit).not.toHaveBeenCalled();
+});
+
+test('a cancel request that never settles holds the exit for ten seconds, then exits 130', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    const dj = deferredJob<string>({ jobId: 'job-1', meta: META });
+    const harness = createHarness({ client: createFakeClient({ render: vi.fn(() => dj.job) }) });
+
+    const run = harness.run(['render', '--template', 't.mogrt', '--preset', 'prores']);
+    await until(() => harness.interruptListeners() === 1);
+    harness.interrupt();
+    dj.fail(cancelledError());
+    await until(() => harness.stderrText().includes('Code: cancelled'));
+
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(harness.exit).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await run;
+
+    expect(harness.exit).toHaveBeenCalledExactlyOnceWith(130);
+    expect(harness.forceExit).not.toHaveBeenCalled();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('once the cancel request settles, no timer is left to hold the process open', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    const dj = deferredJob<string>({ jobId: 'job-1', meta: META });
+    const harness = createHarness({ client: createFakeClient({ render: vi.fn(() => dj.job) }) });
+
+    const run = harness.run(['render', '--template', 't.mogrt', '--preset', 'prores']);
+    await until(() => harness.interruptListeners() === 1);
+    harness.interrupt();
+    dj.fail(cancelledError());
+    await until(() => harness.stderrText().includes('Code: cancelled'));
+    dj.finishCancel();
+    await run;
+
+    expect(harness.exit).toHaveBeenCalledExactlyOnceWith(130);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test('a second Ctrl+C ends the process at once with 130, without waiting for the job, and cancels only once', async () => {
   const dj = deferredJob<string>({ jobId: 'job-1', meta: META });
-  const render = vi.fn(() => dj.job);
-  const harness = createHarness({ client: createFakeClient({ render }) });
+  const harness = createHarness({ client: createFakeClient({ render: vi.fn(() => dj.job) }) });
 
   const run = harness.run(['render', '--template', 't.mogrt', '--preset', 'prores']);
   await until(() => harness.interruptListeners() === 1);
@@ -341,9 +391,29 @@ test('a second Ctrl+C ends the process at once with 130, without waiting for the
   expect(dj.cancelCalls).toBe(1);
 
   dj.fail(cancelledError());
+  dj.finishCancel();
   await run;
   // Settling afterward sets no exit code and ends nothing a second time.
   expect(harness.forceExit).toHaveBeenCalledExactlyOnceWith(130);
+  expect(harness.exit).not.toHaveBeenCalled();
+});
+
+test('a second Ctrl+C while the cancel request is still in flight ends the process at once', async () => {
+  const dj = deferredJob<string>({ jobId: 'job-1', meta: META });
+  const harness = createHarness({ client: createFakeClient({ render: vi.fn(() => dj.job) }) });
+
+  const run = harness.run(['render', '--template', 't.mogrt', '--preset', 'prores']);
+  await until(() => harness.interruptListeners() === 1);
+  harness.interrupt();
+  dj.fail(cancelledError());
+  await until(() => harness.stderrText().includes('Code: cancelled'));
+  expect(harness.forceExit).not.toHaveBeenCalled();
+
+  harness.interrupt();
+  expect(harness.forceExit).toHaveBeenCalledExactlyOnceWith(130);
+
+  dj.finishCancel();
+  await run;
   expect(harness.exit).not.toHaveBeenCalled();
 });
 
@@ -404,6 +474,7 @@ test("by default render listens on the process's SIGINT while the job runs, and 
     expect(dj.cancelCalls).toBe(1);
   } finally {
     dj.fail(cancelledError());
+    dj.finishCancel();
     await run;
   }
 

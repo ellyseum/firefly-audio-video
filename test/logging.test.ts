@@ -391,6 +391,48 @@ test('buildLogRecord: error renders to one redacted string and defaults level to
   expect(buildLogRecord({ msg: 'm', endpoint: 'e' }).level).toBe('info');
 });
 
+test("buildLogRecord: an error's first service reason follows its message in the error field", () => {
+  const failed = new AudioVideoError({
+    message: 'Job job-1 failed: errors on output 0.',
+    code: 'job_failed',
+    jobId: 'job-1',
+    items: [
+      {
+        index: 0,
+        errors: [
+          {
+            code: 'missing_font',
+            message:
+              'The template uses font AdobeClean-Bold, which must be uploaded with the render.',
+          },
+        ],
+      },
+    ],
+  });
+
+  const rec = buildLogRecord({ msg: 'render failed', endpoint: 'e', error: failed });
+
+  expect(rec.error).toBe(
+    'job_failed: Job job-1 failed: errors on output 0. Reason: missing_font: ' +
+      'The template uses font AdobeClean-Bold, which must be uploaded with the render.',
+  );
+});
+
+test("buildLogRecord: a signed URL in an error's reason reaches the error field redacted", () => {
+  const failed = new AudioVideoError({
+    message: 'Job job-2 failed: errors on output 0.',
+    code: 'job_failed',
+    items: [{ index: 0, errors: [{ message: `could not write ${SAS_URL}` }] }],
+  });
+
+  const rec = buildLogRecord({ msg: 'render failed', endpoint: 'e', error: failed });
+
+  expect(rec.error).toBe(
+    `job_failed: Job job-2 failed: errors on output 0. Reason: could not write ${SCRUBBED_URL}`,
+  );
+  expect(rec.error).not.toContain('SECRET');
+});
+
 test('buildLogRecord: never throws on an error value that cannot be stringified', () => {
   const unrenderable = Object.create(null) as object;
 

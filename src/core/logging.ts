@@ -14,6 +14,7 @@
 import { appendFileSync, mkdirSync, renameSync, statSync, unlinkSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { AudioVideoError } from './errors.js';
+import { withFailureReason } from './failure-reason.js';
 import type { JobMeta } from './job.js';
 import { redactValue } from './redact.js';
 
@@ -56,7 +57,11 @@ export interface LogRecord {
   totalJobItems?: number;
   /** The job's terminal status as reported by the service, e.g. `'succeeded'`. */
   status?: string;
-  /** The failure that settled the call, rendered as one redacted `code: message` string. */
+  /**
+   * The failure that settled the call, rendered as one redacted
+   * `code: message` string, followed by the first reason the service gave
+   * (`Reason: <code>: <message>`, at most 200 characters) when it gave one.
+   */
   error?: string;
 }
 
@@ -355,9 +360,10 @@ export interface BuildLogRecordInput {
  * `'error'` when `error` is set and `'info'` otherwise; `meta`'s
  * `queueMs`/`renderMs`/`totalMs` are copied to the record's flat timing fields
  * (a non-finite duration is left out); `error` is rendered to one redacted
- * string — an {@link AudioVideoError} as `code: message`, any other `Error` as
- * `name: message`, anything else via `String()`. A field with no value is left
- * out of the record rather than set to `undefined`.
+ * string — an {@link AudioVideoError} as `code: message` followed by the
+ * first reason its `items` carry, any other `Error` as `name: message`,
+ * anything else via `String()`. A field with no value is left out of the
+ * record rather than set to `undefined`.
  *
  * @example
  * ```ts
@@ -415,14 +421,15 @@ function nonEmpty(value: string | undefined): string | undefined {
 
 /**
  * Renders a settled call's failure to one redacted string: an
- * {@link AudioVideoError} as `code: message`, any other `Error` as
+ * {@link AudioVideoError} as `code: message` followed by the first reason
+ * its `items` carry ({@link withFailureReason}), any other `Error` as
  * `name: message`, anything else via `String()`. Never throws — a value that
  * cannot be stringified renders as a fixed placeholder.
  */
 function renderError(error: unknown): string {
   let text: string;
   if (error instanceof AudioVideoError) {
-    text = `${error.code}: ${error.message}`;
+    text = withFailureReason(`${error.code}: ${error.message}`, error.items);
   } else if (error instanceof Error) {
     text = `${error.name}: ${error.message}`;
   } else {

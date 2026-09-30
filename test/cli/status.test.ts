@@ -52,6 +52,22 @@ test('failure maps to the error family exit code, --json mode', async () => {
   expect(harness.exit).toHaveBeenCalledExactlyOnceWith(3);
 });
 
+test('a failure with only a request ID carries just that ID in the --json document', async () => {
+  const failure = new AudioVideoError({
+    message: 'job not found',
+    code: 'http_404',
+    requestId: 'req-404',
+  });
+  const client = createFakeClient({ status: vi.fn(async () => Promise.reject(failure)) });
+  const harness = createHarness({ client });
+  await harness.run(['status', 'missing-job', '--json']);
+  expect(JSON.parse(harness.stdoutText().trim())).toEqual({
+    ok: false,
+    error: { code: 'http_404', message: 'job not found', requestId: 'req-404' },
+  });
+  expect(harness.exit).toHaveBeenCalledExactlyOnceWith(5);
+});
+
 test('a missing jobId argument is a commander usage error, exit 2', async () => {
   const harness = createHarness({ client: createFakeClient() });
   await harness.run(['status']);

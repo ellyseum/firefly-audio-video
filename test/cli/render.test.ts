@@ -260,6 +260,23 @@ test.each<[code: string, expected: number]>([
   expect(json.exit).toHaveBeenCalledExactlyOnceWith(expected);
 });
 
+test('the --json failure document carries the job and request IDs the error has', async () => {
+  const failure = new AudioVideoError({
+    message: 'render failed',
+    code: 'job_failed',
+    jobId: 'job-9',
+    requestId: 'req-9',
+  });
+  const render = vi.fn(() => settledJob<string>({ error: failure }));
+  const harness = createHarness({ client: createFakeClient({ render }) });
+  await harness.run(['render', '--template', 't.mogrt', '--preset', 'prores', '--json']);
+  expect(JSON.parse(harness.stdoutText().trim())).toEqual({
+    ok: false,
+    error: { code: 'job_failed', message: 'render failed', jobId: 'job-9', requestId: 'req-9' },
+  });
+  expect(harness.exit).toHaveBeenCalledExactlyOnceWith(4);
+});
+
 test('a cancelled error this process did not initiate maps to exit 4, not 130', async () => {
   const failure = new AudioVideoError({
     message: 'cancelled by another caller',

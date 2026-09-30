@@ -164,5 +164,8 @@ test('a status --json the service answers 404 exits 5 with exactly one failure d
   expectExited(result, 5);
   const docs = documents(result.stdout);
   expect(docs).toHaveLength(1);
-  expect(docs[0]).toMatchObject({ ok: false, error: { code: 'http_404' } });
+  expect(docs[0]).toMatchObject({
+    ok: false,
+    error: { code: 'http_404', requestId: 'req-missing' },
+  });
 }, 30_000);

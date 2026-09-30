@@ -2,8 +2,9 @@
  * `dgr render`: renders a template from `--spec <file>` or from
  * `--template`/`--preset`/`--encode`, and resolves the one output as a URL
  * (the default) or a local file. The first Ctrl+C cancels the job and, once
- * the job rejects, waits up to ten seconds for the cancel request to reach
- * the service before exiting 130; a second Ctrl+C ends the process at once.
+ * the job rejects, waits up to ten seconds for the cancel request to be sent
+ * before setting the exit code — 130 for the cancellation; a second Ctrl+C
+ * ends the process at once.
  */
 
 import { Command } from 'commander';

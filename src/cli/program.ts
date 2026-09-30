@@ -37,8 +37,9 @@ export interface CreateProgramOptions {
   stdout?: NodeJS.WritableStream;
   stderr?: NodeJS.WritableStream;
   /**
-   * Sets the exit code. Called exactly once per invocation. Defaults to
-   * setting `process.exitCode`, so the process ends once pending work has
+   * Sets the exit code. Called exactly once per invocation — never after a
+   * second Ctrl+C during `render`, which calls `forceExit` instead. Defaults
+   * to setting `process.exitCode`, so the process ends once pending work has
    * drained.
    */
   exit?: (code: number) => void;
@@ -62,8 +63,8 @@ const EPILOG = [
  * that client, skipping credential resolution entirely — how a test drives
  * this with no network. `parseAsync()` on the returned program never
  * rejects: every exit path, commander's own included, calls `options.exit`
- * exactly once, and only a second Ctrl+C during `render` calls
- * `options.forceExit`.
+ * exactly once, except a second Ctrl+C during `render`, which calls
+ * `options.forceExit` instead.
  */
 export function createProgram(options: CreateProgramOptions = {}): Command {
   const runtime: CliRuntime = {
@@ -182,7 +183,8 @@ function onProcessSigint(listener: () => void): () => void {
 /**
  * Replaces `program.parseAsync` with a version that never rejects and never
  * lets commander's `exitOverride` throw escape: a `CommanderError` (usage
- * errors, `--help`, `--version`) maps to its own exit code; anything else —
+ * errors, `--help`, `--version`) exits `0` or `2` by
+ * {@link commanderExitCode}; anything else —
  * which no command action should let through, since each catches its own
  * errors — prints as any command's failure does, redacted, and exits `1`.
  * A usage error under `--json` also prints

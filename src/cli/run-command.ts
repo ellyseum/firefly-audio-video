@@ -1,7 +1,7 @@
 /**
  * The success/failure envelope every command except `render` uses:
  * `action` runs the command's logic, `runCommand` prints whichever way it
- * settles and ends the process with the matching exit code. `render` cannot
+ * settles and sets the matching exit code. `render` cannot
  * share this — it needs its own Ctrl+C handling around the job it starts.
  */
 
@@ -15,7 +15,7 @@ export interface CommandOutcome {
   readonly json: Record<string, unknown>;
 }
 
-/** Runs `action`, prints its outcome, and ends the process — success or failure, exactly once. */
+/** Runs `action`, prints its outcome, and sets the exit code — success or failure, exactly once. */
 export async function runCommand(
   runtime: CliRuntime,
   json: boolean,

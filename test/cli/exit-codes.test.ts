@@ -1,6 +1,16 @@
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { expect, test } from 'vitest';
 import { AudioVideoError } from '../../src/core/errors.js';
-import { EXIT_CODES, exitCodeForError, exitCodesHelpText } from '../../src/cli/exit-codes.js';
+import {
+  EXIT_CODES,
+  exitCodeForError,
+  exitCodesHelpText,
+  exitCodesReadmeTable,
+} from '../../src/cli/exit-codes.js';
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 function errorOf(code: string): AudioVideoError {
   return new AudioVideoError({ message: 'x', code });
@@ -61,4 +71,11 @@ test('every code in the table appears in the help text, in order, with its own l
     expect(lines[index]).toContain(String(entry.code));
     expect(lines[index]).toContain(entry.meaning);
   });
+});
+
+test("README.md's exit-code table matches EXIT_CODES byte for byte", async () => {
+  const { format } = await import('prettier');
+  const rendered = await format(`${exitCodesReadmeTable()}\n`, { parser: 'markdown' });
+  const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
+  expect(readme).toContain(rendered);
 });

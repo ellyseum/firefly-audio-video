@@ -482,10 +482,10 @@ Exit codes, as `dgr --help` lists them:
 | `0`       | success                                                                                                                                                |
 | `2`       | a usage error, or the SDK rejected `invalid_argument`, `invalid_preset` or `missing_peer_dependency`                                                   |
 | `3`       | `auth_failed`                                                                                                                                          |
-| `4`       | the job failed, timed out or returned an invalid response, or it was cancelled from outside this process                                               |
+| `4`       | the job failed or returned an invalid response, or it was cancelled from outside this process                                                          |
 | `5`       | a network or HTTP failure: `request_failed`, `request_timeout`, `http_*`, `submit_failed`, `job_poll_failed`, `asset_fetch_failed` or `storage_failed` |
 | `130`     | cancelled by this process's own Ctrl+C                                                                                                                 |
-| `1`       | anything else                                                                                                                                          |
+| `1`       | anything else, `save_failed` included: the render finished and its output could not be saved                                                           |
 
 ## Release channels
 

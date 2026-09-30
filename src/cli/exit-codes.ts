@@ -61,6 +61,31 @@ const CODE_5 = new Set([
 ]);
 
 /**
+ * Codes {@link EXIT_CODES} spells as their literal `code` string (`invalid_argument`,
+ * `http_*`, …) rather than paraphrasing (`the job failed`, not `job_failed`) —
+ * {@link exitCodesReadmeTable} marks each one as inline code.
+ */
+const LITERAL_CODE_TOKENS: readonly string[] = [
+  ...CODE_2,
+  ...CODE_5,
+  'auth_failed',
+  'save_failed',
+  'http_*',
+];
+
+/**
+ * {@link EXIT_CODES}, as the GitHub-flavored Markdown table the README embeds
+ * under "Exit codes". Column alignment is Prettier's job, which already
+ * formats the README; this renders only the table's content.
+ */
+export function exitCodesReadmeTable(): string {
+  const wrap = (meaning: string): string =>
+    LITERAL_CODE_TOKENS.reduce((text, token) => text.replaceAll(token, `\`${token}\``), meaning);
+  const rows = EXIT_CODES.map((entry) => `| \`${entry.code}\` | ${wrap(entry.meaning)} |`);
+  return ['| Exit code | Meaning |', '| --- | --- |', ...rows].join('\n');
+}
+
+/**
  * The process exit code for an error a command caught. `cancelledByUser` is
  * `true` only when this process's own Ctrl+C is what cancelled the job — a
  * `cancelled` error from anywhere else (a server-side cancellation, another

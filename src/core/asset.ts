@@ -263,7 +263,7 @@ export class Asset {
     // fails creates no directory and no temp file.
     const first = await download.next();
     try {
-      await mkdir(dirname(path), { recursive: true });
+      await diskStep('creating its directory', () => mkdir(dirname(path), { recursive: true }));
       file = await TempFile.create(path);
       if (first.done !== true) await file.write(first.value);
       for await (const chunk of download) {
@@ -274,7 +274,7 @@ export class Asset {
       // Releases the connection when the failure came from the disk side.
       await download.return(undefined);
       await file?.discard();
-      throw err instanceof AudioVideoError ? err : this.#wrapTransportError(err, plan.signal);
+      throw this.#saveFailure(path, err, plan.signal);
     }
   }
 
@@ -528,6 +528,26 @@ export class Asset {
       status: status !== undefined && status >= 400 ? status : undefined,
       cause: sanitizeTransportError(interruption, this.#url),
     });
+  }
+
+  /**
+   * The error {@link Asset.save} rejects with. A download failure is already
+   * an {@link AudioVideoError} and passes through. A failed file-system step
+   * becomes `asset_fetch_failed`, its message naming the step and `path` —
+   * never the temp file's own path — and its `cause` the sanitized
+   * file-system error; while `signal` is aborted it reports `cancelled`
+   * instead, as any other failure would.
+   */
+  #saveFailure(path: string, err: unknown, signal: AbortSignal | undefined): AudioVideoError {
+    if (err instanceof AudioVideoError) return err;
+    if (err instanceof DiskStepFailure && signal?.aborted !== true) {
+      return new AudioVideoError({
+        message: `Saving the asset at ${redactUrl(this.#url)} to ${path} failed while ${err.step}.`,
+        code: 'asset_fetch_failed',
+        cause: sanitizeTransportError(err.cause, this.#url),
+      });
+    }
+    return this.#wrapTransportError(err instanceof DiskStepFailure ? err.cause : err, signal);
   }
 
   /**
@@ -835,6 +855,28 @@ function destroyOnAbort(body: Readable, signal: AbortSignal | undefined): () => 
 }
 
 /**
+ * A file-system step of {@link Asset.save} that failed: `step` describes it,
+ * and `cause` is the error it failed with.
+ */
+class DiskStepFailure extends Error {
+  readonly step: string;
+
+  constructor(step: string, cause: unknown) {
+    super(`Failed while ${step}.`, { cause });
+    this.step = step;
+  }
+}
+
+/** Runs one file-system step of {@link Asset.save}, rethrowing its failure as a {@link DiskStepFailure}. */
+async function diskStep<T>(step: string, operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (err) {
+    throw new DiskStepFailure(step, err);
+  }
+}
+
+/**
  * The temporary file {@link Asset.save} writes into beside its destination,
  * moved onto the destination with one rename once the download completes.
  * {@link TempFile.replace} starts over in a fresh file, so bytes from a
@@ -854,30 +896,37 @@ class TempFile {
   /** A new, empty temp file beside `destination`. */
   static async create(destination: string): Promise<TempFile> {
     const path = tempSavePath(destination);
-    return new TempFile(destination, path, await open(path, 'w'));
+    const handle = await diskStep('creating its temporary file', () => open(path, 'w'));
+    return new TempFile(destination, path, handle);
   }
 
   /** Appends all of `chunk`, however many writes the file system takes to accept it. */
   async write(chunk: Buffer): Promise<void> {
-    for (let written = 0; written < chunk.length;) {
-      const { bytesWritten } = await this.#handle.write(chunk, written, chunk.length - written);
-      written += bytesWritten;
-    }
+    await diskStep('writing its temporary file', async () => {
+      for (let written = 0; written < chunk.length;) {
+        const { bytesWritten } = await this.#handle.write(chunk, written, chunk.length - written);
+        written += bytesWritten;
+      }
+    });
   }
 
   /** Deletes this file and carries on in a fresh, empty one. */
   async replace(): Promise<void> {
-    await this.#handle.close();
-    await rm(this.#path, { force: true });
-    const path = tempSavePath(this.#destination);
-    this.#handle = await open(path, 'w');
-    this.#path = path;
+    await diskStep('starting over in a fresh temporary file', async () => {
+      await this.#handle.close();
+      await rm(this.#path, { force: true });
+      const path = tempSavePath(this.#destination);
+      this.#handle = await open(path, 'w');
+      this.#path = path;
+    });
   }
 
   /** Closes the file and renames it onto the destination. */
   async commit(): Promise<void> {
-    await this.#handle.close();
-    await rename(this.#path, this.#destination);
+    await diskStep('closing its temporary file', () => this.#handle.close());
+    await diskStep('moving its temporary file into place', () =>
+      rename(this.#path, this.#destination),
+    );
   }
 
   /** Closes and deletes the file. Never throws: it runs on a path that is already failing. */

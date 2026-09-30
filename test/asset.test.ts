@@ -1,4 +1,12 @@
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import type { FileHandle } from 'node:fs/promises';
 import { Console } from 'node:console';
 import { getEventListeners } from 'node:events';
@@ -1480,6 +1488,45 @@ test('a save() that fails on the disk side lets go of the download: no abort lis
   expect(openSockets(), 'TCP connections still open').toBeLessThanOrEqual(sockets);
   expect(readdirSync(dir)).toEqual(['blocker']);
 });
+
+test.each<[string, (dir: string) => string, string[]]>([
+  [
+    'creating its directory',
+    (dir) => {
+      writeFileSync(join(dir, 'blocker'), 'not a directory');
+      return join(dir, 'blocker', 'out.bin');
+    },
+    ['blocker'],
+  ],
+  [
+    'moving its temporary file into place',
+    (dir) => {
+      mkdirSync(join(dir, 'out.bin'));
+      return join(dir, 'out.bin');
+    },
+    ['out.bin'],
+  ],
+])(
+  'a save() that fails while %s says so, naming the destination and no other path',
+  async (step, prepare, left) => {
+    const server = await rangeServer({ resource: V1 });
+    const asset = new Asset({ url: server.url, meta: sampleMeta() });
+    const dir = tempDir();
+    const path = prepare(dir);
+
+    const err = (await asset.save(path).catch((e: unknown) => e)) as AudioVideoError;
+
+    expect(err).toBeInstanceOf(AudioVideoError);
+    expect(err.code).toBe('asset_fetch_failed');
+    expect(err.message).toMatch(/^Saving the asset at http:\/\/127\.0\.0\.1:\d+\/out\.mov/);
+    expect(err.message.endsWith(` to ${path} failed while ${step}.`)).toBe(true);
+    expect(err.message).not.toContain('.partial');
+    // The file system's own error, which may name the temp file, is the cause.
+    expect(err.cause).toBeInstanceOf(Error);
+    expect(typeof (err.cause as Error & { code?: unknown }).code).toBe('string');
+    expect(readdirSync(dir)).toEqual(left);
+  },
+);
 
 test.each<[string, RangeServerOptions, 'saved' | 'failed', number]>([
   ['completes', { resource: V1 }, 'saved', 1],

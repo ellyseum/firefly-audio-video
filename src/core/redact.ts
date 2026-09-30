@@ -12,7 +12,8 @@
  *   `.message` string: walks objects/arrays recursively, scrubbing secret-named
  *   keys, any embedded URL, a secret parameter written in plain text (in its
  *   `&amp;` and percent-encoded forms too), an Azure connection string's
- *   account key and shared access signature, a `Bearer` credential and a JWT.
+ *   account key, shared access signature and shared access key, a `Bearer`
+ *   credential and a JWT.
  * - {@link redactError} — a redacted copy of an error, to keep as another
  *   error's `cause`.
  *
@@ -281,19 +282,21 @@ function stripSecretParamsFromText(s: string): string {
 }
 
 /**
- * An Azure connection string's secret settings, `AccountKey` and
- * `SharedAccessSignature` — names in any case, spaces allowed around the `=` —
- * with the `;` before one, wherever the connection string sits in a larger
- * string. A value runs to the next `;` (a shared access signature carries its
- * own `&` and `=`), `#`, whitespace, quote or angle bracket.
+ * An Azure connection string's secret settings, `AccountKey`,
+ * `SharedAccessSignature` and a Service Bus or Event Hubs `SharedAccessKey` —
+ * names in any case, spaces allowed around the `=` — with the `;` before one,
+ * wherever the connection string sits in a larger string. A value runs to the
+ * next `;` (a shared access signature carries its own `&` and `=`), `#`,
+ * whitespace, quote or angle bracket. `SharedAccessKeyName`, which names the
+ * policy a key belongs to, stays.
  */
 const CONNECTION_STRING_SECRET_RE =
-  /;?\b(?:AccountKey|SharedAccessSignature)[ \t]*=[ \t]*[^;#\s"'<>]*/gi;
+  /;?\b(?:AccountKey|SharedAccessSignature|SharedAccessKey)[ \t]*=[ \t]*[^;#\s"'<>]*/gi;
 
 /**
  * The text-level passes a URL, or any string, gets: user info after `//`, an
- * Azure connection string's account key and shared access signature, then
- * every secret parameter.
+ * Azure connection string's account key, shared access signature and shared
+ * access key, then every secret parameter.
  */
 function stripSecretsFromText(s: string): string {
   return stripSecretParamsFromText(
@@ -357,19 +360,19 @@ function readProperty(value: object, key: string): unknown {
  * through {@link redactUrl}, then loses any user info or secret parameter
  * still written in its text (`sig=…` in a bare query string, an HTML body's
  * `&amp;sig=…`, a percent-encoded `%3Fsig%3D…`), any Azure connection-string
- * `AccountKey=…` or `SharedAccessSignature=…` setting, any `Bearer` credential
- * (`Bearer REDACTED`) and any JWT (`REDACTED`). An array is walked element by
- * element. An object has each key checked against a known secret pattern
- * (`authorization`, `cookie`, `sig`, and anything naming a token, secret,
- * password, credential, API key, private key, signature or bearer —
- * case-insensitive) — a match replaces the whole value with `'REDACTED'`
- * without recursing into it, anything else recurses — and each key is itself
- * redacted as a string, so a URL used as a key loses its signature too. Every
- * other value (numbers, booleans, `null`, `undefined`) passes through
- * unchanged. A value already visited earlier on the same walk (a circular
- * reference) is reported as the literal string `'[Circular]'` rather than
- * recursed into again, and one that cannot be read — a throwing getter or
- * Proxy trap, a revoked Proxy — as `'[Unreadable]'`.
+ * `AccountKey=…`, `SharedAccessSignature=…` or `SharedAccessKey=…` setting,
+ * any `Bearer` credential (`Bearer REDACTED`) and any JWT (`REDACTED`). An
+ * array is walked element by element. An object has each key checked against
+ * a known secret pattern (`authorization`, `cookie`, `sig`, and anything
+ * naming a token, secret, password, credential, API key, private key,
+ * signature or bearer — case-insensitive) — a match replaces the whole value
+ * with `'REDACTED'` without recursing into it, anything else recurses — and
+ * each key is itself redacted as a string, so a URL used as a key loses its
+ * signature too. Every other value (numbers, booleans, `null`, `undefined`)
+ * passes through unchanged. A value already visited earlier on the same walk
+ * (a circular reference) is reported as the literal string `'[Circular]'`
+ * rather than recursed into again, and one that cannot be read — a throwing
+ * getter or Proxy trap, a revoked Proxy — as `'[Unreadable]'`.
  *
  * This is the SDK's general-purpose redaction path for anything that is not
  * already known to be a bare URL or a header set — {@link redactUrl} and

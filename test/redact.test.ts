@@ -260,6 +260,13 @@ test.each([
     'AccountKey = CS_ACCOUNT_KEY is invalid',
     ' is invalid',
   ],
+  [
+    'a Service Bus or Event Hubs shared access key, keeping the name of its policy',
+    'Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;' +
+      'SharedAccessKey=CS_SHARED_ACCESS_KEY+/w=;EntityPath=renders',
+    'Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;' +
+      'EntityPath=renders',
+  ],
 ])('an Azure connection string loses %s', (_case, input, expected) => {
   expect(redactValue(input)).toBe(expected);
 });

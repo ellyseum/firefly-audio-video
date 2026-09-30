@@ -3,9 +3,11 @@
  * spelling an encoder could have given it: not in the error's message or any
  * printed form of it, and not on any level of its cause chain. Each provider
  * runs its four failure paths — initializing, presigning, reading a local
- * input file, and an upload failing in transit — against fakes whose errors
- * quote one held secret in one spelling on every level of a three-level chain:
- * a message, a `code`, and a string cause below them.
+ * input file, and an upload failing in transit — and App Builder Files, which
+ * reads a file's bytes itself before uploading them, a failure of that read
+ * too, against fakes whose errors quote one held secret in one spelling on
+ * every level of a three-level chain: a message, a `code`, and a string cause
+ * below them.
  *
  * A leak is found by the secret's runs of letters and digits, which no
  * percent-encoding, form-decoding or base64url spelling changes: any of them
@@ -47,6 +49,13 @@ const AIO_AUTH = 'aio-runtime-uuid:AioAuthLeft+AioAuthMiddle/AioAuthRight==';
  */
 const statFailures = vi.hoisted((): Array<Error | undefined> => []);
 
+/**
+ * Errors the next reads of a file's bytes reject with, in order — through
+ * `openAsBlob` where the runtime has it, else `readFile` — each read passing
+ * through to the file system once the queue is empty.
+ */
+const byteReadFailures = vi.hoisted((): Error[] => []);
+
 vi.mock('node:fs/promises', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs/promises')>();
   return {
@@ -56,6 +65,24 @@ vi.mock('node:fs/promises', async (importOriginal) => {
       if (failure !== undefined) throw failure;
       return actual.stat(...args);
     }) as typeof actual.stat,
+    readFile: (async (...args: Parameters<typeof actual.readFile>) => {
+      const failure = byteReadFailures.shift();
+      if (failure !== undefined) throw failure;
+      return actual.readFile(...args);
+    }) as typeof actual.readFile,
+  };
+});
+
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  if (typeof actual.openAsBlob !== 'function') return actual;
+  return {
+    ...actual,
+    openAsBlob: (async (...args: Parameters<typeof actual.openAsBlob>) => {
+      const failure = byteReadFailures.shift();
+      if (failure !== undefined) throw failure;
+      return actual.openAsBlob(...args);
+    }) as typeof actual.openAsBlob,
   };
 });
 
@@ -83,6 +110,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   statFailures.length = 0;
+  byteReadFailures.length = 0;
   await agent.close();
   setGlobalDispatcher(original);
 });
@@ -315,6 +343,15 @@ const PATHS: readonly FailurePath[] = [
     [AIO_AUTH],
     (thrown) => {
       statFailures.push(undefined, thrown);
+      return aioFiles({ files: presigning }).stageRead(inputFile);
+    },
+  ],
+  [
+    'App Builder Files',
+    "reading the input file's bytes",
+    [AIO_AUTH],
+    (thrown) => {
+      byteReadFailures.push(thrown);
       return aioFiles({ files: presigning }).stageRead(inputFile);
     },
   ],

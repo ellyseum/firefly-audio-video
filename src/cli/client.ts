@@ -10,7 +10,7 @@
 import { createClient, type Client } from '../dgr/client.js';
 import { stdoutJsonLogger } from '../core/logging.js';
 import { invalidArgument } from './errors.js';
-import type { CliRuntime, GlobalOptions } from './runtime.js';
+import type { CliEnv, CliRuntime, GlobalOptions } from './runtime.js';
 import { resolveStorage, storageSetting } from './storage.js';
 import { firstNonEmpty } from './util.js';
 
@@ -42,13 +42,7 @@ export function resolveClient(
 ): Client {
   if (runtime.client !== undefined) return runtime.client;
 
-  const clientId = firstNonEmpty(options.clientId, runtime.env.IMS_OAUTH_S2S_CLIENT_ID);
-  const clientSecret = firstNonEmpty(options.clientSecret, runtime.env.IMS_OAUTH_S2S_CLIENT_SECRET);
-  if (clientId === undefined || clientSecret === undefined) {
-    throw invalidArgument(missingCredentialsMessage(clientId, clientSecret));
-  }
-
-  const scope = firstNonEmpty(options.scope, runtime.env.IMS_OAUTH_S2S_SCOPES);
+  const { clientId, clientSecret, scope } = resolveCredentials(runtime.env, options);
   const storage = needs.storage === true ? storageSetting(options.storage, runtime.env) : undefined;
 
   return createClient({
@@ -60,6 +54,32 @@ export function resolveClient(
       : {}),
     logging: options.log === true ? stdoutJsonLogger({ stream: runtime.stderr }) : false,
   });
+}
+
+/** The IMS credentials a real client is built from. */
+export interface Credentials {
+  readonly clientId: string;
+  readonly clientSecret: string;
+  /** Absent when neither `--scope` nor `IMS_OAUTH_S2S_SCOPES` is set; the client's default applies. */
+  readonly scope?: string;
+}
+
+/**
+ * The credentials `options` and `env` name: each flag — `--client-id`,
+ * `--client-secret`, `--scope` — over its `IMS_OAUTH_S2S_*` environment
+ * variable, a blank value counting as absent.
+ *
+ * @throws {@link AudioVideoError} `invalid_argument` when no client ID or no
+ *   client secret is configured either way.
+ */
+export function resolveCredentials(env: CliEnv, options: GlobalOptions): Credentials {
+  const clientId = firstNonEmpty(options.clientId, env.IMS_OAUTH_S2S_CLIENT_ID);
+  const clientSecret = firstNonEmpty(options.clientSecret, env.IMS_OAUTH_S2S_CLIENT_SECRET);
+  if (clientId === undefined || clientSecret === undefined) {
+    throw invalidArgument(missingCredentialsMessage(clientId, clientSecret));
+  }
+  const scope = firstNonEmpty(options.scope, env.IMS_OAUTH_S2S_SCOPES);
+  return scope === undefined ? { clientId, clientSecret } : { clientId, clientSecret, scope };
 }
 
 /** Names both ways to configure whichever credential is missing; never echoes a value. */

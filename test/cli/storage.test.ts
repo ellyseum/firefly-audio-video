@@ -6,6 +6,7 @@ import { S3StorageProvider } from '../../src/storage/s3.js';
 import {
   buildStorageProvider,
   parseStorageUri,
+  resolveRegion,
   resolveStorage,
   storageSetting,
   type StorageDescriptor,
@@ -138,12 +139,24 @@ test('there is no storage setting when neither --storage nor DGR_STORAGE holds a
   expect(storageSetting('', { DGR_STORAGE: ' ' })).toBeUndefined();
 });
 
+test('the s3 region is --region over AWS_REGION over AWS_DEFAULT_REGION', () => {
+  const env = { AWS_REGION: 'us-east-1', AWS_DEFAULT_REGION: 'us-west-2' };
+  expect(resolveRegion(env, 'eu-west-1')).toBe('eu-west-1');
+  expect(resolveRegion(env)).toBe('us-east-1');
+  expect(resolveRegion({ AWS_DEFAULT_REGION: 'us-west-2' })).toBe('us-west-2');
+  expect(resolveRegion({})).toBeUndefined();
+});
+
+test('a blank --region or AWS_REGION counts as absent', () => {
+  expect(resolveRegion({ AWS_REGION: ' ', AWS_DEFAULT_REGION: 'us-west-2' }, '')).toBe('us-west-2');
+});
+
 test('buildStorageProvider builds an AioFilesStorageProvider for aio-files', () => {
   const provider = buildStorageProvider({ kind: 'aio-files' }, {});
   expect(provider).toBeInstanceOf(AioFilesStorageProvider);
 });
 
-test('buildStorageProvider builds an S3StorageProvider, region from --region over AWS_REGION over AWS_DEFAULT_REGION', () => {
+test('buildStorageProvider builds an S3StorageProvider with or without a region in the environment or --region', () => {
   const descriptor: StorageDescriptor = { kind: 's3', bucket: 'b', prefix: 'p' };
   expect(buildStorageProvider(descriptor, {})).toBeInstanceOf(S3StorageProvider);
   expect(

@@ -89,11 +89,18 @@ export function parseStorageUri(uri: string, source: StorageSource): StorageDesc
 }
 
 /**
- * Builds the {@link StorageProvider} a {@link StorageDescriptor} names.
- * `regionOverride` (the `--region` flag) wins over `AWS_REGION`, which wins
- * over `AWS_DEFAULT_REGION`; neither is required, since the S3 client falls
- * back to the AWS SDK's own region resolution. Construction never touches
- * the network — nothing here uploads or presigns anything.
+ * The S3 bucket region: `regionOverride` (the `--region` flag) over
+ * `AWS_REGION` over `AWS_DEFAULT_REGION`, a blank value counting as absent;
+ * `undefined` leaves the AWS SDK's own region resolution to apply.
+ */
+export function resolveRegion(env: CliEnv, regionOverride?: string): string | undefined {
+  return firstNonEmpty(regionOverride, env.AWS_REGION, env.AWS_DEFAULT_REGION);
+}
+
+/**
+ * Builds the {@link StorageProvider} a {@link StorageDescriptor} names, an
+ * S3 bucket in the region {@link resolveRegion} picks. Construction never
+ * touches the network — nothing here uploads or presigns anything.
  *
  * @throws {@link AudioVideoError} `invalid_argument` for `azure://` storage
  *   with no `AZURE_STORAGE_CONNECTION_STRING` in `env`.
@@ -107,7 +114,7 @@ export function buildStorageProvider(
     case 'aio-files':
       return new AioFilesStorageProvider();
     case 's3': {
-      const region = firstNonEmpty(regionOverride, env.AWS_REGION, env.AWS_DEFAULT_REGION);
+      const region = resolveRegion(env, regionOverride);
       return new S3StorageProvider({
         bucket: descriptor.bucket,
         ...(descriptor.prefix !== undefined ? { prefix: descriptor.prefix } : {}),

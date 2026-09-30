@@ -11,7 +11,7 @@ import { createClient, type Client } from '../dgr/client.js';
 import { stdoutJsonLogger } from '../core/logging.js';
 import { invalidArgument } from './errors.js';
 import type { CliRuntime, GlobalOptions } from './runtime.js';
-import { resolveStorage } from './storage.js';
+import { resolveStorage, storageSetting } from './storage.js';
 import { firstNonEmpty } from './util.js';
 
 /** What a command needs from its client beyond credentials. */
@@ -49,15 +49,14 @@ export function resolveClient(
   }
 
   const scope = firstNonEmpty(options.scope, runtime.env.IMS_OAUTH_S2S_SCOPES);
-  const storageUri =
-    needs.storage === true ? firstNonEmpty(options.storage, runtime.env.DGR_STORAGE) : undefined;
+  const storage = needs.storage === true ? storageSetting(options.storage, runtime.env) : undefined;
 
   return createClient({
     clientId,
     clientSecret,
     ...(scope !== undefined ? { scope } : {}),
-    ...(storageUri !== undefined
-      ? { storage: resolveStorage(storageUri, runtime.env, options.region) }
+    ...(storage !== undefined
+      ? { storage: resolveStorage(storage, runtime.env, options.region) }
       : {}),
     logging: options.log === true ? stdoutJsonLogger({ stream: runtime.stderr }) : false,
   });

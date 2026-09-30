@@ -7,8 +7,15 @@ import {
   buildStorageProvider,
   parseStorageUri,
   resolveStorage,
+  storageSetting,
   type StorageDescriptor,
 } from '../../src/cli/storage.js';
+
+/** An account key, and a connection string carrying it — a value that must never be echoed. */
+const ACCOUNT_KEY = 'U1RPUkFHRV9LRVlfTVVTVF9ORVZFUl9BUFBFQVI=';
+const CONNECTION_STRING =
+  `DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=${ACCOUNT_KEY};` +
+  'EndpointSuffix=core.windows.net';
 
 async function rejection(fn: () => unknown): Promise<AudioVideoError> {
   try {
@@ -21,17 +28,20 @@ async function rejection(fn: () => unknown): Promise<AudioVideoError> {
 }
 
 test('aio-files parses to the bare descriptor', () => {
-  expect(parseStorageUri('aio-files')).toEqual({ kind: 'aio-files' });
+  expect(parseStorageUri('aio-files', '--storage')).toEqual({ kind: 'aio-files' });
 });
 
 test('s3:// parses the bucket and drops a leading slash from the prefix', () => {
-  expect(parseStorageUri('s3://my-bucket')).toEqual({ kind: 's3', bucket: 'my-bucket' });
-  expect(parseStorageUri('s3://my-bucket/renders')).toEqual({
+  expect(parseStorageUri('s3://my-bucket', '--storage')).toEqual({
+    kind: 's3',
+    bucket: 'my-bucket',
+  });
+  expect(parseStorageUri('s3://my-bucket/renders', '--storage')).toEqual({
     kind: 's3',
     bucket: 'my-bucket',
     prefix: 'renders',
   });
-  expect(parseStorageUri('s3://my-bucket/renders/nested/')).toEqual({
+  expect(parseStorageUri('s3://my-bucket/renders/nested/', '--storage')).toEqual({
     kind: 's3',
     bucket: 'my-bucket',
     prefix: 'renders/nested/',
@@ -39,11 +49,11 @@ test('s3:// parses the bucket and drops a leading slash from the prefix', () => 
 });
 
 test('azure:// parses the container and an optional prefix', () => {
-  expect(parseStorageUri('azure://my-container')).toEqual({
+  expect(parseStorageUri('azure://my-container', 'DGR_STORAGE')).toEqual({
     kind: 'azure',
     container: 'my-container',
   });
-  expect(parseStorageUri('azure://my-container/renders')).toEqual({
+  expect(parseStorageUri('azure://my-container/renders', 'DGR_STORAGE')).toEqual({
     kind: 'azure',
     container: 'my-container',
     prefix: 'renders',
@@ -51,28 +61,81 @@ test('azure:// parses the container and an optional prefix', () => {
 });
 
 test('the scheme is matched case-insensitively', () => {
-  expect(parseStorageUri('S3://my-bucket')).toEqual({ kind: 's3', bucket: 'my-bucket' });
-  expect(parseStorageUri('AZURE://my-container')).toEqual({
+  expect(parseStorageUri('S3://my-bucket', '--storage')).toEqual({
+    kind: 's3',
+    bucket: 'my-bucket',
+  });
+  expect(parseStorageUri('AZURE://my-container', '--storage')).toEqual({
     kind: 'azure',
     container: 'my-container',
   });
 });
 
-test('a string with no scheme at all is invalid_argument', async () => {
-  const error = await rejection(() => parseStorageUri('not-a-uri-at-all'));
+test('a value with no scheme names its source and says it has no scheme, never the value', async () => {
+  for (const source of ['--storage', 'DGR_STORAGE'] as const) {
+    const error = await rejection(() => parseStorageUri('not-a-uri-at-all', source));
+    expect(error.code).toBe('invalid_argument');
+    expect(error.message).toContain(`${source} must be`);
+    expect(error.message).toContain('the value given has no scheme');
+    expect(error.message).not.toContain('not-a-uri-at-all');
+  }
+});
+
+test('an Azure connection string given as the storage URI is never echoed, from either source', async () => {
+  for (const source of ['--storage', 'DGR_STORAGE'] as const) {
+    const error = await rejection(() => parseStorageUri(CONNECTION_STRING, source));
+    expect(error.message).toContain(`${source} must be`);
+    expect(error.message).toContain('the value given has no scheme');
+    expect(error.message).not.toContain(ACCOUNT_KEY);
+    expect(error.message).not.toContain('AccountKey');
+    expect(error.message).not.toContain('AccountName');
+  }
+});
+
+test('an unknown scheme is named with its source, and nothing after the scheme is echoed', async () => {
+  const error = await rejection(() =>
+    parseStorageUri('gcs://secret-bucket/private-prefix', 'DGR_STORAGE'),
+  );
   expect(error.code).toBe('invalid_argument');
-  expect(error.message).toContain('--storage');
+  expect(error.message).toContain('DGR_STORAGE must be');
+  expect(error.message).toContain("the value given has the scheme 'gcs'");
+  expect(error.message).not.toContain('secret-bucket');
+  expect(error.message).not.toContain('private-prefix');
+});
+
+test('an s3:// or azure:// value the URL parser refuses names the scheme, never the value', async () => {
+  const error = await rejection(() => parseStorageUri('s3://secret bucket', '--storage'));
+  expect(error.code).toBe('invalid_argument');
+  expect(error.message).toContain('the value given is not a valid s3:// URI');
+  expect(error.message).not.toContain('secret bucket');
 });
 
 test('s3:// or azure:// with no host is invalid_argument', async () => {
-  expect((await rejection(() => parseStorageUri('s3://'))).code).toBe('invalid_argument');
-  expect((await rejection(() => parseStorageUri('azure://'))).code).toBe('invalid_argument');
+  expect((await rejection(() => parseStorageUri('s3://', '--storage'))).code).toBe(
+    'invalid_argument',
+  );
+  expect((await rejection(() => parseStorageUri('azure://', 'DGR_STORAGE'))).code).toBe(
+    'invalid_argument',
+  );
 });
 
-test('an unknown scheme is invalid_argument, naming the scheme', async () => {
-  const error = await rejection(() => parseStorageUri('gcs://bucket/prefix'));
-  expect(error.code).toBe('invalid_argument');
-  expect(error.message).toContain('gcs');
+test('--storage wins over DGR_STORAGE, and is named as the source', () => {
+  expect(storageSetting('s3://flag-bucket', { DGR_STORAGE: 'azure://env-container' })).toEqual({
+    uri: 's3://flag-bucket',
+    source: '--storage',
+  });
+});
+
+test('DGR_STORAGE is the setting when --storage is absent or blank, and is named as the source', () => {
+  const env = { DGR_STORAGE: 'azure://env-container' };
+  const fromEnv = { uri: 'azure://env-container', source: 'DGR_STORAGE' };
+  expect(storageSetting(undefined, env)).toEqual(fromEnv);
+  expect(storageSetting('   ', env)).toEqual(fromEnv);
+});
+
+test('there is no storage setting when neither --storage nor DGR_STORAGE holds a value', () => {
+  expect(storageSetting(undefined, {})).toBeUndefined();
+  expect(storageSetting('', { DGR_STORAGE: ' ' })).toBeUndefined();
 });
 
 test('buildStorageProvider builds an AioFilesStorageProvider for aio-files', () => {
@@ -119,11 +182,16 @@ test('buildStorageProvider treats a blank AZURE_STORAGE_CONNECTION_STRING as abs
 });
 
 test('resolveStorage composes parseStorageUri and buildStorageProvider', () => {
-  expect(resolveStorage('s3://bucket', {})).toBeInstanceOf(S3StorageProvider);
-  expect(resolveStorage('aio-files', {})).toBeInstanceOf(AioFilesStorageProvider);
+  expect(resolveStorage({ uri: 's3://bucket', source: '--storage' }, {})).toBeInstanceOf(
+    S3StorageProvider,
+  );
+  expect(resolveStorage({ uri: 'aio-files', source: 'DGR_STORAGE' }, {})).toBeInstanceOf(
+    AioFilesStorageProvider,
+  );
 });
 
-test('resolveStorage propagates a parse failure before any provider is built', async () => {
-  const error = await rejection(() => resolveStorage('bogus', {}));
+test('resolveStorage propagates a parse failure, naming the setting source', async () => {
+  const error = await rejection(() => resolveStorage({ uri: 'bogus', source: 'DGR_STORAGE' }, {}));
   expect(error.code).toBe('invalid_argument');
+  expect(error.message).toContain('DGR_STORAGE must be');
 });

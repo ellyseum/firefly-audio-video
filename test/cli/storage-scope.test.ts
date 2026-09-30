@@ -1,9 +1,10 @@
 /**
- * Which commands read `--storage` / `DGR_STORAGE`: render, stage and
- * describe stage files or allocate outputs through it and so resolve it;
- * status, cancel, presets and encode never touch storage, so a stale or
- * invalid value leaves them working. Each command runs on a real client
- * whose IMS and DGR requests reach a MockAgent, never the network.
+ * Which commands read `--storage` / `DGR_STORAGE`, and what a command
+ * prints about a value it rejects: render, stage and describe stage files
+ * or allocate outputs through it and so resolve it; status, cancel, presets
+ * and encode never touch storage, so a stale or invalid value leaves them
+ * working. Each command runs on a real client whose IMS and DGR requests
+ * reach a MockAgent, never the network.
  */
 
 import { afterEach, beforeEach, expect, test } from 'vitest';
@@ -12,6 +13,8 @@ import { createHarness } from './support/harness.js';
 
 const CREDENTIALS = { IMS_OAUTH_S2S_CLIENT_ID: 'id', IMS_OAUTH_S2S_CLIENT_SECRET: 'secret' };
 const INVALID = 'gcs://stale-bucket';
+const ACCOUNT_KEY = 'U1RPUkFHRV9LRVlfTVVTVF9ORVZFUl9BUFBFQVI=';
+const CONNECTION_STRING = `DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=${ACCOUNT_KEY}`;
 
 let api: MockApi;
 
@@ -61,5 +64,24 @@ test.each<[name: string, args: string[]]>([
     expect(harness.stderrText()).toContain('Code: invalid_argument');
     expect(harness.exit).toHaveBeenCalledExactlyOnceWith(2);
     expect(api.calls).toEqual([]);
+  },
+);
+
+test.each<[source: string, env: Record<string, string>, flags: string[]]>([
+  ['DGR_STORAGE', { DGR_STORAGE: CONNECTION_STRING }, []],
+  ['--storage', {}, ['--storage', CONNECTION_STRING]],
+])(
+  'a connection string given as %s is rejected by name and scheme, and never printed',
+  async (source, env, flags) => {
+    for (const mode of [[], ['--json']]) {
+      const harness = createHarness({ env: { ...CREDENTIALS, ...env } });
+      await harness.run(['stage', 'https://example.test/logo.png', ...flags, ...mode]);
+      const printed = harness.stdoutText() + harness.stderrText();
+      expect(printed).toContain(`${source} must be`);
+      expect(printed).toContain('the value given has no scheme');
+      expect(printed).not.toContain(ACCOUNT_KEY);
+      expect(printed).not.toContain('AccountKey');
+      expect(harness.exit).toHaveBeenCalledExactlyOnceWith(2);
+    }
   },
 );

@@ -127,10 +127,15 @@ export async function readAll(stream: Readable, secrets: readonly string[] = [])
 /**
  * @internal A provider's own failure as `storage_failed`: `message`, then the
  * cause's message, and a copy of the cause — never the original, which may
- * hold a presigned URL or a credential. Both pass through the redaction
- * pass, and every string in `secrets` (a credential the provider holds that
- * the redaction pass cannot recognize) is replaced in them as well. An
- * {@link AudioVideoError} passes through as it is.
+ * hold a presigned URL or a credential. Every string in `secrets` (a
+ * credential the provider holds that the redaction pass cannot recognize) is
+ * removed first, in each spelling {@link heldSecretPattern} matches, from the
+ * cause's message and from the message, name and code on every level of the
+ * copy; only then does the redaction pass run. The order matters: the pass
+ * rewrites what it recognizes — it takes a connection string's key out of the
+ * middle of the string, and re-encodes a query string it strips — after which
+ * a held secret no longer reads as itself. An {@link AudioVideoError} passes
+ * through as it is.
  *
  * @param message - What failed, without a trailing period.
  */
@@ -140,11 +145,12 @@ export function adapterError(
   secrets: readonly string[] = [],
 ): AudioVideoError {
   if (cause instanceof AudioVideoError) return cause;
-  const detail = cause === undefined ? '' : causeText(cause, secrets);
+  const scrub = secretScrub(secrets);
+  const detail = cause === undefined ? '' : causeText(cause, scrub);
   return new AudioVideoError({
     message: detail === '' ? `${message}.` : `${message}: ${detail}`,
     code: 'storage_failed',
-    ...(cause !== undefined ? { cause: scrubbedCopy(cause, secrets) } : {}),
+    ...(cause !== undefined ? { cause: redactError(cause, scrub) } : {}),
   });
 }
 
@@ -156,36 +162,78 @@ export function invalidOption(message: string): AudioVideoError {
 /** How much of a cause's message a provider failure repeats. */
 const CAUSE_LIMIT = 300;
 
-/**
- * A cause's message, scrubbed of `secrets`, redacted, and cut short. The scrub
- * comes first: the redaction pass rewrites a connection string it recognizes and
- * re-encodes a query string it strips, after which a secret no longer appears
- * verbatim for the scrub to find.
- */
-function causeText(cause: unknown, secrets: readonly string[]): string {
+/** A cause's message with the held secrets removed, then redacted, and cut short. */
+function causeText(cause: unknown, scrub: (text: string) => string): string {
   let text: string;
   try {
     text = cause instanceof Error ? cause.message : String(cause);
   } catch {
     return '';
   }
-  const redacted = redactValue(scrub(text, secrets)).trim();
+  const redacted = redactValue(scrub(text)).trim();
   return redacted.length > CAUSE_LIMIT ? `${redacted.slice(0, CAUSE_LIMIT - 3)}...` : redacted;
 }
 
-/** A redacted copy of `cause`, with every message along its cause chain scrubbed of `secrets`. */
-function scrubbedCopy(cause: unknown, secrets: readonly string[]): Error {
-  const copy = redactError(cause);
-  for (let current: unknown = copy; current instanceof Error; current = current.cause) {
-    current.message = scrub(current.message, secrets);
-  }
-  return copy;
+/** Replaces every spelling of the held `secrets` in a text with `REDACTED`. */
+function secretScrub(secrets: readonly string[]): (text: string) => string {
+  const pattern = heldSecretPattern(secrets);
+  return pattern === undefined ? (text) => text : (text) => text.replace(pattern, 'REDACTED');
 }
 
-/** `text` with every occurrence of each non-empty secret replaced. */
-function scrub(text: string, secrets: readonly string[]): string {
-  return secrets.reduce(
-    (out, secret) => (secret === '' ? out : out.split(secret).join('REDACTED')),
-    text,
-  );
+/**
+ * Every spelling an encoder or a decoder could give the non-empty `secrets`
+ * in a third party's error text, as one pattern: each character as itself or
+ * percent-encoded as UTF-8 (either hex case, once or twice); a `+` also as
+ * the space form-decoding reads it as; `+` and `/` also as base64url's `-` and
+ * `_`; and the trailing `=` padding in part or not at all. Letters and digits
+ * match only as they are, which no common encoder changes. A longer secret is
+ * tried first, so one that begins with another is removed whole rather than
+ * cut after the shorter one. `undefined` when there is none.
+ */
+function heldSecretPattern(secrets: readonly string[]): RegExp | undefined {
+  const sources = [...new Set(secrets)]
+    .filter((secret) => secret !== '')
+    .sort((a, b) => b.length - a.length)
+    .map(spellingsOf);
+  return sources.length === 0 ? undefined : new RegExp(sources.join('|'), 'gu');
+}
+
+/**
+ * The pattern for every spelling of one secret. A secret that is nothing but
+ * `=` keeps every character required: a pattern of optional padding alone
+ * would match the empty string at every position of the text.
+ */
+function spellingsOf(secret: string): string {
+  const body = secret.replace(/=+$/, '');
+  if (body === '') return [...secret].map(characterForms).join('');
+  const padding = secret.length - body.length;
+  const tail = padding > 0 ? `${characterForms('=')}{0,${padding}}` : '';
+  return [...body].map(characterForms).join('') + tail;
+}
+
+/** One character of a secret in every form {@link heldSecretPattern} lists. */
+function characterForms(character: string): string {
+  if (/^[A-Za-z0-9]$/.test(character)) return character;
+  const forms = [literal(character), percentEncoded(character)];
+  if (character === '+') forms.push(literal(' '), percentEncoded(' '), literal('-'));
+  if (character === '/') forms.push(literal('_'));
+  return `(?:${forms.join('|')})`;
+}
+
+/** `character` percent-encoded as UTF-8, once (`%2B`) or twice (`%252B`), each hex letter in either case. */
+function percentEncoded(character: string): string {
+  return [...Buffer.from(character, 'utf8')].map((byte) => `%(?:25)?${hexDigits(byte)}`).join('');
+}
+
+/** A byte's two hex digits, each letter matching in either case. */
+function hexDigits(byte: number): string {
+  return byte
+    .toString(16)
+    .padStart(2, '0')
+    .replace(/[a-f]/g, (digit) => `[${digit}${digit.toUpperCase()}]`);
+}
+
+/** A pattern matching exactly `character`, whatever it means in a pattern. */
+function literal(character: string): string {
+  return `\\u{${(character.codePointAt(0) ?? 0).toString(16)}}`;
 }

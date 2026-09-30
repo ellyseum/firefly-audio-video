@@ -562,6 +562,45 @@ test('redactError: never throws, even for an error whose properties throw', () =
   expect(redactError(hostile).message).toBe('[Unreadable error]');
 });
 
+test("redactError: the copy's name and string code are redacted like its message", () => {
+  const copy = redactError(
+    Object.assign(new Error('failed'), {
+      name: 'Error at https://x.blob/n?sig=NAME_SIG',
+      code: 'E https://x.blob/c?sig=CODE_SIG&rest=keep',
+    }),
+  );
+  expect(copy.name).toBe('Error at https://x.blob/n');
+  expect((copy as Error & { code?: unknown }).code).toBe('E https://x.blob/c?rest=keep');
+  expect(inspect(copy, { depth: null, showHidden: true })).not.toMatch(/NAME_SIG|CODE_SIG/);
+});
+
+test('redactError: a scrub sees every string as the error wrote it, before the redaction pass', () => {
+  const seen: string[] = [];
+  const copy = redactError(
+    Object.assign(new Error('msg https://x.blob/f?sig=MSG_SIG&k=HELD'), {
+      name: 'HELDError',
+      code: 'E_HELD',
+      cause: 'inner https://x.blob/g?sig=INNER_SIG&k=HELD',
+    }),
+    (text) => {
+      seen.push(text);
+      return text.replaceAll('HELD', 'GONE');
+    },
+  );
+  expect(seen).toEqual([
+    'msg https://x.blob/f?sig=MSG_SIG&k=HELD',
+    'HELDError',
+    'E_HELD',
+    'inner https://x.blob/g?sig=INNER_SIG&k=HELD',
+  ]);
+  expect(copy).toMatchObject({
+    name: 'GONEError',
+    code: 'E_GONE',
+    message: 'msg https://x.blob/f?k=GONE',
+  });
+  expect((copy.cause as Error).message).toBe('inner https://x.blob/g?k=GONE');
+});
+
 // --- AudioVideoError --------------------------------------------
 
 test('AudioVideoError: redacts message + items; secrets never survive JSON.stringify, toString, or util.inspect', () => {

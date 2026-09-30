@@ -404,39 +404,54 @@ const MAX_CAUSE_DEPTH = 4;
 /**
  * A redacted stand-in for an error about to become another error's
  * `cause`: a new `Error` carrying the original's `name`, its `code` (a string
- * or number), its message run through {@link redactValue}, and — to a depth
- * of four — its own `cause` copied the same way. The original is never kept:
- * a transport error can still hold an unredacted URL in its message or its
- * cause. Any error-shaped value is read this way — an object with a string
- * `message`, or an object the runtime brands as an error — so an error made
- * in another realm (a `vm` context, a test runner's sandbox) keeps its name
- * and code even though it is not an `instanceof Error` here. Any other value
- * becomes an `Error` from its string form. Never throws.
+ * or number) and its message — each string run through {@link redactValue} —
+ * and, to a depth of four, its own `cause` copied the same way. The original
+ * is never kept: a transport error can still hold an unredacted URL in its
+ * message, its code or its cause. Any error-shaped value is read this way — an
+ * object with a string `message`, or an object the runtime brands as an error
+ * — so an error made in another realm (a `vm` context, a test runner's
+ * sandbox) keeps its name and code even though it is not an `instanceof Error`
+ * here. Any other value becomes an `Error` from its string form. Never throws.
+ *
+ * `scrub`, when given, runs over each of those strings before the redaction
+ * pass does — the message, the name and a string code on every level, and a
+ * non-error value's string form — so text a caller holds as secret is removed
+ * while it still reads as written: the redaction pass rewrites what it
+ * recognizes, re-encoding a query string it strips, after which a held secret
+ * no longer appears as itself.
  *
  * @param error - Whatever was thrown or rejected.
+ * @param scrub - Removes held secrets from one string of the error's text.
  * @returns A new `Error` safe to keep as a `cause`.
  *
  * @internal
  */
-export function redactError(error: unknown): Error {
-  return redactErrorAt(error, 1);
+export function redactError(error: unknown, scrub: (text: string) => string = unchanged): Error {
+  return redactErrorAt(error, 1, (text) => redactValue(scrub(text)));
 }
 
-function redactErrorAt(error: unknown, depth: number): Error {
+function redactErrorAt(error: unknown, depth: number, clean: (text: string) => string): Error {
   let copy: Error;
   try {
     const fields = errorFields(error);
-    if (fields === undefined) return new Error(redactValue(String(error)));
-    copy = new Error(redactValue(fields.message));
-    if (fields.name !== undefined) copy.name = fields.name;
-    if (fields.code !== undefined) (copy as Error & { code?: string | number }).code = fields.code;
+    if (fields === undefined) return new Error(clean(String(error)));
+    copy = new Error(clean(fields.message));
+    if (fields.name !== undefined) copy.name = clean(fields.name);
+    if (fields.code !== undefined) {
+      (copy as Error & { code?: string | number }).code =
+        typeof fields.code === 'string' ? clean(fields.code) : fields.code;
+    }
     if (fields.cause !== undefined && depth < MAX_CAUSE_DEPTH) {
-      copy.cause = redactErrorAt(fields.cause, depth + 1);
+      copy.cause = redactErrorAt(fields.cause, depth + 1, clean);
     }
   } catch {
     return new Error('[Unreadable error]');
   }
   return copy;
+}
+
+function unchanged(text: string): string {
+  return text;
 }
 
 /**

@@ -1070,14 +1070,27 @@ test('a submit rejecting with something other than AudioVideoError is wrapped su
   expect(inspect(job)).toBe("{ jobId: undefined, state: 'rejected' }");
 });
 
-test("a TokenProvider's plain Error rejecting the submit is wrapped submit_failed the same way", async () => {
-  const cause = new Error('token endpoint unreachable');
-  const submit = vi.fn(() => Promise.reject(cause));
-  const job = runJob(http(), { submit, mapResult: () => 'unreached' });
+test("a TokenProvider's plain Error on the submit request rejects the job with the client's own auth_failed error, not a submit_failed wrapper", async () => {
+  const client = new HttpClient({
+    apiKey: 'key',
+    tokenProvider: {
+      getAccessToken: () => Promise.reject(new Error('token endpoint unreachable')),
+    },
+  });
+  let raised: unknown;
+  const submit = async (): Promise<JobSubmission> => {
+    try {
+      return (await client.request<JobSubmission>('POST', '/v1/submit', {})).body;
+    } catch (error) {
+      raised = error;
+      throw error;
+    }
+  };
+  const job = runJob(client, { submit, mapResult: () => 'unreached' });
 
   const err = await rejectionOf(job);
-  expect(err?.code).toBe('submit_failed');
-  expect(err?.cause).toBe(cause);
+  expect(err?.code).toBe('auth_failed');
+  expect(err).toBe(raised);
 });
 
 // --- transient status-poll failures ------------------------------------------------------

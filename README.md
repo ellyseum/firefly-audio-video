@@ -422,7 +422,8 @@ Errors are redacted when they are built. `.message`, `.items`, `toJSON()`, `toSt
 `console.log(error)` never carry a bearer token, an `x-api-key`, a presigned URL's signature (Azure
 SAS, AWS SigV4 and SigV2, Google Cloud Storage V4 and V2), a connection string's key, or a JWT.
 `.jobId` and `.requestId` stay as the service sent them. `.cause` holds the underlying error for
-inspection and is left out of every serialized form.
+inspection and is left out of every serialized form; it is kept as thrown when the official IMS
+token provider or a storage provider of your own threw it, so log the error rather than its cause.
 
 ## CLI
 

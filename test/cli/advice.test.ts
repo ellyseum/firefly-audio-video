@@ -1,7 +1,8 @@
 /**
  * The advice a CLI user reads is the CLI's own: an error about missing
  * storage names `--storage` / `DGR_STORAGE` and the URI forms, never an SDK
- * option, and a missing peer dependency names only its install command.
+ * option; a missing peer dependency names only its install command; and a
+ * peer that fails to load names the command that reinstalls it.
  * The unit cases restate errors built by the SDK's own message builders;
  * the command cases run a real client with no storage configured, whose
  * IMS and DGR requests would reach a MockAgent, never the network.
@@ -68,6 +69,29 @@ test("a missing peer dependency's message names only the install command", async
   );
   expect(message).not.toContain('option');
   expect(message).not.toContain('bundled code');
+});
+
+test("a storage peer that fails to load keeps its loader's error, redacted, and names the command that reinstalls it", async () => {
+  const broken = new SyntaxError(
+    'Unexpected token in https://acct.blob.core.windows.net/c/index.js?sv=2024&sig=LOADER_SIG',
+  );
+  const peer = {
+    specifier: '@aws-sdk/client-s3',
+    provider: 'S3StorageProvider',
+    install: 'npm install @aws-sdk/client-s3 @aws-sdk/s3-request-presigner',
+    option: 's3',
+  };
+  const error = await loadPeer(peer, () => Promise.reject(broken)).then(
+    () => undefined,
+    (failure: unknown) => failure,
+  );
+  expect(error).toBeInstanceOf(AudioVideoError);
+  expect((error as AudioVideoError).code).toBe('storage_failed');
+  expect(cliMessage(error as AudioVideoError)).toBe(
+    'Loading @aws-sdk/client-s3 for S3StorageProvider failed (SyntaxError: Unexpected token in ' +
+      'https://acct.blob.core.windows.net/c/index.js): reinstall it with ' +
+      '`npm install @aws-sdk/client-s3`.',
+  );
 });
 
 test('any other error message is left as it is', () => {

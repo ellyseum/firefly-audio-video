@@ -1,4 +1,5 @@
 import { expect, test } from 'vitest';
+import * as z from 'zod';
 import { buildRenderBody } from '../src/dgr/build-body.js';
 import type { RenderSpec } from '../src/dgr/schemas.js';
 
@@ -34,4 +35,52 @@ test('variationIndex defaults to 0; fileName omitted when absent', () => {
 
 test('an invalid spec throws a zod error', () => {
   expect(() => buildRenderBody({ source: 's', presets: [] } as unknown as RenderSpec)).toThrow();
+});
+
+test('an assetIndex past the end of assets throws a zod error naming exactly that variable', () => {
+  let thrown: unknown;
+  try {
+    buildRenderBody({
+      source: 's',
+      presets: [{ presetId: 'p' }],
+      assets: ['https://x/a0.png'],
+      variations: [
+        {
+          variables: [
+            { variableId: '0_0_media', assetIndex: 0 },
+            { variableId: '0_1_media', assetIndex: 1 },
+          ],
+        },
+      ],
+      outputs: [{ presetIndex: 0, destination: 'd' }],
+    });
+  } catch (error) {
+    thrown = error;
+  }
+  expect(thrown).toBeInstanceOf(z.ZodError);
+  expect((thrown as z.ZodError).issues).toEqual([
+    expect.objectContaining({
+      code: 'custom',
+      path: ['variations', 0, 'variables', 1, 'assetIndex'],
+      message: 'assetIndex is 1, but the spec has 1 asset',
+    }),
+  ]);
+});
+
+test('an assetIndex with no assets at all is out of range too, and an in-range one builds', () => {
+  const base = {
+    source: 's',
+    presets: [{ presetId: 'p' }],
+    outputs: [{ presetIndex: 0, destination: 'd' }],
+  };
+  expect(() =>
+    buildRenderBody({ ...base, variations: [{ variables: [{ variableId: 'v', assetIndex: 0 }] }] }),
+  ).toThrow('assetIndex is 0, but the spec has 0 assets');
+
+  const body = buildRenderBody({
+    ...base,
+    assets: ['https://x/a0.png'],
+    variations: [{ variables: [{ variableId: 'v', assetIndex: 0 }] }],
+  });
+  expect(body.variations?.[0]?.variables[0]?.assetIndex).toBe(0);
 });

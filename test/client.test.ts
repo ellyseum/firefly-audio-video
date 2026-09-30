@@ -629,6 +629,22 @@ test('an enormous unknown key in a spec is cut short in the invalid_argument mes
   expect(error.message).toMatch(/\.\.\.$/);
 });
 
+test('an assetIndex past the end of assets rejects invalid_argument before anything is submitted', async () => {
+  const spec: RenderRequest = {
+    ...singleSpec(),
+    assets: [`${STORAGE}/a0.png`],
+    variations: [{ variables: [{ variableId: '0_0_media', assetIndex: 9 }] }],
+  };
+
+  const error = await rejection(client().render(spec));
+
+  expect(error.code).toBe('invalid_argument');
+  expect(error.message).toContain(
+    'variations.0.variables.0.assetIndex: assetIndex is 9, but the spec has 1 asset',
+  );
+  expect(api.submitted()).toEqual([]);
+});
+
 test('a render that fails before submitting emits exactly one record, with no job ID', async () => {
   const logger = recordingLogger();
   await rejection(

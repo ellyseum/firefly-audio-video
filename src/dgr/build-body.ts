@@ -3,6 +3,7 @@
  * `POST /v1/templates/render` actually expects.
  */
 
+import * as z from 'zod';
 import { RenderSpecSchema, type RenderSpec } from './schemas.js';
 import type { RenderBodyOutput, RenderBodyPresetRef, RenderBodyWire } from './types.js';
 
@@ -23,13 +24,15 @@ import type { RenderBodyOutput, RenderBodyPresetRef, RenderBodyWire } from './ty
  *
  * Validation runs first: a spec that fails {@link RenderSpecSchema} throws a zod
  * `ZodError` before any transform is attempted, so a caller never gets a
- * partially-built wire body for invalid input.
+ * partially-built wire body for invalid input. So does a variable whose
+ * `assetIndex` points past the end of `assets` — the API would otherwise be
+ * sent a body referencing an asset that does not exist.
  *
  * @param spec - The friendly render input (strings for URLs/paths).
  * @returns The wire body, ready to be sent as the JSON body of
  *   `POST /v1/templates/render`.
  * @throws A zod `ZodError` when `spec` fails validation against
- *   {@link RenderSpecSchema}.
+ *   {@link RenderSpecSchema}, or names an `assetIndex` it has no asset for.
  *
  * @example
  * ```ts
@@ -44,6 +47,7 @@ import type { RenderBodyOutput, RenderBodyPresetRef, RenderBodyWire } from './ty
  */
 export function buildRenderBody(spec: RenderSpec): RenderBodyWire {
   const parsed = RenderSpecSchema.parse(spec);
+  checkAssetIndices(parsed);
 
   const presets: RenderBodyPresetRef[] = parsed.presets.map((preset) =>
     'presetId' in preset
@@ -67,4 +71,26 @@ export function buildRenderBody(spec: RenderSpec): RenderBodyWire {
     ...(parsed.variations && parsed.variations.length > 0 ? { variations: parsed.variations } : {}),
     outputs,
   };
+}
+
+/**
+ * Throws a `ZodError` naming every variable whose `assetIndex` points past the
+ * end of `spec.assets`.
+ */
+function checkAssetIndices(spec: RenderSpec): void {
+  const assetCount = spec.assets?.length ?? 0;
+  const issues: z.core.$ZodIssue[] = [];
+  spec.variations?.forEach((variation, v) => {
+    variation.variables.forEach((variable, i) => {
+      const { assetIndex } = variable;
+      if (assetIndex === undefined || assetIndex < assetCount) return;
+      issues.push({
+        code: 'custom',
+        path: ['variations', v, 'variables', i, 'assetIndex'],
+        message: `assetIndex is ${assetIndex}, but the spec has ${assetCount} asset${assetCount === 1 ? '' : 's'}`,
+        input: assetIndex,
+      });
+    });
+  });
+  if (issues.length > 0) throw new z.ZodError(issues);
 }

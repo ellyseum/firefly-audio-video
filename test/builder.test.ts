@@ -201,6 +201,34 @@ test('.buffer(), .save() and .stream() render, then read the finished asset', as
   expect(api.count('POST', '/v1/templates/render')).toBe(3);
 });
 
+test('.buffer(), .save() and .stream() hand their retries option to the asset read, which validates it', async () => {
+  jobsSucceed('job-retries-1', 'job-retries-2', 'job-retries-3');
+  api.download('/out/', BYTES);
+  const c = client();
+  const dir = mkdtempSync(join(tmpdir(), 'firefly-audio-video-builder-'));
+  const path = join(dir, 'out.mov');
+
+  const buffered = await rejection(
+    c.render(CAPSULE, { pollIntervalMs: 0 }).prores.buffer({ retries: -1 }),
+  );
+  const saved = await rejection(
+    c.render(CAPSULE, { pollIntervalMs: 0 }).prores.save(path, { retries: -1 }),
+  );
+  const stream = c.render(CAPSULE, { pollIntervalMs: 0 }).prores.stream({ retries: -1 });
+  const streamed = await rejection(
+    (async () => {
+      for await (const chunk of stream) void chunk;
+    })(),
+  );
+
+  for (const error of [buffered, saved, streamed]) {
+    expect(error.code).toBe('invalid_argument');
+    expect(error.message).toContain('retries must be a non-negative integer');
+  }
+  expect(existsSync(path)).toBe(false);
+  rmdirSync(dir);
+});
+
 test('.save() creates its destination directory, the same as Asset.save', async () => {
   jobsSucceed('job-mkdir');
   api.download('/out/', BYTES);

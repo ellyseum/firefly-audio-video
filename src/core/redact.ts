@@ -11,7 +11,8 @@
  * - {@link redactValue} — an arbitrary log record, error `.items`, or error
  *   `.message` string: walks objects/arrays recursively, scrubbing secret-named
  *   keys, any embedded URL, a secret parameter written in plain text (in its
- *   `&amp;` and percent-encoded forms too), a `Bearer` credential and a JWT.
+ *   `&amp;` and percent-encoded forms too), an Azure connection string's
+ *   account key and shared access signature, a `Bearer` credential and a JWT.
  * - {@link redactError} — a redacted copy of an error, to keep as another
  *   error's `cause`.
  *
@@ -279,9 +280,25 @@ function stripSecretParamsFromText(s: string): string {
   );
 }
 
-/** The text-level passes a URL, or any string, gets: user info after `//`, then every secret parameter. */
+/**
+ * An Azure connection string's secret settings, `AccountKey` and
+ * `SharedAccessSignature` — names in any case, spaces allowed around the `=` —
+ * with the `;` before one, wherever the connection string sits in a larger
+ * string. A value runs to the next `;` (a shared access signature carries its
+ * own `&` and `=`), `#`, whitespace, quote or angle bracket.
+ */
+const CONNECTION_STRING_SECRET_RE =
+  /;?\b(?:AccountKey|SharedAccessSignature)[ \t]*=[ \t]*[^;#\s"'<>]*/gi;
+
+/**
+ * The text-level passes a URL, or any string, gets: user info after `//`, an
+ * Azure connection string's account key and shared access signature, then
+ * every secret parameter.
+ */
 function stripSecretsFromText(s: string): string {
-  return stripSecretParamsFromText(s.replace(USERINFO_RE, '$1'));
+  return stripSecretParamsFromText(
+    s.replace(USERINFO_RE, '$1').replace(CONNECTION_STRING_SECRET_RE, ''),
+  );
 }
 
 /**
@@ -294,7 +311,10 @@ const BEARER_RE = /\b([Bb][Ee][Aa][Rr][Ee][Rr]\s+)(?![a-z]+(?![\w\-.~+/=]))[\w\-
 /** A JWT: three base64url segments, the first opening with `eyJ` (the encoding of `{"`). */
 const JWT_RE = /\beyJ[\w-]+\.[\w-]+\.[\w-]*/g;
 
-/** Every redaction a free-text string gets: embedded URLs, user info, secret parameters, `Bearer` credentials and JWTs. */
+/**
+ * Every redaction a free-text string gets: embedded URLs, user info, connection-string
+ * secrets, secret parameters, `Bearer` credentials and JWTs.
+ */
 function redactString(s: string): string {
   return stripSecretsFromText(redactEmbeddedUrls(s))
     .replace(BEARER_RE, '$1REDACTED')
@@ -336,7 +356,8 @@ function readProperty(value: object, key: string): unknown {
  * Deep-walks `value`, redacting as it goes. A string has every embedded URL run
  * through {@link redactUrl}, then loses any user info or secret parameter
  * still written in its text (`sig=…` in a bare query string, an HTML body's
- * `&amp;sig=…`, a percent-encoded `%3Fsig%3D…`), any `Bearer` credential
+ * `&amp;sig=…`, a percent-encoded `%3Fsig%3D…`), any Azure connection-string
+ * `AccountKey=…` or `SharedAccessSignature=…` setting, any `Bearer` credential
  * (`Bearer REDACTED`) and any JWT (`REDACTED`). An array is walked element by
  * element. An object has each key checked against a known secret pattern
  * (`authorization`, `cookie`, `sig`, and anything naming a token, secret,

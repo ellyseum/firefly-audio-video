@@ -229,6 +229,56 @@ test('a URL used as an object key loses its signature too', () => {
   });
 });
 
+// --- Azure connection strings ------------------------------------------------------------
+
+const ACCOUNT_KEY_CONNECTION_STRING =
+  'DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=CS_ACCOUNT_KEY+/w==;' +
+  'EndpointSuffix=core.windows.net';
+const SAS_CONNECTION_STRING =
+  'BlobEndpoint=https://acct.blob.core.windows.net/;SharedAccessSignature=sv=2022-11-02' +
+  '&ss=b&srt=co&sp=rl&se=2030-01-01T00:00:00Z&rscd=attachment&sig=CS_SAS_SIG%3D;' +
+  'QueueEndpoint=https://acct.queue.core.windows.net/';
+
+test.each([
+  [
+    'an account key, from a connection string quoted in a message',
+    `cannot connect with '${ACCOUNT_KEY_CONNECTION_STRING}'`,
+    "cannot connect with 'DefaultEndpointsProtocol=https;AccountName=acct;EndpointSuffix=core.windows.net'",
+  ],
+  [
+    'a whole shared access signature, the & and = inside it included',
+    SAS_CONNECTION_STRING,
+    'BlobEndpoint=https://acct.blob.core.windows.net/;QueueEndpoint=https://acct.queue.core.windows.net/',
+  ],
+  [
+    'a setting that opens the string, its name in any case',
+    'accountkey=CS_ACCOUNT_KEY;ACCOUNTNAME=acct',
+    ';ACCOUNTNAME=acct',
+  ],
+  [
+    'a setting written with spaces around its =',
+    'AccountKey = CS_ACCOUNT_KEY is invalid',
+    ' is invalid',
+  ],
+])('an Azure connection string loses %s', (_case, input, expected) => {
+  expect(redactValue(input)).toBe(expected);
+});
+
+test('a connection string in a log record or an error message is scrubbed; look-alike settings stay', () => {
+  expect(
+    redactValue({ connectionString: ACCOUNT_KEY_CONNECTION_STRING, container: 'renders' }),
+  ).toEqual({
+    connectionString:
+      'DefaultEndpointsProtocol=https;AccountName=acct;EndpointSuffix=core.windows.net',
+    container: 'renders',
+  });
+  const error = new AudioVideoError({ message: `storage refused ${SAS_CONNECTION_STRING}` });
+  expect(error.message).not.toContain('CS_SAS_SIG');
+  expect(error.message).not.toContain('SharedAccessSignature');
+  const lookAlike = 'AccountName=acct;AccountKeyVersion=2;EndpointSuffix=core.windows.net';
+  expect(redactValue(lookAlike)).toBe(lookAlike);
+});
+
 // --- redactHeaders -------------------------------------------------------------
 
 test('redactHeaders: redacts by name, case-insensitively, and passes other headers through', () => {

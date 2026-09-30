@@ -19,12 +19,13 @@ push to `main` republishes `@next` from that new base.
 
 ### The flip
 
-The package name is unclaimed and the repository is private, so none of the above can run until:
+The repository is public and both environments exist; the package name is still unclaimed, so
+none of the above can run until:
 
-1. **Make the repository public.** On GitHub Free, environments — and the protection rules on
-   them — exist only on public repositories, which is why `release` and `npm-next` cannot be
-   created before this step.
-2. **Create two GitHub environments:**
+1. **The repository is public — done.** On GitHub Free, environments — and the protection rules on
+   them — exist only on public repositories, which is why `release` and `npm-next` could not be
+   created before this.
+2. **Two GitHub environments exist — done.**
    - `release` — required reviewer: the repository owner; deployment branches: `main`.
    - `npm-next` — no required reviewer; deployment branches: `main`.
 3. **Add a repository secret `NPM_BOOTSTRAP_TOKEN`**: a classic npm automation token with publish

@@ -1092,7 +1092,13 @@ test.each<Accessor>(['stream', 'save', 'buffer'])(
     expect(sha256(bytes)).toBe(sha256(BODY));
     expect(server.cuts()).toBe(1);
     expect(server.requests).toHaveLength(2);
-    expect(server.requests[0]).toEqual({ range: undefined, ifRange: undefined });
+    // The first request asks for the asset unencoded too, so no proxy between
+    // hands back a compressed body that a Range could not address.
+    expect(server.requests[0]).toEqual({
+      range: undefined,
+      ifRange: undefined,
+      acceptEncoding: 'identity',
+    });
     expectResumption(server.requests[1], CUT, '"v1"');
   },
 );
@@ -1242,7 +1248,11 @@ test('a 206 whose Content-Range does not continue at the offset makes save() sta
   expect(sha256(bytes)).toBe(sha256(BODY));
   expect(server.requests).toHaveLength(3);
   expectResumption(server.requests[1], CUT, '"v1"');
-  expect(server.requests[2]).toEqual({ range: undefined, ifRange: undefined });
+  expect(server.requests[2]).toEqual({
+    range: undefined,
+    ifRange: undefined,
+    acceptEncoding: 'identity',
+  });
 });
 
 test('an asset replaced between attempts: If-Range brings the new version whole, and save() keeps exactly that', async () => {
@@ -1290,7 +1300,11 @@ test('a 416 on the resumption: stream() rejects with its status, save() starts o
   expect(sha256(bytes)).toBe(sha256(BODY));
   expect(restarting.requests).toHaveLength(3);
   expectResumption(restarting.requests[1], CUT, '"v1"');
-  expect(restarting.requests[2]).toEqual({ range: undefined, ifRange: undefined });
+  expect(restarting.requests[2]).toEqual({
+    range: undefined,
+    ifRange: undefined,
+    acceptEncoding: 'identity',
+  });
 });
 
 test('a 403 on the resumption fails the download at once, with retries still unspent', async () => {
@@ -1497,6 +1511,9 @@ test.each<[string, RangeServerOptions, 'saved' | 'failed', number]>([
 
 // --- resumable downloads, through a stubbed fetch -----------------------------------------
 
+/** The header every download request carries. */
+const IDENTITY = { 'Accept-Encoding': 'identity' };
+
 test('a body that ends cleanly but short of its Content-Length resumes like a cut', async () => {
   const requests: Array<Record<string, string>> = [];
   const asset = new Asset({
@@ -1519,7 +1536,7 @@ test('a body that ends cleanly but short of its Content-Length resumes like a cu
   const bytes = await asset.buffer();
 
   expect(sha256(bytes)).toBe(sha256(BODY));
-  expect(requests).toEqual([{}, { Range: 'bytes=1000-', 'If-Range': '"v1"' }]);
+  expect(requests).toEqual([IDENTITY, { ...IDENTITY, Range: 'bytes=1000-', 'If-Range': '"v1"' }]);
 });
 
 test.each<Accessor>(['stream', 'save', 'buffer'])(
@@ -1541,7 +1558,7 @@ test.each<Accessor>(['stream', 'save', 'buffer'])(
 
     expect(sha256(bytes)).toBe(sha256(BODY));
     // With nothing delivered there is no offset to resume from.
-    expect(requests).toEqual([{}, {}]);
+    expect(requests).toEqual([IDENTITY, IDENTITY]);
   },
 );
 
@@ -1583,10 +1600,10 @@ test('a cut after save() starts over resumes the new version from its own offset
 
   expect(sha256(bytes)).toBe(sha256(V2.body));
   expect(requests).toEqual([
-    {},
-    { Range: `bytes=${firstCut}-`, 'If-Range': '"v1"' },
+    IDENTITY,
+    { ...IDENTITY, Range: `bytes=${firstCut}-`, 'If-Range': '"v1"' },
     // Counted from V2's first byte, not from where V1 stopped.
-    { Range: `bytes=${restartCut}-`, 'If-Range': '"v2"' },
+    { ...IDENTITY, Range: `bytes=${restartCut}-`, 'If-Range': '"v2"' },
   ]);
 });
 
@@ -1644,7 +1661,7 @@ test.each<Accessor>(['stream', 'save', 'buffer'])(
     const bytes = await readThrough(asset, accessor);
 
     expect(sha256(bytes)).toBe(sha256(full));
-    expect(requests).toEqual([{}, { Range: 'bytes=1000-', 'If-Range': '"v1"' }]);
+    expect(requests).toEqual([IDENTITY, { ...IDENTITY, Range: 'bytes=1000-', 'If-Range': '"v1"' }]);
   },
 );
 
@@ -1674,7 +1691,11 @@ test.each([
     const restarted = resetThen416({ ...options, delivered: 1_000 });
     const bytes = await readThrough(restarted.asset, 'save');
     expect(sha256(bytes)).toBe(sha256(options.full));
-    expect(restarted.requests).toEqual([{}, { Range: 'bytes=1000-', 'If-Range': '"v1"' }, {}]);
+    expect(restarted.requests).toEqual([
+      IDENTITY,
+      { ...IDENTITY, Range: 'bytes=1000-', 'If-Range': '"v1"' },
+      IDENTITY,
+    ]);
   },
 );
 
@@ -1721,7 +1742,7 @@ test('a content-encoded body is never resumed by byte offset: stream() rejects w
   expect(err.code).toBe('asset_fetch_failed');
   expect(err.message).toContain('could not be resumed');
   expect(err.message).toContain('content-encoded');
-  expect(stub.requests).toEqual([{}]);
+  expect(stub.requests).toEqual([IDENTITY]);
 });
 
 test('a content-encoded body is never resumed by byte offset: save() starts over with a plain request', async () => {
@@ -1743,7 +1764,7 @@ test('a content-encoded body is never resumed by byte offset: save() starts over
 
   expect(sha256(readFileSync(path))).toBe(sha256(BODY));
   expect(readdirSync(dir)).toEqual(['out.bin']);
-  expect(stub.requests).toEqual([{}, {}]);
+  expect(stub.requests).toEqual([IDENTITY, IDENTITY]);
 });
 
 test('each retry first waits a uniform fraction of a doubling delay, capped at 2 s before the fraction is taken', async () => {
@@ -1778,7 +1799,10 @@ test('each retry first waits a uniform fraction of a doubling delay, capped at 2
   expect(err).toMatchObject({ code: 'asset_fetch_failed', status: 503 });
   expect((err as AudioVideoError).message).toContain('and 5 retries did not complete it.');
   // Every retry asks for the bytes after the seven already delivered.
-  expect(requests).toEqual([{}, ...Array.from({ length: 5 }, () => ({ Range: 'bytes=7-' }))]);
+  expect(requests).toEqual([
+    IDENTITY,
+    ...Array.from({ length: 5 }, () => ({ ...IDENTITY, Range: 'bytes=7-' })),
+  ]);
 });
 
 test('an abort during the backoff ends the wait at once, clearing its timer and every listener it added', async () => {

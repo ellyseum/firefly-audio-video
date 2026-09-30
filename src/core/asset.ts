@@ -20,10 +20,10 @@ import { delay, linkSignals } from './signals.js';
 /**
  * The subset of the global `fetch` function {@link Asset} needs: called with
  * a URL and an options object carrying a `signal` that aborts when the
- * caller's does — plus, on a request that resumes an interrupted download,
- * its `Range` and `If-Range` headers — and resolving with a `Response`.
- * Narrower than `typeof fetch` so a test can inject a stub matching this
- * exact shape.
+ * caller's does, and headers — `Accept-Encoding: identity` on every request,
+ * plus `Range` and `If-Range` on a request that resumes an interrupted
+ * download — and resolving with a `Response`. Narrower than `typeof fetch` so
+ * a test can inject a stub matching this exact shape.
  */
 type FetchLike = (
   url: string,
@@ -38,6 +38,13 @@ const RETRY_BACKOFF_BASE_MS = 250;
 
 /** The longest any retry waits, however many came before it. */
 const RETRY_BACKOFF_CAP_MS = 2_000;
+
+/**
+ * Sent on every download request, the first included: a proxy or CDN that
+ * compresses what it passes on would otherwise return a content-encoded body,
+ * which leaves no byte offset to resume from.
+ */
+const ACCEPT_IDENTITY: Readonly<Record<string, string>> = { 'Accept-Encoding': 'identity' };
 
 /** Why a content-encoded download cannot continue where it stopped. */
 const CONTENT_ENCODED =
@@ -443,12 +450,13 @@ export class Asset {
   }
 
   /**
-   * One fetch of the asset. The fetch gets a signal of its own that aborts
-   * when `signal` does, unhooked through the returned attempt's `release`:
-   * the platform fetch keeps a listener on whatever signal it is handed until
-   * that signal is garbage-collected, so handing it the caller's own would
-   * leave one behind on the caller's signal for every request a download
-   * makes. Rejects exactly as the fetch does.
+   * One fetch of the asset, asking for it unencoded ({@link ACCEPT_IDENTITY})
+   * and with any `headers` given. The fetch gets a signal of its own that
+   * aborts when `signal` does, unhooked through the returned attempt's
+   * `release`: the platform fetch keeps a listener on whatever signal it is
+   * handed until that signal is garbage-collected, so handing it the caller's
+   * own would leave one behind on the caller's signal for every request a
+   * download makes. Rejects exactly as the fetch does.
    */
   async #request(
     signal: AbortSignal | undefined,
@@ -456,8 +464,7 @@ export class Asset {
   ): Promise<Attempt> {
     const link = linkSignals(signal === undefined ? [] : [signal]);
     try {
-      const init =
-        headers === undefined ? { signal: link.signal } : { signal: link.signal, headers };
+      const init = { signal: link.signal, headers: { ...ACCEPT_IDENTITY, ...headers } };
       return { res: await this.#fetch(this.#url, init), release: link.release };
     } catch (err) {
       link.release();

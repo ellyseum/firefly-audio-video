@@ -76,6 +76,12 @@ credential or for use inside a library. Both take the credential as options (or
 `{ clientId, tokenProvider }` to supply tokens yourself); only the default client reads the
 environment. Every function takes `{ client }`, and a client has the same methods.
 
+A process that loads both this package's ESM and CommonJS build — an ESM application with a
+CommonJS dependency, say — shares one default client and one class identity between the two:
+`configure()` through either build is seen by both, and `instanceof AudioVideoError` (and every
+other exported class) holds for an instance either one made. That sharing is keyed by name, not by
+package version, so it is not a promise across two different installed versions of this package.
+
 ### Calls
 
 | Call                         | Resolves with                                                                         |
@@ -99,7 +105,10 @@ accepts the job, `meta` once the job ends, and `cancel()`. Their options:
 | `pollIntervalMs`        | Milliseconds between polls, or a function of the time elapsed. Defaults to 1 s for the first 30 s, 2 s until two minutes, then 5 s.  |
 | `resolveAs`, `savePath` | `render()` only: resolve with the output's `'url'`, `'buffer'`, `'stream'`, or `'file'` (the path saved to) instead of the `Asset`.  |
 
-`signal: AbortSignal.timeout(ms)` gives a render a deadline.
+`signal: AbortSignal.timeout(ms)` gives a render a deadline. With `resolveAs: 'stream'`, that link
+holds until the stream closes rather than only until the call settles: aborting `signal` or calling
+`cancel()` before the render resolves rejects it `cancelled`; doing either while the returned stream
+is still open instead makes the stream emit `'error'` with a `cancelled` error.
 
 ## Presets and encode
 
@@ -181,6 +190,11 @@ await render('./capsule.mogrt').prores4444xq.resize('9:16').save('./master.mov')
 const bytes = await render('./capsule.mogrt').hevc1080p10bit.bitrate('20M').buffer();
 ```
 
+The builder is the job: awaiting it, or calling any of `buffer()`, `stream()` or `save()`, starts one
+render that every consumer of that builder shares. Destroying a `.stream()` it returned while the
+render is still running cancels that shared render and aborts the download at once, rather than
+after the render finishes or the next chunk arrives.
+
 ## Storage
 
 DGR reads every input from a URL and writes every output to a presigned URL. A `StorageProvider`
@@ -200,9 +214,11 @@ is neither an http(s) URL nor an existing file rejects `invalid_argument`.
 | `S3StorageProvider`        | `credentials`, else the AWS SDK's default credential chain                                                                            | 1 to 604800 s              |
 | `AzureBlobStorageProvider` | a `connectionString` holding the account key, `accountName` with `accountKey`, or a `client` built with the shared key                | 1 to 604800 s              |
 
-Every provider defaults to one hour for a staged input and 24 hours for an output, and writes its
-keys under `firefly-audio-video/` unless `prefix` says otherwise. The SDK never deletes what it
-stages; expire that prefix with your store's lifecycle rules.
+Every provider defaults to 24 hours for both a staged input and an output — a staged input's URL is
+minted just before the submit, and a queued job has waited 45 minutes to start rendering before now,
+which left an hour-long URL little margin — and writes its keys under `firefly-audio-video/` unless
+`prefix` says otherwise. The SDK never deletes what it stages; expire that prefix with your store's
+lifecycle rules.
 
 **App Builder Files.** A client with no `storage` in an App Builder environment (`__OW_NAMESPACE`
 or `AIO_runtime_namespace` set) uses an `AioFilesStorageProvider` on its own. That provider imports
@@ -290,11 +306,15 @@ A job holds its slot from staging until it settles. Its uploads, generated `.epr
 allocations run once it is admitted, just before its submit, so a staged URL is fresh however long
 the job queued, and at most `concurrency` jobs hold upload bytes at once. A `resolveAs` download
 runs after the slot is released, and `status()`, `cancel()`, `listPresets()` and `stage()` take no
-slot.
+slot; `stage()` takes its own `signal`, aborting the upload, and an already-aborted one rejects
+without calling the storage provider.
 
 A `429` is retried with backoff, honoring `Retry-After` up to 60 s and otherwise exponential with
-jitter, up to `retry: { maxRetries }` times (default `5`). The pool counts per process: several
-processes sharing one credential coordinate through a `PoolBackend` of your own, passed as `pool`.
+jitter, up to `retry: { maxRetries }` times (default `5`). Cancelling while a submit is retrying
+rejects the call at once; its slot stays held until that submit has settled — at most the 30 s
+attempt timeout, never a further retry — and any cancel request has been sent, so a second call
+still respects `concurrency`. The pool counts per process: several processes sharing one credential
+coordinate through a `PoolBackend` of your own, passed as `pool`.
 
 ## Downloads
 
@@ -410,20 +430,23 @@ export async function renderOrReport(spec: RenderRequest) {
 | `job_failed`              | The job failed or reported errors; `.items` lists the errors per output.                                        |
 | `job_poll_failed`         | Five status polls in a row failed transiently. The job may still finish; its ID is on the error.                |
 | `cancelled`               | `cancel()`, an aborted `signal`, or the service cancelled the job.                                              |
+| `callback_failed`         | Your `onProgress` threw. A job still running is asked to stop; a finished job is not.                           |
 | `invalid_response`        | The service answered with something the SDK cannot use.                                                         |
 | `http_<status>`           | A non-2xx response left after retries, such as `http_404`; `.items` holds the redacted body.                    |
 | `request_timeout`         | One HTTP attempt ran past 30 seconds.                                                                           |
 | `request_failed`          | The request failed in transit: DNS, a refused or reset connection.                                              |
 | `storage_failed`          | A storage provider failed to load, upload or presign.                                                           |
 | `asset_fetch_failed`      | A download failed, could not resume, or ran out of retries.                                                     |
+| `save_failed`             | `asset.save()` hit a failed file-system step. The asset is intact: saving it again downloads it again.          |
 | `internal_error`          | An embedded `.epr` template lost its shape: a bug in this package.                                              |
 
 Errors are redacted when they are built. `.message`, `.items`, `toJSON()`, `toString()` and
 `console.log(error)` never carry a bearer token, an `x-api-key`, a presigned URL's signature (Azure
 SAS, AWS SigV4 and SigV2, Google Cloud Storage V4 and V2), a connection string's key, or a JWT.
 `.jobId` and `.requestId` stay as the service sent them. `.cause` holds the underlying error for
-inspection and is left out of every serialized form; it is kept as thrown when the official IMS
-token provider or a storage provider of your own threw it, so log the error rather than its cause.
+inspection and is left out of every serialized form; a storage provider's or the official IMS token
+provider's failure keeps a redacted copy there, not the object it threw, so log the error rather
+than its cause.
 
 ## CLI
 
@@ -463,7 +486,10 @@ only the result.
 Credentials come from `IMS_OAUTH_S2S_CLIENT_ID`, `IMS_OAUTH_S2S_CLIENT_SECRET` and
 `IMS_OAUTH_S2S_SCOPES`, in the environment or a `.env` in the working directory, or from
 `--client-id`, `--client-secret` and `--scope`. Prefer the environment: a value on the command line
-is visible to other processes on the machine.
+is visible to other processes on the machine. Surrounding whitespace is trimmed, so a trailing
+newline from an environment file is not part of the credential; whitespace or a control character
+anywhere else in a value is refused with `invalid_argument` without echoing it, and a scope list
+with spaces in it gets a hint to separate scopes with commas instead.
 
 `render`, `describe` and `stage` stage through `--storage <uri>`, or `DGR_STORAGE`:
 

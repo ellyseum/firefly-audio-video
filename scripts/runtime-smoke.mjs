@@ -15,10 +15,11 @@
  * fails legibly against a broken one).
  */
 
+import { Console } from 'node:console';
 import { createRequire } from 'node:module';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
-import { Readable } from 'node:stream';
+import { Readable, Writable } from 'node:stream';
 import { inspect } from 'node:util';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -27,6 +28,12 @@ const distDir = process.argv[2] ? resolve(process.argv[2]) : join(here, '..', 'd
 const FAKE_CLIENT_ID = 'runtime-smoke-client-id';
 const FAKE_CLIENT_SECRET = 'runtime-smoke-fake-secret-do-not-use';
 const FAKE_SIGNATURE = 'RUNTIME_SMOKE_SIGNATURE_MUST_NOT_LEAK';
+const FAKE_RUNTIME_AUTH = 'runtime-smoke-uuid:RUNTIME_SMOKE_RUNTIME_AUTH_MUST_NOT_PRINT';
+const FAKE_AWS_SECRET = 'RUNTIME_SMOKE_AWS_SECRET_KEY_MUST_NOT_PRINT';
+const FAKE_AWS_SESSION = 'RUNTIME_SMOKE_AWS_SESSION_TOKEN_MUST_NOT_PRINT';
+const FAKE_AZURE_KEY = Buffer.from('RUNTIME_SMOKE_AZURE_ACCOUNT_KEY_MUST_NOT_PRINT').toString(
+  'base64',
+);
 
 let failures = 0;
 
@@ -186,6 +193,33 @@ async function runBehaviourChecks(mod, label) {
     }
   });
 
+  await check(
+    `[${label}] no storage provider, nor a client using one, prints a credential it holds`,
+    () => {
+      if (!printedForms({ held: FAKE_AWS_SECRET }).includes(FAKE_AWS_SECRET)) {
+        throw new Error('the printed forms checked here do not show even a plain held value');
+      }
+      for (const { name, options, secrets } of STORAGE_PROVIDERS) {
+        const provider = new mod[name](options);
+        const client = mod.createClient({
+          clientId: FAKE_CLIENT_ID,
+          clientSecret: FAKE_CLIENT_SECRET,
+          logging: false,
+          storage: provider,
+        });
+        for (const [what, value] of [
+          ['provider', provider],
+          ['client', client],
+        ]) {
+          const printed = printedForms(value);
+          const shown = secrets.filter((secret) => printed.includes(secret)).length;
+          if (shown > 0)
+            throw new Error(`${name}: the ${what} printed ${shown} held credential(s)`);
+        }
+      }
+    },
+  );
+
   for (const { name, peer, options } of STORAGE_PROVIDERS) {
     // Where the peer is installed, using the provider would reach its real SDK; the
     // missing-peer path is exercised wherever it is not, as in the production-only install.
@@ -217,19 +251,53 @@ const STORAGE_PROVIDERS = [
   {
     name: 'AioFilesStorageProvider',
     peer: '@adobe/aio-lib-files',
-    options: { namespace: 'runtime-smoke-ns', auth: 'runtime-smoke-auth' },
+    options: { namespace: 'runtime-smoke-ns', auth: FAKE_RUNTIME_AUTH },
+    secrets: [FAKE_RUNTIME_AUTH],
   },
   {
     name: 'S3StorageProvider',
     peer: '@aws-sdk/client-s3',
-    options: { bucket: 'runtime-smoke-bucket', region: 'us-east-1' },
+    options: {
+      bucket: 'runtime-smoke-bucket',
+      region: 'us-east-1',
+      credentials: {
+        accessKeyId: 'RUNTIMESMOKEACCESSKEYID',
+        secretAccessKey: FAKE_AWS_SECRET,
+        sessionToken: FAKE_AWS_SESSION,
+      },
+    },
+    secrets: ['RUNTIMESMOKEACCESSKEYID', FAKE_AWS_SECRET, FAKE_AWS_SESSION],
   },
   {
     name: 'AzureBlobStorageProvider',
     peer: '@azure/storage-blob',
-    options: { container: 'runtime-smoke', connectionString: 'UseDevelopmentStorage=true' },
+    options: {
+      container: 'runtime-smoke',
+      accountName: 'runtimesmoke',
+      accountKey: FAKE_AZURE_KEY,
+    },
+    secrets: [FAKE_AZURE_KEY],
   },
 ];
+
+/** Every common printed form of a value: `inspect`, `String`, `JSON.stringify`, a spread copy, and what `console.log` writes. */
+function printedForms(value) {
+  const written = [];
+  const sink = new Writable({
+    write(chunk, _encoding, done) {
+      written.push(String(chunk));
+      done();
+    },
+  });
+  new Console({ stdout: sink, stderr: sink }).log(value);
+  return [
+    inspect(value, { depth: 10, showHidden: true }),
+    String(value),
+    JSON.stringify(value),
+    inspect({ ...value }, { depth: 10 }),
+    ...written,
+  ].join('\n');
+}
 
 /** True when `name` resolves from the package being tested — an optional peer that is installed. */
 function resolvableFromDist(name) {

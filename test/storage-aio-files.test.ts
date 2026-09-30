@@ -1,7 +1,8 @@
+import { Console } from 'node:console';
 import { mkdtempSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Readable } from 'node:stream';
+import { Readable, Writable } from 'node:stream';
 import { inspect } from 'node:util';
 import type { Files, init as realInit } from '@adobe/aio-lib-files';
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
@@ -463,9 +464,35 @@ test('a missing @adobe/aio-lib-files rejects missing_peer_dependency naming the 
   expect(error.message).toContain('pass the module as the module option instead');
 });
 
-test('the auth key never appears in how the provider prints', () => {
+/** Every common printed form of a value: `inspect`, `String`, `JSON.stringify`, a spread copy, and what `console.log` writes. */
+function printedForms(value: object): string {
+  const written: string[] = [];
+  const sink = new Writable({
+    write(chunk, _encoding, done) {
+      written.push(String(chunk));
+      done();
+    },
+  });
+  new Console({ stdout: sink, stderr: sink }).log(value);
+  return [
+    inspect(value, { depth: 10, showHidden: true }),
+    String(value),
+    JSON.stringify(value),
+    inspect({ ...value }, { depth: 10 }),
+    ...written,
+  ].join('\n');
+}
+
+test('no printed form of the provider, or of a client using it, shows the auth key', () => {
+  expect(printedForms({ held: AUTH })).toContain('RUNTIME_AUTH_SECRET_VALUE');
   const provider = new AioFilesStorageProvider({ namespace: 'ns', auth: AUTH });
-  expect(`${inspect(provider, { depth: 5 })}\n${JSON.stringify(provider)}`).not.toContain(
+  const client = createClient({
+    clientId: 'id',
+    clientSecret: 'secret',
+    logging: false,
+    storage: provider,
+  });
+  expect(`${printedForms(provider)}\n${printedForms(client)}`).not.toContain(
     'RUNTIME_AUTH_SECRET_VALUE',
   );
 });

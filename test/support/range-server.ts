@@ -9,10 +9,11 @@ export interface Resource {
   lastModified?: string;
 }
 
-/** The range headers one request carried. */
+/** The range and encoding headers one request carried. */
 export interface SeenRequest {
   range: string | undefined;
   ifRange: string | undefined;
+  acceptEncoding: string | undefined;
 }
 
 /**
@@ -74,7 +75,11 @@ export async function startRangeServer(options: RangeServerOptions): Promise<Ran
 
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const index = requests.length;
-    requests.push({ range: header(req, 'range'), ifRange: header(req, 'if-range') });
+    requests.push({
+      range: header(req, 'range'),
+      ifRange: header(req, 'if-range'),
+      acceptEncoding: header(req, 'accept-encoding'),
+    });
     const resource = resourceAt(index);
     const handling = options.handle?.(index) ?? {};
     const answer = plan(resource, req, handling);

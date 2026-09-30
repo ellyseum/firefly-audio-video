@@ -1,4 +1,13 @@
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import type { FileHandle } from 'node:fs/promises';
 import { Console } from 'node:console';
 import { getEventListeners } from 'node:events';
 import { tmpdir } from 'node:os';
@@ -22,6 +31,21 @@ import {
   type Resource,
   type SeenRequest,
 } from './support/range-server.js';
+
+/** Every file handle opened through `node:fs/promises` during the current test, so a test can check each was closed. */
+const openedFiles = vi.hoisted((): FileHandle[] => []);
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    open: async (...args: Parameters<typeof actual.open>): Promise<FileHandle> => {
+      const handle = await actual.open(...args);
+      openedFiles.push(handle);
+      return handle;
+    },
+  };
+});
 
 const SAS_URL =
   'https://x.blob.core.windows.net/out.mov?sv=2021&sig=SUPER_SECRET&se=2026&rest=keep';
@@ -51,6 +75,7 @@ beforeEach(() => {
   // The backoff schedule itself has its own test, and a test that needs a
   // real wait draws its own fraction.
   vi.spyOn(Math, 'random').mockReturnValue(0);
+  openedFiles.splice(0);
 });
 
 afterEach(async () => {
@@ -110,12 +135,25 @@ function multiChunkBody(chunks: readonly Uint8Array[]): ReadableStream<Uint8Arra
   });
 }
 
-/** A `ReadableStream` that enqueues each of `chunks`, then errors instead of closing — a mid-download reset. */
+/**
+ * A `ReadableStream` that delivers each of `chunks`, then errors instead of
+ * closing — a mid-download reset. The error waits until the reader has taken
+ * every chunk and asked for more, then one turn of the event loop longer: an
+ * error raised any sooner discards the chunks still queued, and none of them
+ * would reach the reader.
+ */
 function resettingBody(chunks: readonly Uint8Array[], error: Error): ReadableStream<Uint8Array> {
+  const pending = [...chunks];
   return new ReadableStream<Uint8Array>({
-    start(controller) {
-      for (const chunk of chunks) controller.enqueue(chunk);
-      controller.error(error);
+    pull(controller) {
+      const chunk = pending.shift();
+      if (chunk !== undefined) {
+        controller.enqueue(chunk);
+        return undefined;
+      }
+      return new Promise<void>((resolve) => setImmediate(resolve)).then(() =>
+        controller.error(error),
+      );
     },
   });
 }
@@ -407,13 +445,18 @@ test('a non-2xx response makes save() reject with the same AudioVideoError, leav
   const asset = new Asset({
     url: 'https://x/out.bin',
     meta: sampleMeta(),
-    fetch: async () => fakeResponse('forbidden', 403),
+    fetch: async () => fakeResponse('not found', 404),
   });
 
   const dir = tempDir();
   const path = join(dir, 'out.bin');
 
-  await expect(asset.save(path)).rejects.toMatchObject({ code: 'asset_fetch_failed' });
+  const err = (await asset.save(path).catch((e: unknown) => e)) as AudioVideoError;
+  expect(err).toBeInstanceOf(AudioVideoError);
+  expect(err.code).toBe('asset_fetch_failed');
+  expect(err.status).toBe(404);
+  // Nothing was interrupted: the first request itself failed.
+  expect(err.message).toMatch(/failed with status 404\.$/);
   expect(existsSync(path)).toBe(false);
   expect(readdirSync(dir)).toEqual([]);
 });
@@ -1030,6 +1073,11 @@ async function readFailure(
   return err as AudioVideoError;
 }
 
+/** TCP connections open in this process, client and server ends alike. */
+function openSockets(): number {
+  return process.getActiveResourcesInfo().filter((type) => type === 'TCPSocketWrap').length;
+}
+
 /** Resolves once `predicate()` holds, polling every few milliseconds of real time. */
 async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -1042,7 +1090,9 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
 test.each<Accessor>(['stream', 'save', 'buffer'])(
   '%s() resumes a download cut mid-body with Range and If-Range, and the bytes match exactly',
   async (accessor) => {
-    const server = await cutOnce(V1);
+    // Served with both validators, as Azure Blob and S3 serve every GET: If-Range
+    // carries the strong ETag, never the date.
+    const server = await cutOnce({ ...V1, lastModified: LAST_MODIFIED });
     const asset = new Asset({ url: server.url, meta: sampleMeta() });
 
     const bytes = await readThrough(asset, accessor);
@@ -1050,7 +1100,13 @@ test.each<Accessor>(['stream', 'save', 'buffer'])(
     expect(sha256(bytes)).toBe(sha256(BODY));
     expect(server.cuts()).toBe(1);
     expect(server.requests).toHaveLength(2);
-    expect(server.requests[0]).toEqual({ range: undefined, ifRange: undefined });
+    // The first request asks for the asset unencoded too, so no proxy between
+    // hands back a compressed body that a Range could not address.
+    expect(server.requests[0]).toEqual({
+      range: undefined,
+      ifRange: undefined,
+      acceptEncoding: 'identity',
+    });
     expectResumption(server.requests[1], CUT, '"v1"');
   },
 );
@@ -1200,7 +1256,11 @@ test('a 206 whose Content-Range does not continue at the offset makes save() sta
   expect(sha256(bytes)).toBe(sha256(BODY));
   expect(server.requests).toHaveLength(3);
   expectResumption(server.requests[1], CUT, '"v1"');
-  expect(server.requests[2]).toEqual({ range: undefined, ifRange: undefined });
+  expect(server.requests[2]).toEqual({
+    range: undefined,
+    ifRange: undefined,
+    acceptEncoding: 'identity',
+  });
 });
 
 test('an asset replaced between attempts: If-Range brings the new version whole, and save() keeps exactly that', async () => {
@@ -1248,7 +1308,11 @@ test('a 416 on the resumption: stream() rejects with its status, save() starts o
   expect(sha256(bytes)).toBe(sha256(BODY));
   expect(restarting.requests).toHaveLength(3);
   expectResumption(restarting.requests[1], CUT, '"v1"');
-  expect(restarting.requests[2]).toEqual({ range: undefined, ifRange: undefined });
+  expect(restarting.requests[2]).toEqual({
+    range: undefined,
+    ifRange: undefined,
+    acceptEncoding: 'identity',
+  });
 });
 
 test('a 403 on the resumption fails the download at once, with retries still unspent', async () => {
@@ -1323,6 +1387,37 @@ test('an abort during the backoff makes save() reject cancelled, sending no furt
   expect(getEventListeners(controller.signal, 'abort')).toEqual([]);
 });
 
+test('destroying stream() during a backoff ends the download: no further request, no timer, no open connection', async () => {
+  vi.spyOn(Math, 'random').mockReturnValue(0.999); // the first retry waits just under 250 ms
+  const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+  const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout');
+  // The backoff's timer, set for 0.999 × 250 ms; undici's own timers use other delays.
+  const backoffTimer = (): NodeJS.Timeout | undefined => {
+    const index = setTimeoutSpy.mock.calls.findIndex(
+      ([, ms]) => Math.abs((ms ?? 0) - 249.75) < 0.01,
+    );
+    return index === -1 ? undefined : (setTimeoutSpy.mock.results[index]?.value as NodeJS.Timeout);
+  };
+  const timers = (): number =>
+    process.getActiveResourcesInfo().filter((type) => type === 'Timeout').length;
+  const server = await cutOnce(V1);
+  const asset = new Asset({ url: server.url, meta: sampleMeta() });
+  const idleTimers = timers();
+
+  const stream = asset.stream();
+  const closed = new Promise<void>((resolve) => stream.once('close', resolve));
+  stream.resume();
+  await waitFor(() => server.cuts() === 1 && backoffTimer() !== undefined);
+  stream.destroy();
+  await closed;
+
+  expect(clearTimeoutSpy).toHaveBeenCalledWith(backoffTimer());
+  expect(timers()).toBeLessThanOrEqual(idleTimers);
+  await new Promise((resolve) => setTimeout(resolve, 250 + 2_000));
+  expect(server.requests).toHaveLength(1);
+  await server.idle();
+}, 10_000);
+
 test("no abort listener is left on the caller's signal, whether the download resumed or could not", async () => {
   const controller = new AbortController();
 
@@ -1330,11 +1425,16 @@ test("no abort listener is left on the caller's signal, whether the download res
   await new Asset({ url: resuming.url, meta: sampleMeta() }).buffer({ signal: controller.signal });
   expect(getEventListeners(controller.signal, 'abort')).toEqual([]);
 
-  const refusing = await cutOnce(V1, () => ({ ignoreRange: true }));
-  await readFailure(new Asset({ url: refusing.url, meta: sampleMeta() }), 'stream', {
-    signal: controller.signal,
-  });
-  expect(getEventListeners(controller.signal, 'abort')).toEqual([]);
+  // A refused resumption's response is discarded. stream() reaches the caller's
+  // signal through one link of its own, so buffer() is where a request's link
+  // left behind by that discard would show.
+  for (const accessor of ['stream', 'buffer'] as const) {
+    const refusing = await cutOnce(V1, () => ({ ignoreRange: true }));
+    await readFailure(new Asset({ url: refusing.url, meta: sampleMeta() }), accessor, {
+      signal: controller.signal,
+    });
+    expect(getEventListeners(controller.signal, 'abort'), accessor).toEqual([]);
+  }
 
   const exhausted = await rangeServer({ resource: V1, handle: () => ({ cutAfter: 10_000 }) });
   await readFailure(new Asset({ url: exhausted.url, meta: sampleMeta() }), 'save', {
@@ -1370,7 +1470,101 @@ test('every response a failed download received is read or cancelled, and its co
   await server.idle();
 });
 
+test('a save() that fails on the disk side lets go of the download: no abort listener, no open connection, no temp file', async () => {
+  const server = await rangeServer({ resource: V1 });
+  const asset = new Asset({ url: server.url, meta: sampleMeta() });
+  const dir = tempDir();
+  // A file where the destination's directory would have to be created.
+  writeFileSync(join(dir, 'blocker'), 'not a directory');
+  const controller = new AbortController();
+  const sockets = openSockets();
+
+  const err = await asset
+    .save(join(dir, 'blocker', 'out.bin'), { signal: controller.signal })
+    .catch((e: unknown) => e);
+
+  expect(err).toBeInstanceOf(AudioVideoError);
+  expect((err as AudioVideoError).code).toBe('asset_fetch_failed');
+  expect(getEventListeners(controller.signal, 'abort')).toEqual([]);
+  await server.idle();
+  // The server closes its end once the whole body is written, so the client's
+  // end is where a body left unreleased would keep the connection open.
+  await waitFor(() => openSockets() <= sockets).catch(() => undefined);
+  expect(openSockets(), 'TCP connections still open').toBeLessThanOrEqual(sockets);
+  expect(readdirSync(dir)).toEqual(['blocker']);
+});
+
+test.each<[string, (dir: string) => string, string[]]>([
+  [
+    'creating its directory',
+    (dir) => {
+      writeFileSync(join(dir, 'blocker'), 'not a directory');
+      return join(dir, 'blocker', 'out.bin');
+    },
+    ['blocker'],
+  ],
+  [
+    'moving its temporary file into place',
+    (dir) => {
+      mkdirSync(join(dir, 'out.bin'));
+      return join(dir, 'out.bin');
+    },
+    ['out.bin'],
+  ],
+])(
+  'a save() that fails while %s says so, naming the destination and no other path',
+  async (step, prepare, left) => {
+    const server = await rangeServer({ resource: V1 });
+    const asset = new Asset({ url: server.url, meta: sampleMeta() });
+    const dir = tempDir();
+    const path = prepare(dir);
+
+    const err = (await asset.save(path).catch((e: unknown) => e)) as AudioVideoError;
+
+    expect(err).toBeInstanceOf(AudioVideoError);
+    expect(err.code).toBe('asset_fetch_failed');
+    expect(err.message).toMatch(/^Saving the asset at http:\/\/127\.0\.0\.1:\d+\/out\.mov/);
+    expect(err.message.endsWith(` to ${path} failed while ${step}.`)).toBe(true);
+    expect(err.message).not.toContain('.partial');
+    // The file system's own error, which may name the temp file, is the cause.
+    expect(err.cause).toBeInstanceOf(Error);
+    expect(typeof (err.cause as Error & { code?: unknown }).code).toBe('string');
+    expect(readdirSync(dir)).toEqual(left);
+  },
+);
+
+test.each<[string, RangeServerOptions, 'saved' | 'failed', number]>([
+  ['completes', { resource: V1 }, 'saved', 1],
+  ['runs out of retries', { resource: V1, handle: () => ({ cutAfter: 10_000 }) }, 'failed', 1],
+  [
+    'starts over from byte zero',
+    { resource: V1, handle: (i) => (i === 0 ? { cutAfter: CUT } : { ignoreRange: true }) },
+    'saved',
+    2,
+  ],
+])(
+  'every temp file save() opens is closed again when the download %s',
+  async (_case, options, outcome, opens) => {
+    const server = await rangeServer(options);
+    const asset = new Asset({ url: server.url, meta: sampleMeta() });
+
+    const result = await asset.save(join(tempDir(), 'out.bin')).then(
+      () => 'saved',
+      () => 'failed',
+    );
+
+    expect(result).toBe(outcome);
+    expect(openedFiles).toHaveLength(opens);
+    for (const [index, handle] of openedFiles.entries()) {
+      expect(handle.fd, `temp file ${index} is closed`).toBe(-1);
+    }
+  },
+);
+
 // --- resumable downloads, through a stubbed fetch -----------------------------------------
+
+/** The header every download request carries. */
+const IDENTITY = { 'Accept-Encoding': 'identity' };
 
 test('a body that ends cleanly but short of its Content-Length resumes like a cut', async () => {
   const requests: Array<Record<string, string>> = [];
@@ -1394,8 +1588,168 @@ test('a body that ends cleanly but short of its Content-Length resumes like a cu
   const bytes = await asset.buffer();
 
   expect(sha256(bytes)).toBe(sha256(BODY));
-  expect(requests).toEqual([{}, { Range: 'bytes=1000-', 'If-Range': '"v1"' }]);
+  expect(requests).toEqual([IDENTITY, { ...IDENTITY, Range: 'bytes=1000-', 'If-Range': '"v1"' }]);
 });
+
+test.each<Accessor>(['stream', 'save', 'buffer'])(
+  'a body cut before its first byte makes %s() start over with a plain request',
+  async (accessor) => {
+    const requests: Array<Record<string, string>> = [];
+    const asset = new Asset({
+      url: 'https://x/out.bin',
+      meta: sampleMeta(),
+      fetch: async (_url, init) => {
+        requests.push(init?.headers ?? {});
+        return requests.length === 1
+          ? new Response(resettingBody([], new Error('reset')), { headers: { etag: '"v1"' } })
+          : fakeResponse(BODY);
+      },
+    });
+
+    const bytes = await readThrough(asset, accessor);
+
+    expect(sha256(bytes)).toBe(sha256(BODY));
+    // With nothing delivered there is no offset to resume from.
+    expect(requests).toEqual([IDENTITY, IDENTITY]);
+  },
+);
+
+test('a cut after save() starts over resumes the new version from its own offset, conditional on its own ETag', async () => {
+  // V1 is cut after firstCut bytes; the resumption's If-Range no longer
+  // matches, so the answer is 200 with V2, and that response is cut in turn.
+  const firstCut = 60_000;
+  const restartCut = 40_000;
+  const requests: Array<Record<string, string>> = [];
+  const asset = new Asset({
+    url: 'https://x/out.bin',
+    meta: sampleMeta(),
+    fetch: async (_url, init) => {
+      const headers = init?.headers ?? {};
+      requests.push(headers);
+      if (requests.length === 1) {
+        return new Response(resettingBody([V1.body.subarray(0, firstCut)], new Error('reset')), {
+          headers: { 'content-length': String(V1.body.length), etag: '"v1"' },
+        });
+      }
+      if (requests.length === 2) {
+        return new Response(resettingBody([V2.body.subarray(0, restartCut)], new Error('reset')), {
+          headers: { 'content-length': String(V2.body.length), etag: '"v2"' },
+        });
+      }
+      const start = rangeOffset(headers.Range);
+      return new Response(V2.body.subarray(start), {
+        status: 206,
+        headers: {
+          'content-range': `bytes ${start}-${V2.body.length - 1}/${V2.body.length}`,
+          etag: '"v2"',
+        },
+      });
+    },
+  });
+
+  // readThrough also checks that only the destination is left in its directory.
+  const bytes = await readThrough(asset, 'save');
+
+  expect(sha256(bytes)).toBe(sha256(V2.body));
+  expect(requests).toEqual([
+    IDENTITY,
+    { ...IDENTITY, Range: `bytes=${firstCut}-`, 'If-Range': '"v1"' },
+    // Counted from V2's first byte, not from where V1 stopped.
+    { ...IDENTITY, Range: `bytes=${restartCut}-`, 'If-Range': '"v2"' },
+  ]);
+});
+
+/**
+ * An asset whose first response delivers the first `delivered` bytes of
+ * `full` and then resets — reporting `full`'s length only when `reportLength`
+ * is set — whose resumption gets a `416` giving `completeLength` as the
+ * complete length, and whose later plain requests get the whole of `full`.
+ * Records each request's headers.
+ */
+function resetThen416(options: {
+  full: Buffer;
+  delivered: number;
+  reportLength: boolean;
+  completeLength: number;
+}): { asset: Asset; requests: Array<Record<string, string>> } {
+  const { full, delivered, reportLength, completeLength } = options;
+  const requests: Array<Record<string, string>> = [];
+  const asset = new Asset({
+    url: 'https://x/out.bin',
+    meta: sampleMeta(),
+    fetch: async (_url, init) => {
+      const headers = init?.headers ?? {};
+      requests.push(headers);
+      if (requests.length === 1) {
+        const length = reportLength ? { 'content-length': String(full.length) } : {};
+        return new Response(resettingBody([full.subarray(0, delivered)], new Error('reset')), {
+          headers: { ...length, etag: '"v1"' },
+        });
+      }
+      if (headers.Range !== undefined) {
+        return new Response(null, {
+          status: 416,
+          headers: { 'content-range': `bytes */${completeLength}` },
+        });
+      }
+      return new Response(full, { headers: { etag: '"v1"' } });
+    },
+  });
+  return { asset, requests };
+}
+
+test.each<Accessor>(['stream', 'save', 'buffer'])(
+  'a 416 giving exactly the length already delivered completes %s() without downloading again',
+  async (accessor) => {
+    // Every byte arrives, then the connection resets before the body's end is seen.
+    const full = BODY.subarray(0, 1_000);
+    const { asset, requests } = resetThen416({
+      full,
+      delivered: 1_000,
+      reportLength: true,
+      completeLength: 1_000,
+    });
+
+    const bytes = await readThrough(asset, accessor);
+
+    expect(sha256(bytes)).toBe(sha256(full));
+    expect(requests).toEqual([IDENTITY, { ...IDENTITY, Range: 'bytes=1000-', 'If-Range': '"v1"' }]);
+  },
+);
+
+test.each([
+  [
+    'no length was known before it',
+    { full: BODY.subarray(0, 1_000), reportLength: false, completeLength: 1_000 },
+  ],
+  [
+    'its length differs from the one the first response reported',
+    { full: BODY.subarray(0, 2_000), reportLength: true, completeLength: 1_000 },
+  ],
+  [
+    'its length differs from the bytes delivered',
+    { full: BODY.subarray(0, 2_000), reportLength: true, completeLength: 2_000 },
+  ],
+])(
+  'a 416 proves nothing when %s: buffer() rejects and save() starts over, as for any other 416',
+  async (_case, options) => {
+    const refused = resetThen416({ ...options, delivered: 1_000 });
+    const err = await readFailure(refused.asset, 'buffer');
+    expect(err.code).toBe('asset_fetch_failed');
+    expect(err.status).toBe(416);
+    expect(err.message).toContain('could not be resumed, because the server answered 416');
+    expect(refused.requests).toHaveLength(2);
+
+    const restarted = resetThen416({ ...options, delivered: 1_000 });
+    const bytes = await readThrough(restarted.asset, 'save');
+    expect(sha256(bytes)).toBe(sha256(options.full));
+    expect(restarted.requests).toEqual([
+      IDENTITY,
+      { ...IDENTITY, Range: 'bytes=1000-', 'If-Range': '"v1"' },
+      IDENTITY,
+    ]);
+  },
+);
 
 /**
  * A fetch stub whose first response is a content-encoded body that is cut off
@@ -1440,7 +1794,7 @@ test('a content-encoded body is never resumed by byte offset: stream() rejects w
   expect(err.code).toBe('asset_fetch_failed');
   expect(err.message).toContain('could not be resumed');
   expect(err.message).toContain('content-encoded');
-  expect(stub.requests).toEqual([{}]);
+  expect(stub.requests).toEqual([IDENTITY]);
 });
 
 test('a content-encoded body is never resumed by byte offset: save() starts over with a plain request', async () => {
@@ -1462,20 +1816,20 @@ test('a content-encoded body is never resumed by byte offset: save() starts over
 
   expect(sha256(readFileSync(path))).toBe(sha256(BODY));
   expect(readdirSync(dir)).toEqual(['out.bin']);
-  expect(stub.requests).toEqual([{}, {}]);
+  expect(stub.requests).toEqual([IDENTITY, IDENTITY]);
 });
 
 test('each retry first waits a uniform fraction of a doubling delay, capped at 2 s before the fraction is taken', async () => {
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
   const random = vi.spyOn(Math, 'random');
   for (const fraction of [0.5, 0.5, 0.5, 0.5, 0.999]) random.mockReturnValueOnce(fraction);
-  let requests = 0;
+  const requests: Array<Record<string, string>> = [];
   const asset = new Asset({
     url: 'https://x/out.bin',
     meta: sampleMeta(),
-    fetch: async () => {
-      requests += 1;
-      return requests === 1
+    fetch: async (_url, init) => {
+      requests.push(init?.headers ?? {});
+      return requests.length === 1
         ? fakeResponse(resettingBody([Buffer.from('partial')], new Error('reset')))
         : fakeResponse('busy', 503);
     },
@@ -1486,16 +1840,21 @@ test('each retry first waits a uniform fraction of a doubling delay, capped at 2
   // min(2 s, 250 ms × 2^(retry − 1)) × the fraction drawn for that retry.
   for (const delayMs of [125, 250, 500, 1_000, 1_998]) {
     await until(() => vi.getTimerCount() === 1);
-    const before = requests;
+    const before = requests.length;
     await vi.advanceTimersByTimeAsync(delayMs - 1);
     await flush();
-    expect(requests, `no request before ${delayMs} ms`).toBe(before);
+    expect(requests.length, `no request before ${delayMs} ms`).toBe(before);
     await vi.advanceTimersByTimeAsync(1);
-    await until(() => requests === before + 1);
+    await until(() => requests.length === before + 1);
   }
   const err = await reading;
   expect(err).toMatchObject({ code: 'asset_fetch_failed', status: 503 });
   expect((err as AudioVideoError).message).toContain('and 5 retries did not complete it.');
+  // Every retry asks for the bytes after the seven already delivered.
+  expect(requests).toEqual([
+    IDENTITY,
+    ...Array.from({ length: 5 }, () => ({ ...IDENTITY, Range: 'bytes=7-' })),
+  ]);
 });
 
 test('an abort during the backoff ends the wait at once, clearing its timer and every listener it added', async () => {
@@ -1529,6 +1888,78 @@ test('an abort during the backoff ends the wait at once, clearing its timer and 
   expect(vi.getTimerCount()).toBe(0);
   expect(getEventListeners(controller.signal, 'abort')).toEqual([]);
   expect(requests).toBe(1);
+});
+
+test.each<Accessor>(['stream', 'save', 'buffer'])(
+  "an abort while a re-request's headers are pending ends %s() cancelled, even on its last retry",
+  async (accessor) => {
+    const controller = new AbortController();
+    let requests = 0;
+    const asset = new Asset({
+      url: 'https://x/out.bin',
+      meta: sampleMeta(),
+      fetch: (_url, init) => {
+        requests += 1;
+        if (requests === 1) {
+          return Promise.resolve(
+            fakeResponse(resettingBody([Buffer.from('partial')], new Error('reset'))),
+          );
+        }
+        // A re-request whose response never arrives: it settles only through its signal.
+        return new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          signal?.addEventListener('abort', () => reject(signal.reason as Error), { once: true });
+          controller.abort(new Error('stop the download'));
+        });
+      },
+    });
+
+    // With one retry, an abort counted as a failed attempt would end the
+    // download as out of retries instead.
+    const err = await readFailure(asset, accessor, { signal: controller.signal, retries: 1 });
+
+    expect(err.code).toBe('cancelled');
+    expect(requests).toBe(2);
+  },
+);
+
+test('destroying stream() while a re-request is pending aborts that request', async () => {
+  let requests = 0;
+  let pending: AbortSignal | undefined;
+  const asset = new Asset({
+    url: 'https://x/out.bin',
+    meta: sampleMeta(),
+    fetch: (_url, init) => {
+      requests += 1;
+      if (requests === 1) {
+        return Promise.resolve(
+          fakeResponse(resettingBody([Buffer.from('partial')], new Error('reset'))),
+        );
+      }
+      // A re-request whose response never arrives: it settles only through its signal.
+      pending = init?.signal;
+      return new Promise<Response>((_resolve, reject) => {
+        pending?.addEventListener('abort', () => reject(pending?.reason as Error), { once: true });
+      });
+    },
+  });
+
+  const stream = asset.stream();
+  const closed = new Promise<void>((resolve) => stream.once('close', resolve));
+  stream.resume();
+  await waitFor(() => requests === 2);
+  stream.destroy();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    closed,
+    new Promise((resolve) => {
+      timer = setTimeout(resolve, 1_000);
+    }),
+  ]);
+  clearTimeout(timer);
+
+  expect(pending?.aborted).toBe(true);
+  expect(requests).toBe(2);
 });
 
 test.each([-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, '3'])(

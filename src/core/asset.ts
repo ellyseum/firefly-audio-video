@@ -20,10 +20,10 @@ import { delay, linkSignals } from './signals.js';
 /**
  * The subset of the global `fetch` function {@link Asset} needs: called with
  * a URL and an options object carrying a `signal` that aborts when the
- * caller's does — plus, on a request that resumes an interrupted download,
- * its `Range` and `If-Range` headers — and resolving with a `Response`.
- * Narrower than `typeof fetch` so a test can inject a stub matching this
- * exact shape.
+ * caller's does, and headers — `Accept-Encoding: identity` on every request,
+ * plus `Range` and `If-Range` on a request that resumes an interrupted
+ * download — and resolving with a `Response`. Narrower than `typeof fetch` so
+ * a test can inject a stub matching this exact shape.
  */
 type FetchLike = (
   url: string,
@@ -38,6 +38,13 @@ const RETRY_BACKOFF_BASE_MS = 250;
 
 /** The longest any retry waits, however many came before it. */
 const RETRY_BACKOFF_CAP_MS = 2_000;
+
+/**
+ * Sent on every download request, the first included: a proxy or CDN that
+ * compresses what it passes on would otherwise return a content-encoded body,
+ * which leaves no byte offset to resume from.
+ */
+const ACCEPT_IDENTITY: Readonly<Record<string, string>> = { 'Accept-Encoding': 'identity' };
 
 /** Why a content-encoded download cannot continue where it stopped. */
 const CONTENT_ENCODED =
@@ -72,12 +79,28 @@ export interface AssetReadOptions {
    * waits a short jittered backoff (never more than two seconds), then asks
    * for the bytes still missing with `Range: bytes=<received>-`, made
    * conditional by `If-Range` on the asset being unchanged (its `ETag`, else
-   * its `Last-Modified`). Only a `206` whose `Content-Range` starts exactly
-   * where the download stopped is appended; {@link Asset.stream} and
-   * {@link Asset.save} describe what happens when the server cannot resume. A
-   * status on a retry other than `408`, `429` or a `5xx` fails the download at
-   * once. Defaults to `3`; `0` turns resuming off, so the first interruption
-   * fails the download.
+   * its `Last-Modified`). What the answer to a retry does:
+   *
+   * - A `206` whose `Content-Range` starts exactly where the download stopped,
+   *   and whose total length and validator do not contradict what the
+   *   download already knew, is appended and the download goes on.
+   * - A `416` whose `Content-Range` gives as the complete length both the
+   *   total an earlier response reported and the bytes already delivered
+   *   means nothing is missing: every accessor finishes normally.
+   * - A `200` (the whole asset: it changed, or the server ignores ranges),
+   *   another `2xx`, any other `416`, or a `206` that does not continue where
+   *   the download stopped means the server cannot resume.
+   *   {@link Asset.save} starts over from byte zero in a fresh temp file,
+   *   within the same retry budget: from the `200`'s own body, or with a
+   *   fresh request. {@link Asset.stream} and {@link Asset.buffer} fail with
+   *   `asset_fetch_failed`, since the bytes they have already delivered
+   *   cannot be taken back.
+   * - After a `408`, `429` or `5xx`, the same request is made again after the
+   *   next backoff, spending another retry.
+   * - Any other status fails the download at once, with that status.
+   *
+   * Defaults to `3`; `0` turns resuming off, so the first interruption fails
+   * the download.
    */
   retries?: number;
 }
@@ -177,16 +200,20 @@ export class Asset {
    * fetch failure — a non-2xx response, a malformed URL, a DNS failure, an
    * abort — surfaces as an `'error'` event carrying the same
    * {@link AudioVideoError} {@link Asset.buffer} would throw, never as an
-   * unhandled rejection.
+   * unhandled rejection. Destroying the stream — directly, or through
+   * `pipeline()` when the destination fails — ends the download at once: a
+   * request in flight is aborted, a wait before a retry is cut short, and no
+   * further request is made.
    *
    * Range-backed: a body cut off mid-transfer continues from the next byte as
    * {@link AssetReadOptions.retries} describes, so the reader sees one
    * unbroken byte sequence. Bytes already emitted cannot be taken back, so a
    * server that cannot resume — it answers the `Range` request with `200`
-   * (the asset changed, or it ignores ranges), with `416`, or with a
-   * `Content-Range` that does not continue where the stream stopped — ends the
-   * stream with an `asset_fetch_failed` error saying the download could not be
-   * resumed, rather than repeating bytes from the start.
+   * (the asset changed, or it ignores ranges), with a `416` that does not show
+   * the download already complete, or with a `Content-Range` that does not
+   * continue where the stream stopped — ends the stream with an
+   * `asset_fetch_failed` error saying the download could not be resumed,
+   * rather than repeating bytes from the start.
    *
    * @param options - See {@link AssetReadOptions}.
    * @returns A readable byte stream over the asset's bytes.
@@ -194,7 +221,24 @@ export class Asset {
    *   when `options.retries` is not a non-negative integer.
    */
   stream(options: AssetReadOptions = {}): Readable {
-    return Readable.from(this.#download(readPlan(options)), { objectMode: false });
+    const plan = readPlan(options);
+    const destroyed = new AbortController();
+    const link = linkSignals(
+      plan.signal === undefined ? [destroyed.signal] : [plan.signal, destroyed.signal],
+    );
+    const bytes = Readable.from(this.#download({ ...plan, signal: link.signal }), {
+      objectMode: false,
+    });
+    // Readable.from's own destroy asks the generator to return, which takes
+    // effect only at its next yield: after a backoff, and after the request
+    // that follows it. Aborting the download here ends either at once.
+    const destroyDownload = bytes._destroy.bind(bytes);
+    bytes._destroy = (error, callback) => {
+      destroyed.abort(error ?? new Error('The stream was destroyed.'));
+      destroyDownload(error, callback);
+    };
+    bytes.once('close', link.release);
+    return bytes;
   }
 
   /**
@@ -212,12 +256,22 @@ export class Asset {
    *
    * A body cut off mid-transfer resumes as {@link AssetReadOptions.retries}
    * describes. When the server cannot resume — it answers the `Range` request
-   * with `200`, with `416`, or with a `Content-Range` that does not continue
-   * where the download stopped — the download starts over from byte zero in a
-   * fresh temp file, the partial one deleted, within the same retry budget.
+   * with `200`, with a `416` that does not show the download already complete,
+   * or with a `Content-Range` that does not continue where the download
+   * stopped — the download starts over from byte zero in a fresh temp file,
+   * the partial one deleted, within the same retry budget.
    *
    * @param path - The destination file path.
    * @param options - See {@link AssetReadOptions}.
+   * @throws {@link AudioVideoError} — `code: 'asset_fetch_failed'` — for a
+   *   non-2xx response to the first request, a download that ran out of
+   *   retries or met a status it does not retry, any other fetch failure (a
+   *   malformed URL, a DNS failure), or a failed file-system step — creating
+   *   the directory, creating, writing, closing or replacing the temp file,
+   *   moving it into place — which the message names. The URL is always
+   *   redacted, and the `cause` sanitized.
+   * @throws {@link AudioVideoError} — `code: 'cancelled'` — when
+   *   `options.signal` aborts before or during the download.
    * @throws {@link AudioVideoError} — `code: 'invalid_argument'` — when
    *   `options.retries` is not a non-negative integer.
    */
@@ -234,7 +288,7 @@ export class Asset {
     // fails creates no directory and no temp file.
     const first = await download.next();
     try {
-      await mkdir(dirname(path), { recursive: true });
+      await diskStep('creating its directory', () => mkdir(dirname(path), { recursive: true }));
       file = await TempFile.create(path);
       if (first.done !== true) await file.write(first.value);
       for await (const chunk of download) {
@@ -245,7 +299,7 @@ export class Asset {
       // Releases the connection when the failure came from the disk side.
       await download.return(undefined);
       await file?.discard();
-      throw err instanceof AudioVideoError ? err : this.#wrapTransportError(err, plan.signal);
+      throw this.#saveFailure(path, err, plan.signal);
     }
   }
 
@@ -283,7 +337,7 @@ export class Asset {
    * generator; aborted by `plan.signal`, which rejects `cancelled`; or cut
    * off — a transport error, or a clean end short of the length the response
    * reported — which hands over to `#recover` for the response to read on
-   * from.
+   * from, or for the finding that nothing is missing.
    */
   async *#download(plan: DownloadPlan): AsyncGenerator<Buffer> {
     const { signal } = plan;
@@ -310,7 +364,9 @@ export class Asset {
           ),
         };
       }
-      attempt = await this.#recover(state, plan, interruption.cause);
+      const next = await this.#recover(state, plan, interruption.cause);
+      if (next === undefined) return;
+      attempt = next;
     }
   }
 
@@ -346,15 +402,17 @@ export class Asset {
    * {@link resumptionVerdict}), or — when the server cannot resume and the
    * read may start over (`plan.restart` is set, or nothing has been delivered
    * yet) — a complete response from byte zero, with `state` reset to match.
-   * Every re-request spends one of `plan.retries` and waits its backoff
-   * first. A server that cannot resume fails a read that may not start over at
-   * once, as does a status other than `408`, `429` or a `5xx`.
+   * Resolves `undefined` instead when the answer is a `416` showing every byte
+   * already delivered. Every re-request spends one of `plan.retries` and
+   * waits its backoff first. A server that cannot resume fails a read that
+   * may not start over at once, as does a status other than `408`, `429` or a
+   * `5xx`.
    */
   async #recover(
     state: DownloadState,
     plan: DownloadPlan,
     interruption: unknown,
-  ): Promise<Attempt> {
+  ): Promise<Attempt | undefined> {
     const { signal, retries } = plan;
     const mayRestart = plan.restart !== undefined || state.offset === 0;
     let resume = state.resumable && state.offset > 0;
@@ -380,6 +438,10 @@ export class Asset {
       }
       const { res } = attempt;
       const verdict = resume ? resumptionVerdict(res, state) : restartVerdict(res);
+      if (verdict.kind === 'complete') {
+        await discard(attempt);
+        return undefined;
+      }
       if (verdict.kind === 'continue') {
         state.total ??= verdict.total;
         return attempt;
@@ -413,12 +475,13 @@ export class Asset {
   }
 
   /**
-   * One fetch of the asset. The fetch gets a signal of its own that aborts
-   * when `signal` does, unhooked through the returned attempt's `release`:
-   * the platform fetch keeps a listener on whatever signal it is handed until
-   * that signal is garbage-collected, so handing it the caller's own would
-   * leave one behind on the caller's signal for every request a download
-   * makes. Rejects exactly as the fetch does.
+   * One fetch of the asset, asking for it unencoded ({@link ACCEPT_IDENTITY})
+   * and with any `headers` given. The fetch gets a signal of its own that
+   * aborts when `signal` does, unhooked through the returned attempt's
+   * `release`: the platform fetch keeps a listener on whatever signal it is
+   * handed until that signal is garbage-collected, so handing it the caller's
+   * own would leave one behind on the caller's signal for every request a
+   * download makes. Rejects exactly as the fetch does.
    */
   async #request(
     signal: AbortSignal | undefined,
@@ -426,8 +489,7 @@ export class Asset {
   ): Promise<Attempt> {
     const link = linkSignals(signal === undefined ? [] : [signal]);
     try {
-      const init =
-        headers === undefined ? { signal: link.signal } : { signal: link.signal, headers };
+      const init = { signal: link.signal, headers: { ...ACCEPT_IDENTITY, ...headers } };
       return { res: await this.#fetch(this.#url, init), release: link.release };
     } catch (err) {
       link.release();
@@ -491,6 +553,26 @@ export class Asset {
       status: status !== undefined && status >= 400 ? status : undefined,
       cause: sanitizeTransportError(interruption, this.#url),
     });
+  }
+
+  /**
+   * The error {@link Asset.save} rejects with. A download failure is already
+   * an {@link AudioVideoError} and passes through. A failed file-system step
+   * becomes `asset_fetch_failed`, its message naming the step and `path` —
+   * never the temp file's own path — and its `cause` the sanitized
+   * file-system error; while `signal` is aborted it reports `cancelled`
+   * instead, as any other failure would.
+   */
+  #saveFailure(path: string, err: unknown, signal: AbortSignal | undefined): AudioVideoError {
+    if (err instanceof AudioVideoError) return err;
+    if (err instanceof DiskStepFailure && signal?.aborted !== true) {
+      return new AudioVideoError({
+        message: `Saving the asset at ${redactUrl(this.#url)} to ${path} failed while ${err.step}.`,
+        code: 'asset_fetch_failed',
+        cause: sanitizeTransportError(err.cause, this.#url),
+      });
+    }
+    return this.#wrapTransportError(err instanceof DiskStepFailure ? err.cause : err, signal);
   }
 
   /**
@@ -570,14 +652,16 @@ interface Failure {
 
 /**
  * What the response to a re-request lets a download do next: `continue` —
- * append its body, a `206` picking up at the offset; `restart` — start over
- * with it, a complete response from byte zero; `refused` — start over with a
- * fresh request, since it cannot continue at the offset (a `416`, a
+ * append its body, a `206` picking up at the offset; `complete` — finish, a
+ * `416` showing every byte already delivered; `restart` — start over with it,
+ * a complete response from byte zero; `refused` — start over with a fresh
+ * request, since it cannot continue at the offset (any other `416`, a
  * misaligned or changed `206`); `retry` — try again after a `408`, `429` or
  * `5xx`; `fatal` — fail the download on any other status.
  */
 type Verdict =
   | { kind: 'continue'; total: number | undefined }
+  | { kind: 'complete' }
   | { kind: 'restart'; reason: string }
   | { kind: 'refused'; reason: string }
   | { kind: 'retry' }
@@ -712,10 +796,26 @@ function resumptionVerdict(res: Response, state: DownloadState): Verdict {
     };
   }
   if (status === 416) {
+    if (completedBy416(headers, state)) return { kind: 'complete' };
     return { kind: 'refused', reason: 'the server answered 416 Range Not Satisfiable' };
   }
   if (res.ok) return { kind: 'refused', reason: `the server answered ${status}, not 206` };
   return retryableStatus(status) ? { kind: 'retry' } : { kind: 'fatal' };
+}
+
+/**
+ * Whether a `416` to a resumption shows the download already holds every
+ * byte: its `Content-Range` is the unsatisfied-range form, giving a complete
+ * length and no range, and that length is both the one an earlier response
+ * reported and the number of bytes delivered. A body cut off after its last
+ * byte, before its end was seen, is resumed at exactly that length.
+ */
+function completedBy416(headers: Headers, state: DownloadState): boolean {
+  // bytes */<complete length>
+  const match = /^bytes\s+\*\/(\d+)$/i.exec(headers.get('content-range')?.trim() ?? '');
+  if (match === null) return false;
+  const length = Number(match[1]);
+  return state.total !== undefined && length === state.total && length === state.offset;
 }
 
 /** What the response to a fresh request from byte zero lets the download do. */
@@ -780,6 +880,28 @@ function destroyOnAbort(body: Readable, signal: AbortSignal | undefined): () => 
 }
 
 /**
+ * A file-system step of {@link Asset.save} that failed: `step` describes it,
+ * and `cause` is the error it failed with.
+ */
+class DiskStepFailure extends Error {
+  readonly step: string;
+
+  constructor(step: string, cause: unknown) {
+    super(`Failed while ${step}.`, { cause });
+    this.step = step;
+  }
+}
+
+/** Runs one file-system step of {@link Asset.save}, rethrowing its failure as a {@link DiskStepFailure}. */
+async function diskStep<T>(step: string, operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (err) {
+    throw new DiskStepFailure(step, err);
+  }
+}
+
+/**
  * The temporary file {@link Asset.save} writes into beside its destination,
  * moved onto the destination with one rename once the download completes.
  * {@link TempFile.replace} starts over in a fresh file, so bytes from a
@@ -799,30 +921,37 @@ class TempFile {
   /** A new, empty temp file beside `destination`. */
   static async create(destination: string): Promise<TempFile> {
     const path = tempSavePath(destination);
-    return new TempFile(destination, path, await open(path, 'w'));
+    const handle = await diskStep('creating its temporary file', () => open(path, 'w'));
+    return new TempFile(destination, path, handle);
   }
 
   /** Appends all of `chunk`, however many writes the file system takes to accept it. */
   async write(chunk: Buffer): Promise<void> {
-    for (let written = 0; written < chunk.length;) {
-      const { bytesWritten } = await this.#handle.write(chunk, written, chunk.length - written);
-      written += bytesWritten;
-    }
+    await diskStep('writing its temporary file', async () => {
+      for (let written = 0; written < chunk.length;) {
+        const { bytesWritten } = await this.#handle.write(chunk, written, chunk.length - written);
+        written += bytesWritten;
+      }
+    });
   }
 
   /** Deletes this file and carries on in a fresh, empty one. */
   async replace(): Promise<void> {
-    await this.#handle.close();
-    await rm(this.#path, { force: true });
-    const path = tempSavePath(this.#destination);
-    this.#handle = await open(path, 'w');
-    this.#path = path;
+    await diskStep('starting over in a fresh temporary file', async () => {
+      await this.#handle.close();
+      await rm(this.#path, { force: true });
+      const path = tempSavePath(this.#destination);
+      this.#handle = await open(path, 'w');
+      this.#path = path;
+    });
   }
 
   /** Closes the file and renames it onto the destination. */
   async commit(): Promise<void> {
-    await this.#handle.close();
-    await rename(this.#path, this.#destination);
+    await diskStep('closing its temporary file', () => this.#handle.close());
+    await diskStep('moving its temporary file into place', () =>
+      rename(this.#path, this.#destination),
+    );
   }
 
   /** Closes and deletes the file. Never throws: it runs on a path that is already failing. */

@@ -1,3 +1,6 @@
+import { mkdtempSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from 'vitest';
 import { AudioVideoError } from '../src/core/errors.js';
 import { InMemoryPool, type PoolBackend } from '../src/core/pool.js';
@@ -276,6 +279,32 @@ test('cancelling a render while it stages in its slot aborts the signal its uplo
   await next;
   expect(jobs.submits).toHaveLength(1);
   expect(jobs.submits[0]?.body.source).toEqual({ url: expect.stringContaining('/staged/2?') });
+});
+
+test('cancelling a describe while its local template uploads in the slot aborts the signal the upload got, and submits nothing', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fav-describe-staging-'));
+  const template = join(dir, 'capsule.mogrt');
+  writeFileSync(template, 'mogrt bytes');
+  try {
+    const probe = probeStorage((_index, signal) => untilAborted(signal));
+    api.submit(['describe-job'], { path: '/v1/templates/describe' });
+    const c = client({ pool: new InMemoryPool({ concurrency: 1 }), storage: probe.storage });
+
+    const describing = c.describe(template);
+    // Reading the file on disk takes real time, not only event-loop turns.
+    await until(() => probe.calls.length === 1, 5_000);
+    expect(probe.calls[0]?.input).toBe(template);
+
+    await describing.cancel();
+    const error = await rejection(describing);
+    expect(error.code).toBe('cancelled');
+    expect(probe.calls[0]?.signal?.aborted).toBe(true);
+    expect(describing.jobId).toBeUndefined();
+    expect(api.count('POST', '/v1/templates/describe')).toBe(0);
+  } finally {
+    unlinkSync(template);
+    rmdirSync(dir);
+  }
 });
 
 test("a caller's abort during in-slot staging frees the slot even from a provider that ignores the signal", async () => {

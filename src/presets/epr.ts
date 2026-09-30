@@ -209,7 +209,7 @@ function h264Deviation(config: EncodeConfig, traits: CodecTraits): string {
   const size = `${width}x${height}`;
   if (!H264_SIZES.includes(size)) return `size ${size} is not a native H.264 size.`;
   if (config.mode === undefined) return "mode is required: 'hq' | 'lq' | '2pass'.";
-  return 'this config already matches a native H.264 preset; call resolvePreset(), not toEpr(), for H.264.';
+  return 'this config matches a native H.264 preset, which a render uses as it is; no .epr is generated for H.264.';
 }
 
 /** Validates `config` against what its codec can produce and derives the {@link EprPlan}. */

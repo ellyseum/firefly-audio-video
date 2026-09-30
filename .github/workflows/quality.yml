@@ -183,3 +183,44 @@ jobs:
           cache: 'npm'
       - run: npm ci
       - run: npx commitlint --from ${{ github.event.pull_request.base.sha }} --to ${{ github.event.pull_request.head.sha }} --verbose
+
+  npm-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+      - run: npm ci
+      # An advisory in dev-only tooling (build, lint, test) never ships in
+      # the published package and must not block a release; an advisory in
+      # a production dependency is what every consumer of this package
+      # inherits, so that is what this reports on. The step never fails the
+      # job: npm audit exits non-zero the moment it finds anything at any
+      # severity, which would turn this into a required gate on the next
+      # low-severity transitive advisory rather than a report.
+      - name: npm audit (production dependencies)
+        run: |
+          npm audit --omit=dev --json > audit.json || true
+          {
+            echo '### npm audit — production dependencies'
+            echo
+            if [ ! -s audit.json ]; then
+              echo 'npm audit did not produce a report.'
+            else
+              total=$(jq -r '.metadata.vulnerabilities.total // empty' audit.json)
+              if [ -z "$total" ]; then
+                echo 'npm audit did not produce a parseable report.'
+              elif [ "$total" = "0" ]; then
+                echo 'No advisories against a production dependency.'
+              else
+                noun=$([ "$total" = "1" ] && echo 'advisory' || echo 'advisories')
+                echo "$total $noun against a production dependency:"
+                echo
+                echo '```'
+                jq -r '.vulnerabilities[] | "\(.name) \(.severity): \(.via[0].title // .via[0])"' audit.json
+                echo '```'
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

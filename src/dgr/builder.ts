@@ -19,7 +19,13 @@ import type { BitDepth, Bitrate, Chroma, EncodeConfig, PresetName } from './sche
 
 /** Options for a fluent `render(templateUrl, options)`. */
 export interface RenderBuilderOptions {
-  /** Runs this render on `client` rather than the default client (or the client whose `render()` was called). */
+  /**
+   * Runs this render on `client` rather than the default client (or the
+   * client whose `render()` was called). It is read when the render starts:
+   * a value that is not a client from `createClient()` rejects the render
+   * `invalid_argument` then, and writes no log record, since the builder logs
+   * through the client it runs on and none exists.
+   */
   client?: Client;
   /**
    * Cancels the render when it aborts: before the job is submitted nothing is
@@ -106,7 +112,9 @@ export interface FluentRenderer {
 /**
  * @internal A builder for `source`. `resolve` is called when the render
  * starts — never before — and names the client it runs on; a throw from it
- * rejects the render.
+ * (`invalid_argument` for a `{ client }` that is not a client) rejects the
+ * render with that error and logs nothing: the builder logs only through the
+ * client `resolve` returns, and there is none to log on.
  */
 export function createRenderBuilder(
   source: TemplateSource,

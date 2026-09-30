@@ -2,3 +2,6 @@ dist/
 coverage/
 node_modules/
 package-lock.json
+# Written by release-please in its own format on every release.
+CHANGELOG.md
+.release-please-manifest.json

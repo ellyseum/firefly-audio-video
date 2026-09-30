@@ -531,14 +531,16 @@ Exit codes, as `dgr --help` lists them:
 
 ## Release channels
 
-| Channel              | Install                                                  | Published                                                       |
-| -------------------- | -------------------------------------------------------- | --------------------------------------------------------------- |
-| `latest`             | `npm i firefly-audio-video`                              | on each release, when the release pull request merges           |
-| `next`               | `npm i firefly-audio-video@next`                         | on every green push to `main`, as `<x.y.z+1>-next.<run>.g<sha>` |
-| pull request preview | the install command pkg.pr.new posts on the pull request | on every pull request, once pkg.pr.new is connected             |
+| Channel              | Install                                                  | Published                                                                                                        |
+| -------------------- | -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `latest`             | `npm i firefly-audio-video`                              | staged on each release, when the release pull request merges; live once a maintainer approves it on npm with 2FA |
+| `next`               | `npm i firefly-audio-video@next`                         | on every green push to `main`, as `<x.y.z+1>-next.<run>.g<sha>`                                                  |
+| pull request preview | the install command pkg.pr.new posts on the pull request | on every pull request, once pkg.pr.new is connected                                                              |
 
-Every version is published from GitHub Actions with `npm publish --provenance`, so npm carries a
-signed statement of the commit and workflow that built it; `npm audit signatures` checks it. The
+Every version is published from GitHub Actions by trusted publishing with `--provenance`, so npm
+carries a signed statement of the commit and workflow that built it; `npm audit signatures` checks
+it. `@next` publishes directly with `npm publish`; a stable release is staged with
+`npm stage publish` and does not reach `latest` until a maintainer approves it on npm. The
 publish flow and its gates are in
 [CONTRIBUTING.md](https://github.com/ellyseum/firefly-audio-video/blob/main/CONTRIBUTING.md).
 
@@ -590,11 +592,11 @@ Runnable here:
 
 Publishes or deploys, run by the workflows and not here:
 
-| Command                                               | Run by                                          |
-| ----------------------------------------------------- | ----------------------------------------------- |
-| `npm publish --provenance --access public`            | `release.yml`, publishing `latest` on a release |
-| `npm publish --provenance --tag next --access public` | `release.yml`, publishing `next` from `main`    |
-| `npx --no-install pkg-pr-new publish`                 | `pkg-pr-new.yml`, previewing a pull request     |
+| Command                                               | Run by                                       |
+| ----------------------------------------------------- | -------------------------------------------- |
+| `npm stage publish --provenance --access public`      | `release.yml`, staging `latest` on a release |
+| `npm publish --provenance --tag next --access public` | `release.yml`, publishing `next` from `main` |
+| `npx --no-install pkg-pr-new publish`                 | `pkg-pr-new.yml`, previewing a pull request  |
 
 ## Security
 

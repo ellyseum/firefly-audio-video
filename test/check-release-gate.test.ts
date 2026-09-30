@@ -72,8 +72,8 @@ test('mutation: id-token: write on an unrelated job reddens id-token-scope', () 
 test('mutation: dropping id-token: write from publish-latest reddens id-token-scope', () => {
   const mutated = mutate(
     BASE,
-    "    permissions:\n      contents: read\n      id-token: write\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0\n        with:\n          node-version-file: '.nvmrc'\n          registry-url: 'https://registry.npmjs.org'\n          package-manager-cache: false\n      - run: npm ci\n      - run: npm run build\n      - run: npm publish --provenance --access public\n",
-    "    permissions:\n      contents: read\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0\n        with:\n          node-version-file: '.nvmrc'\n          registry-url: 'https://registry.npmjs.org'\n          package-manager-cache: false\n      - run: npm ci\n      - run: npm run build\n      - run: npm publish --provenance --access public\n",
+    "    permissions:\n      contents: read\n      id-token: write\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0\n        with:\n          node-version-file: '.nvmrc'\n          registry-url: 'https://registry.npmjs.org'\n          package-manager-cache: false\n      - run: npm ci\n      - run: npm run build\n      - run: npm stage publish --provenance --access public\n",
+    "    permissions:\n      contents: read\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0\n        with:\n          node-version-file: '.nvmrc'\n          registry-url: 'https://registry.npmjs.org'\n          package-manager-cache: false\n      - run: npm ci\n      - run: npm run build\n      - run: npm stage publish --provenance --access public\n",
   );
   const violations = checkReleaseGate(mutated);
   expect(ids(violations)).toContain('id-token-scope');
@@ -167,8 +167,8 @@ test("mutation: renaming publish-next's environment reddens publish-next-environ
 test('mutation: putting the bootstrap-token line back in publish-latest reddens npm-token-secret', () => {
   const mutated = mutate(
     BASE,
-    '      - run: npm publish --provenance --access public\n',
-    '      - run: npm publish --provenance --access public\n        env:\n          NODE_AUTH_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}\n',
+    '      - run: npm stage publish --provenance --access public\n',
+    '      - run: npm stage publish --provenance --access public\n        env:\n          NODE_AUTH_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}\n',
   );
   const violations = checkReleaseGate(mutated);
   expect(ids(violations)).toEqual(['npm-token-secret']);
@@ -189,8 +189,8 @@ test('mutation: putting the bootstrap-token line back in publish-next reddens np
 test('mutation: a secret merely named like an npm token, fed into an unrelated key, still reddens npm-token-secret', () => {
   const mutated = mutate(
     BASE,
-    '      - run: npm publish --provenance --access public\n',
-    '      - run: npm publish --provenance --access public\n        env:\n          SOME_OTHER_VAR: ${{ secrets.NPM_TOKEN }}\n',
+    '      - run: npm stage publish --provenance --access public\n',
+    '      - run: npm stage publish --provenance --access public\n        env:\n          SOME_OTHER_VAR: ${{ secrets.NPM_TOKEN }}\n',
   );
   const violations = checkReleaseGate(mutated);
   expect(ids(violations)).toEqual(['npm-token-secret']);
@@ -200,8 +200,8 @@ test('mutation: a secret merely named like an npm token, fed into an unrelated k
 test('mutation: any secret fed into NODE_AUTH_TOKEN reddens npm-token-secret even under an unrelated name', () => {
   const mutated = mutate(
     BASE,
-    '      - run: npm publish --provenance --access public\n',
-    '      - run: npm publish --provenance --access public\n        env:\n          NODE_AUTH_TOKEN: ${{ secrets.RELEASE_TOKEN }}\n',
+    '      - run: npm stage publish --provenance --access public\n',
+    '      - run: npm stage publish --provenance --access public\n        env:\n          NODE_AUTH_TOKEN: ${{ secrets.RELEASE_TOKEN }}\n',
   );
   const violations = checkReleaseGate(mutated);
   expect(ids(violations)).toEqual(['npm-token-secret']);
@@ -211,8 +211,8 @@ test('mutation: any secret fed into NODE_AUTH_TOKEN reddens npm-token-secret eve
 test('mutation: an unrelated secret fed into an unrelated key does not redden npm-token-secret', () => {
   const mutated = mutate(
     BASE,
-    '      - run: npm publish --provenance --access public\n',
-    '      - run: npm publish --provenance --access public\n        env:\n          SOME_OTHER_VAR: ${{ secrets.SOME_OTHER_SECRET }}\n',
+    '      - run: npm stage publish --provenance --access public\n',
+    '      - run: npm stage publish --provenance --access public\n        env:\n          SOME_OTHER_VAR: ${{ secrets.SOME_OTHER_SECRET }}\n',
   );
   const violations = checkReleaseGate(mutated);
   expect(ids(violations)).toEqual([]);
@@ -221,8 +221,8 @@ test('mutation: an unrelated secret fed into an unrelated key does not redden np
 test('mutation: dropping --provenance from publish-latest reddens npm-publish-provenance', () => {
   const mutated = mutate(
     BASE,
-    '- run: npm publish --provenance --access public',
-    '- run: npm publish --access public',
+    '- run: npm stage publish --provenance --access public',
+    '- run: npm stage publish --access public',
   );
   const violations = checkReleaseGate(mutated);
   expect(ids(violations)).toEqual(['npm-publish-provenance']);
@@ -243,8 +243,8 @@ test('mutation: dropping --provenance from publish-next reddens npm-publish-prov
 test('mutation: dropping --provenance from both publish jobs reddens npm-publish-provenance twice', () => {
   let mutated = mutate(
     BASE,
-    '- run: npm publish --provenance --access public',
-    '- run: npm publish --access public',
+    '- run: npm stage publish --provenance --access public',
+    '- run: npm stage publish --access public',
   );
   mutated = mutate(
     mutated,
@@ -253,6 +253,24 @@ test('mutation: dropping --provenance from both publish jobs reddens npm-publish
   );
   const violations = checkReleaseGate(mutated);
   expect(ids(violations)).toEqual(['npm-publish-provenance', 'npm-publish-provenance']);
+});
+
+test('mutation: publish-latest back on a direct npm publish reddens publish-latest-stage', () => {
+  const mutated = mutate(
+    BASE,
+    '- run: npm stage publish --provenance --access public',
+    '- run: npm publish --provenance --access public',
+  );
+  const violations = checkReleaseGate(mutated);
+  expect(ids(violations)).toEqual(['publish-latest-stage']);
+  expect(onlyMessage(violations)).toMatch(/"publish-latest".*not a direct publish/);
+});
+
+test("mutation: removing publish-latest's publish step entirely reddens publish-latest-stage", () => {
+  const mutated = mutate(BASE, '      - run: npm stage publish --provenance --access public\n', '');
+  const violations = checkReleaseGate(mutated);
+  expect(ids(violations)).toEqual(['publish-latest-stage']);
+  expect(onlyMessage(violations)).toMatch(/has no npm publish step/);
 });
 
 test('mutation: publish-latest needs: without verify reddens publish-latest-needs-verify', () => {

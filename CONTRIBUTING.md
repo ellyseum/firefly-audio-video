@@ -8,11 +8,11 @@ workflow, including the pull-request preview channel, runs only while the reposi
 
 ### Channels
 
-| Channel              | Publishes when                                                                                                      | npm dist-tag                                         |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
-| Pull request preview | every pull request, via `pkg-pr-new.yml` (also gated on the repository being public)                                | none — installed from a preview URL posted to the PR |
-| `next`               | every push to `main` that passes `verify` and is not itself a release commit                                        | `next`                                               |
-| `latest`             | merging the release-please pull request, approved by the repository owner, once `verify` passes on the merge commit | `latest` (the npm default)                           |
+| Channel              | Publishes when                                                                                                                            | npm dist-tag                                         |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| Pull request preview | every pull request, via `pkg-pr-new.yml` (also gated on the repository being public)                                                      | none — installed from a preview URL posted to the PR |
+| `next`               | every push to `main` that passes `verify` and is not itself a release commit                                                              | `next`                                               |
+| `latest`             | merging the release-please pull request, once `verify` passes on the merge commit — staged on npm until a maintainer approves it with 2FA | `latest` (the npm default)                           |
 
 CI never moves an npm dist-tag itself. After a stable release ships to `latest`, the following
 push to `main` republishes `@next` from that new base.
@@ -28,17 +28,20 @@ lint, format check, build, test, the packed-file check (`scripts/verify-pack-con
 `scripts/runtime-smoke.mjs` against the built package on Node 18, 20, 22 and 24. Neither publish
 job starts until it passes on the commit being published.
 
-- **`publish-latest`** runs once `verify` passes on a commit release-please just tagged. It deploys
-  through the `release` environment, which requires the repository owner's approval before the job
-  proceeds, then publishes to the `latest` dist-tag.
+- **`publish-latest`** runs once `verify` passes on a commit release-please just tagged, through
+  the `release` environment. It stages the release to the `latest` dist-tag with
+  `npm stage publish`; the staged version does not go live until a maintainer approves it on npm
+  with 2FA — a stable release no longer waits for a GitHub environment approval, since the
+  maintainer's approval now happens on npm, on the uploaded package.
 - **`publish-next`** runs on every other green push — one that is not itself a release commit, and
-  only once a `latest` version already exists on npm (`check-npm-tag`) — publishing to the `next`
-  dist-tag through the `npm-next` environment, which requires no approval.
+  only once a `latest` version already exists on npm (`check-npm-tag`) — publishing directly to the
+  `next` dist-tag through the `npm-next` environment, which requires no approval.
 
 Both jobs authenticate to npm by trusted publishing, not a stored secret: `permissions: id-token:
-write` lets the job mint a short-lived OIDC token that npm exchanges for a publish grant, and
-`npm publish --provenance` attaches the resulting attestation. Neither job references any npm
-secret.
+write` lets the job mint a short-lived OIDC token that npm exchanges for a publish grant.
+`publish-next` attaches the resulting attestation with `npm publish --provenance`; `publish-latest`
+attaches it with `npm stage publish --provenance`, since npm's trusted publisher for the `release`
+environment only accepts a staged version. Neither job references any npm secret.
 
 Set the repository variable `PUBLISH_ENABLED` to `false` to pause the release path: `verify`,
 `check-npm-tag`, and both publish jobs are skipped, since none of them has anything to do while
@@ -47,8 +50,9 @@ nothing may publish. `pack-contents` keeps running regardless — it only ever r
 
 ### Floor for OIDC trusted publishing
 
-npm CLI `>= 11.5.1` and Node `>= 22.14.0`. Both publish jobs read their Node version from
-`.nvmrc` (`24`), which clears it.
+npm CLI `>= 11.15.0` and Node `>= 22.14.0` — `npm stage publish`'s own floor, above the `>= 11.5.1`
+that plain trusted publishing needs. Both publish jobs read their Node version from `.nvmrc`
+(`24`), which ships npm 11.19.0 and clears both floors.
 
 ### The release pull request does not run CI on itself
 

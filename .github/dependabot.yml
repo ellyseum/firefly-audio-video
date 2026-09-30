@@ -4,6 +4,12 @@ updates:
     directory: '/'
     schedule:
       interval: 'weekly'
+    ignore:
+      # commander 14 requires Node >= 20, and commander 15 requires Node >= 22.12 and
+      # is ESM-only ("type": "module"). This package supports Node >= 18 and ships the
+      # dgr bin as CommonJS, so neither major can be taken as an update.
+      - dependency-name: 'commander'
+        versions: ['>=14.0.0']
   - package-ecosystem: 'github-actions'
     directory: '/'
     schedule:

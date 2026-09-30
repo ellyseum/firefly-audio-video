@@ -835,10 +835,25 @@ test('the listener on the caller signal is detached when the job settles without
   expect(polls()).toBe(1);
 });
 
+test('an AsyncJob cannot be constructed or subclassed outside the SDK, and stays instanceof-checkable', async () => {
+  const driver = { run: () => Promise.resolve('done'), cancelRemote: () => Promise.resolve() };
+
+  // @ts-expect-error — the constructor is private: jobs come from the SDK.
+  const construct = (): unknown => new AsyncJob<string>(driver);
+  // @ts-expect-error — a class whose constructor is private cannot be extended.
+  class Subclass extends AsyncJob<string> {}
+
+  expect(construct).toBeTypeOf('function');
+  expect(Subclass).toBeTypeOf('function');
+  const job = AsyncJob.start(driver);
+  expect(job).toBeInstanceOf(AsyncJob);
+  expect(await job).toBe('done');
+});
+
 test('an AudioVideoError thrown by the run passes through unmasked even when the signal aborted in the same instant', async () => {
   const external = new AbortController();
   const failure = new AudioVideoError({ message: 'x', code: 'http_500', status: 500 });
-  const job = new AsyncJob<string>({
+  const job = AsyncJob.start<string>({
     run: () => {
       external.abort();
       return Promise.reject(failure);

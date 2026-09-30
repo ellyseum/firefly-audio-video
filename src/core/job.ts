@@ -241,7 +241,8 @@ const POLL_RETRY_MAX_MS = 30_000;
  * its own.
  *
  * Instances are created by the SDK's job runner; application code receives them
- * from a capability method and has no reason to construct one directly.
+ * from a capability method. The constructor is private — a job cannot be built
+ * or subclassed outside the SDK — while `instanceof AsyncJob` still works.
  *
  * @example
  * ```ts
@@ -270,8 +271,12 @@ export class AsyncJob<T> implements PromiseLike<T> {
   #detachExternalSignal: (() => void) | undefined;
   #remoteCancel: Promise<void> | undefined;
 
-  /** @internal */
-  constructor(driver: JobDriver<T>) {
+  /** @internal Starts the job `driver` runs; the only way to create an {@link AsyncJob}. */
+  static start<T>(driver: JobDriver<T>): AsyncJob<T> {
+    return new AsyncJob(driver);
+  }
+
+  private constructor(driver: JobDriver<T>) {
     this.#cancelRemote = driver.cancelRemote;
     this.#timeoutMs = driver.timeoutMs;
     this.#cancelOnTimeout = driver.cancelOnTimeout ?? false;
@@ -506,7 +511,7 @@ export class AsyncJob<T> implements PromiseLike<T> {
  */
 export function runJob<T>(http: HttpClient, opts: RunJobOptions<T>): AsyncJob<T> {
   const cancelPath = opts.cancelPath ?? defaultCancelPath;
-  return new AsyncJob<T>({
+  return AsyncJob.start<T>({
     run: (ctx) => pollUntilTerminal(http, opts, ctx),
     cancelRemote: async (jobId) => {
       await http.request('PUT', cancelPath(jobId));

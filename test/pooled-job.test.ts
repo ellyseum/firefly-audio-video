@@ -41,7 +41,7 @@ function flush(): Promise<void> {
 
 /** A job that reports `jobId` at once and settles when `result` does, or when it is aborted. */
 function controlledJob<T>(jobId: string, result: Promise<T>, cancels: string[] = []): AsyncJob<T> {
-  return new AsyncJob<T>({
+  return AsyncJob.start<T>({
     run: async (ctx) => {
       await ctx.trackSubmission(Promise.resolve({ jobId, statusUrl: `/v1/status/${jobId}` }));
       return new Promise<T>((resolve, reject) => {

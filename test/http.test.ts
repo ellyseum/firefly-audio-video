@@ -714,6 +714,157 @@ test('a signal aborted in the gap between attempts short-circuits the next wait 
   expect((err.cause as Error).message).toBe('gave up between attempts');
 });
 
+// --- a stop signal: stops between attempts, never mid-attempt -----------------------
+
+test('a stop signal aborting during a 429 backoff rejects cancelled at once, sending no retry', async () => {
+  useFakeClock();
+  let attempts = 0;
+  pool()
+    .intercept({ path: '/v1/templates/render', method: 'POST' })
+    .reply(
+      429,
+      () => {
+        attempts += 1;
+        return { error: 'rate_limit' };
+      },
+      { headers: { 'retry-after': '10' } },
+    )
+    .persist();
+  const client = new HttpClient({ apiKey: 'key', tokenProvider });
+  const stop = new AbortController();
+
+  const pending = client.request(
+    'POST',
+    '/v1/templates/render',
+    { x: 1 },
+    { stopSignal: stop.signal },
+  );
+  await until(() => vi.getTimerCount() === 1);
+  stop.abort(new Error('job cancelled'));
+
+  const err = await rejection(pending);
+  expect(err.code).toBe('cancelled');
+  expect((err.cause as Error).message).toBe('job cancelled');
+  expect(attempts).toBe(1);
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+test('a stop signal aborting the moment a backoff ends still keeps the retry from being sent', async () => {
+  useFakeClock();
+  let attempts = 0;
+  pool()
+    .intercept({ path: '/v1/templates/render', method: 'POST' })
+    .reply(
+      429,
+      () => {
+        attempts += 1;
+        return { error: 'rate_limit' };
+      },
+      { headers: { 'retry-after': '10' } },
+    )
+    .persist();
+  const client = new HttpClient({ apiKey: 'key', tokenProvider });
+  const stop = new AbortController();
+
+  const pending = client.request(
+    'POST',
+    '/v1/templates/render',
+    { x: 1 },
+    { stopSignal: stop.signal },
+  );
+  await until(() => vi.getTimerCount() === 1);
+  // The backoff's timer fires here, and the retry it releases has not been sent yet.
+  vi.advanceTimersByTime(10_000);
+  stop.abort(new Error('job cancelled'));
+
+  const err = await rejection(pending);
+  expect(err.code).toBe('cancelled');
+  expect(attempts).toBe(1);
+});
+
+test('a stop signal never aborts an attempt in flight: one answering 2xx after the stop still resolves', async () => {
+  const held = deferred();
+  let arrived = false;
+  pool()
+    .intercept({ path: '/v1/templates/render', method: 'POST' })
+    .reply(202, async () => {
+      arrived = true;
+      await held.promise;
+      return { jobId: 'j1', statusUrl: '/v1/status/j1' };
+    });
+  const client = new HttpClient({ apiKey: 'key', tokenProvider });
+  const stop = new AbortController();
+
+  const pending = client.request(
+    'POST',
+    '/v1/templates/render',
+    { x: 1 },
+    { stopSignal: stop.signal },
+  );
+  await until(() => arrived);
+  stop.abort(new Error('job cancelled'));
+  await flush();
+  held.resolve();
+
+  const res = await pending;
+  expect(res.status).toBe(202);
+  expect(res.body).toEqual({ jobId: 'j1', statusUrl: '/v1/status/j1' });
+});
+
+test('a stop signal aborting while an attempt is in flight turns its 429 or 401 into cancelled, sending it no second time', async () => {
+  for (const status of [429, 401]) {
+    const held = deferred();
+    let attempts = 0;
+    pool()
+      .intercept({ path: '/v1/templates/render', method: 'POST' })
+      .reply(
+        status,
+        async () => {
+          attempts += 1;
+          await held.promise;
+          return { error: `status ${status}` };
+        },
+        { headers: { 'retry-after': '0' } },
+      )
+      .persist();
+    getAccessTokenMock.mockClear();
+    const client = new HttpClient({ apiKey: 'key', tokenProvider });
+    const stop = new AbortController();
+
+    const pending = client.request(
+      'POST',
+      '/v1/templates/render',
+      { x: 1 },
+      {
+        stopSignal: stop.signal,
+      },
+    );
+    await until(() => attempts === 1);
+    stop.abort(new Error('job cancelled'));
+    held.resolve();
+
+    const err = await rejection(pending);
+    expect(err.code, `status ${status}`).toBe('cancelled');
+    expect(attempts, `status ${status}`).toBe(1);
+    expect(getAccessTokenMock, `status ${status}`).toHaveBeenCalledTimes(1);
+    await agent.close();
+    agent = new MockAgent();
+    agent.disableNetConnect();
+    setGlobalDispatcher(agent);
+  }
+});
+
+test('an already-aborted stop signal rejects cancelled before a token is requested or anything is sent', async () => {
+  const client = new HttpClient({ apiKey: 'key', tokenProvider });
+
+  const err = await rejection(
+    client.request('POST', '/v1/templates/render', { x: 1 }, { stopSignal: AbortSignal.abort() }),
+  );
+
+  expect(err.code).toBe('cancelled');
+  expect(getAccessTokenMock).not.toHaveBeenCalled();
+});
+
 // --- every other failure is an AudioVideoError too ----------------------------------
 
 test('a transport failure rejects request_failed, naming its system code, with a redacted copy of the error chain as cause', async () => {

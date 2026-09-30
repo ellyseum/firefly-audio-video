@@ -10,6 +10,7 @@
  * {@link InMemoryPool} without the client changing.
  */
 
+import { brandClass } from './brand.js';
 import { AudioVideoError } from './errors.js';
 
 /**
@@ -206,5 +207,9 @@ export class InMemoryPool implements PoolBackend {
       this.#queueHead = 0;
     }
     return next;
+  }
+
+  static {
+    brandClass(this, 'InMemoryPool');
   }
 }

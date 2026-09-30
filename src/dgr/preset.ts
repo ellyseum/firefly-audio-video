@@ -6,6 +6,7 @@
  */
 
 import { readFileSync, statSync } from 'node:fs';
+import { brandClass, sharedKey } from '../core/brand.js';
 import { AudioVideoError } from '../core/errors.js';
 import {
   ASPECT_RESOLUTIONS,
@@ -87,6 +88,9 @@ const EMPTY_CONFIG: Readonly<Partial<EncodeConfig>> = Object.freeze({});
 /** Validates a `with()` overrides object: every field optional, no unknown keys. */
 const OVERRIDES_SCHEMA = EncodeConfigSchema.partial();
 
+/** The key every copy of the package reads a preset's state through, a preset another copy built included. */
+const PRESET_STATE = sharedKey('Preset.state');
+
 let stateOf: (preset: Preset) => PresetState;
 let presetFrom: (state: PresetState) => Preset;
 
@@ -101,7 +105,9 @@ let presetFrom: (state: PresetState) => Preset;
  * whose effective config equals a DGR-native preset resolves to that
  * `presetId`; any other config is generated as an `.epr` and staged. The
  * catalog accessors exist on the class and on every instance and ignore the
- * instance they are read from.
+ * instance they are read from. When a process loads both of the package's
+ * builds, a preset either one made passes `instanceof Preset` and renders
+ * through the other.
  *
  * `toJSON()`, `toString()` and `console.log` all show the JSON form — never XML.
  *
@@ -267,7 +273,18 @@ export class Preset extends NamedAccessorBase {
   }
 
   static {
-    stateOf = (preset) => preset.#state;
+    brandClass(this, 'Preset');
+    // Each copy of the package reads its own presets' state directly, and another copy's
+    // through this accessor: the field itself is private to the class that declared it.
+    Object.defineProperty(this.prototype, PRESET_STATE, {
+      value(this: Preset): PresetState {
+        return this.#state;
+      },
+    });
+    stateOf = (preset) =>
+      #state in preset
+        ? preset.#state
+        : (preset as unknown as Record<symbol, () => PresetState>)[PRESET_STATE]!();
     presetFrom = (state) => {
       const preset = new Preset();
       preset.#state = state;

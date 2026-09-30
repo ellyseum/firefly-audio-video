@@ -5,6 +5,7 @@
 
 import { createReadStream } from 'node:fs';
 import type { Readable } from 'node:stream';
+import { brandClass } from '../core/brand.js';
 import { httpUrlOf, type StageInput, type StorageProvider } from '../core/storage.js';
 import { exportOf, loadPeer, type Peer } from './peer.js';
 import {
@@ -103,8 +104,9 @@ export interface S3StorageProviderOptions {
   /**
    * Seconds every URL this provider returns stays valid, from 1 to 604800
    * (seven days, the limit of a SigV4 presigned URL; temporary credentials
-   * end it sooner). Defaults to one hour for a staged input and 24 hours for
-   * an output, whose URLs must outlive the render and the download after it.
+   * end it sooner). Defaults to 24 hours: a staged input's URL must last until
+   * the service reads it, which can follow a long wait in its queue, and an
+   * output's URLs must outlive the render and the download after it.
    */
   expiresIn?: number;
   /**
@@ -365,6 +367,10 @@ export class S3StorageProvider implements StorageProvider {
 
   #checkExpiry(value: unknown): number {
     return checkExpiry(value, `${NAME}: expiresIn`, MAX_EXPIRY_SECONDS);
+  }
+
+  static {
+    brandClass(this, 'S3StorageProvider');
   }
 }
 

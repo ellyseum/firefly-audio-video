@@ -7,7 +7,9 @@
  * feature the target major lacks. This script is the check that would have
  * caught that, run with zero dependencies so it works on every Node major
  * the package claims to support, long before the dev toolchain itself could
- * even be installed there.
+ * even be installed there. It loads both builds into one process, as an
+ * application with a CommonJS dependency does, and checks that they share
+ * one default client and one identity for every exported class.
  *
  * Usage: `node scripts/runtime-smoke.mjs [distDir]`
  * `distDir` defaults to the `dist/` next to this script's own repo; pass an
@@ -317,6 +319,213 @@ if (esm) await runBehaviourChecks(esm, 'esm');
 else console.error('not ok - [esm] behaviour checks skipped: the ESM entry did not load');
 
 if (!cjs || !esm) failures += 1;
+
+// --- one process, both builds: one default client, one identity for every class ---
+
+/**
+ * A fetch stub for the checks that follow: IMS mints a token, the presets
+ * listing answers empty, a render submit is accepted and its status succeeds
+ * at once. Each request is recorded in `seen` with the x-api-key it carried,
+ * a submit with its body too.
+ */
+function recordingFetch(seen) {
+  const json = (status, body) =>
+    new Response(JSON.stringify(body), {
+      status,
+      headers: { 'content-type': 'application/json' },
+    });
+  return async (input, init = {}) => {
+    const url = new URL(typeof input === 'string' ? input : (input.url ?? String(input)));
+    if (url.hostname === 'ims-na1.adobelogin.com') {
+      seen.push(`ims ${new URLSearchParams(String(init.body)).get('client_id')}`);
+      return json(200, {
+        access_token: 'runtime-smoke-token',
+        token_type: 'bearer',
+        expires_in: 86399,
+      });
+    }
+    const key = new Headers(init.headers).get('x-api-key');
+    if (url.pathname === '/v1/presets') {
+      seen.push(`presets ${key}`);
+      return json(200, { items: [] });
+    }
+    if (url.pathname === '/v1/templates/render') {
+      seen.push(`submit ${key} ${init.body}`);
+      return json(202, { jobId: 'smoke-job', statusUrl: `${url.origin}/v1/status/smoke-job` });
+    }
+    if (url.pathname === '/v1/status/smoke-job') {
+      return json(200, {
+        jobId: 'smoke-job',
+        status: 'succeeded',
+        outputs: [
+          {
+            destination: { url: 'https://example.test/out.mov' },
+            variationIndex: '0',
+            presetIndex: '0',
+          },
+        ],
+      });
+    }
+    throw new Error(`runtime-smoke made an unexpected request: ${url.href}`);
+  };
+}
+
+/** A config authenticating with a fixed token, so a request's x-api-key names the tenant. */
+function tenant(clientId) {
+  return {
+    clientId,
+    tokenProvider: { getAccessToken: async () => `${clientId}-token` },
+    logging: false,
+  };
+}
+
+/** One instance of every class the package exports, made by `mod`. */
+function instancesOf(mod) {
+  return [
+    ['AudioVideoError', new mod.AudioVideoError({ message: 'runtime smoke', code: 'smoke' })],
+    [
+      'Asset',
+      new mod.Asset({ url: 'https://example.test/a.mov', meta: { jobId: 'j', perItem: [] } }),
+    ],
+    ['Preset', mod.presets.prores],
+    ['InMemoryPool', new mod.InMemoryPool()],
+    ['PassthroughStorageProvider', new mod.PassthroughStorageProvider()],
+    [
+      'ClientCredentialsProvider',
+      new mod.ClientCredentialsProvider({
+        clientId: FAKE_CLIENT_ID,
+        clientSecret: FAKE_CLIENT_SECRET,
+      }),
+    ],
+    ...STORAGE_PROVIDERS.map(({ name, options }) => [name, new mod[name](options)]),
+  ];
+}
+
+if (cjs && esm) {
+  const throwingFetch = globalThis.fetch;
+  const savedEnv = {
+    id: process.env.IMS_OAUTH_S2S_CLIENT_ID,
+    secret: process.env.IMS_OAUTH_S2S_CLIENT_SECRET,
+  };
+  // An environment credential is present, so a build that ignored the other build's configure()
+  // would fall back to it rather than fail.
+  process.env.IMS_OAUTH_S2S_CLIENT_ID = 'RUNTIME_SMOKE_ENV_CLIENT';
+  process.env.IMS_OAUTH_S2S_CLIENT_SECRET = 'runtime-smoke-env-secret';
+  try {
+    await check(
+      '[cjs+esm] configure() through either build installs the default client the other build calls',
+      async () => {
+        for (const [through, calledFrom, clientId] of [
+          [cjs, esm, 'RUNTIME_SMOKE_TENANT_A'],
+          [esm, cjs, 'RUNTIME_SMOKE_TENANT_B'],
+        ]) {
+          const seen = [];
+          globalThis.fetch = recordingFetch(seen);
+          through.configure(tenant(clientId));
+          await calledFrom.listPresets();
+          assertEqual(seen, [`presets ${clientId}`], 'the requests the other build made');
+          through.resetDefaultClient();
+        }
+      },
+    );
+
+    await check(
+      '[cjs+esm] resetDefaultClient() through either build clears the default client for both',
+      async () => {
+        const seen = [];
+        globalThis.fetch = recordingFetch(seen);
+        cjs.configure(tenant('RUNTIME_SMOKE_TENANT_A'));
+        esm.resetDefaultClient();
+        await cjs.listPresets();
+        assertEqual(
+          seen,
+          ['ims RUNTIME_SMOKE_ENV_CLIENT', 'presets RUNTIME_SMOKE_ENV_CLIENT'],
+          'the requests after a reset through the other build',
+        );
+        cjs.resetDefaultClient();
+      },
+    );
+
+    await check(
+      '[cjs+esm] an error either build throws, and every exported class, is instanceof across the builds',
+      async () => {
+        for (const [made, other, label] of [
+          [cjs, esm, 'cjs'],
+          [esm, cjs, 'esm'],
+        ]) {
+          const thrown = await made.status('').then(
+            () => undefined,
+            (error) => error,
+          );
+          if (
+            !(thrown instanceof other.AudioVideoError) ||
+            !(thrown instanceof made.AudioVideoError)
+          ) {
+            throw new Error(
+              `an error the ${label} build threw is not instanceof both builds' AudioVideoError`,
+            );
+          }
+          for (const [name, instance] of instancesOf(made)) {
+            if (!(instance instanceof other[name])) {
+              throw new Error(
+                `a ${name} the ${label} build made is not instanceof the other build's ${name}`,
+              );
+            }
+          }
+          made.resetDefaultClient();
+        }
+      },
+    );
+
+    await check(
+      "[cjs+esm] a preset one build made renders through the other build's default client",
+      async () => {
+        const seen = [];
+        globalThis.fetch = recordingFetch(seen);
+        cjs.configure(tenant('RUNTIME_SMOKE_TENANT_A'));
+        const asset = await esm.render(
+          {
+            source: 'https://example.test/capsule.mogrt',
+            presets: [esm.presets.prores],
+            outputs: [{ presetIndex: 0, destination: 'https://example.test/out.mov' }],
+          },
+          { pollIntervalMs: 0 },
+        );
+        const submit = seen.find((entry) => entry.startsWith('submit '));
+        if (
+          submit === undefined ||
+          !submit.startsWith('submit RUNTIME_SMOKE_TENANT_A ') ||
+          !submit.includes('"presetId":"ffs_video_api_prores"')
+        ) {
+          throw new Error(`the submit did not carry the tenant and the preset: ${submit}`);
+        }
+        if (!(asset instanceof esm.Asset) || !(asset instanceof cjs.Asset)) {
+          throw new Error("the rendered asset is not instanceof both builds' Asset");
+        }
+        cjs.resetDefaultClient();
+      },
+    );
+
+    await check(
+      "[cjs+esm] a client one build created serves the other build's calls given as { client }",
+      async () => {
+        const seen = [];
+        globalThis.fetch = recordingFetch(seen);
+        await esm.listPresets({ client: cjs.createClient(tenant('RUNTIME_SMOKE_TENANT_C')) });
+        assertEqual(seen, ['presets RUNTIME_SMOKE_TENANT_C'], 'the requests the esm build made');
+      },
+    );
+  } finally {
+    globalThis.fetch = throwingFetch;
+    for (const [name, value] of [
+      ['IMS_OAUTH_S2S_CLIENT_ID', savedEnv.id],
+      ['IMS_OAUTH_S2S_CLIENT_SECRET', savedEnv.secret],
+    ]) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
 
 globalThis.fetch = realFetch;
 

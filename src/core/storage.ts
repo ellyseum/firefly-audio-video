@@ -11,7 +11,9 @@
 import { stat } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
+import { brandClass } from './brand.js';
 import { AudioVideoError } from './errors.js';
+import { redactError } from './redact.js';
 
 /**
  * Anything a {@link StorageProvider} can stage: a `Buffer`, a `Readable`, a
@@ -178,6 +180,10 @@ export class PassthroughStorageProvider implements StorageProvider {
         'destination and a readUrl, or configure a storage provider that allocates them.',
     );
   }
+
+  static {
+    brandClass(this, 'PassthroughStorageProvider');
+  }
 }
 
 /**
@@ -265,11 +271,18 @@ export function isReadable(value: unknown): value is Readable {
 /**
  * @internal A storage provider's failure as the SDK reports it: an
  * {@link AudioVideoError} the provider threw passes through; anything else is
- * wrapped with `code: 'storage_failed'`, keeping the original as `cause`.
+ * wrapped with `code: 'storage_failed'`, keeping a redacted copy of the
+ * original as `cause` ({@link redactError}). Never the original itself: a
+ * provider's error can hold a presigned URL, and a cause prints wherever the
+ * error does, Node's crash print for an unhandled rejection included.
  */
 export function storageFailure(message: string, cause?: unknown): AudioVideoError {
   if (cause instanceof AudioVideoError) return cause;
-  return new AudioVideoError({ message, code: 'storage_failed', cause });
+  return new AudioVideoError({
+    message,
+    code: 'storage_failed',
+    ...(cause !== undefined ? { cause: redactError(cause) } : {}),
+  });
 }
 
 const EXPECTED_INPUT =

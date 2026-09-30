@@ -3,7 +3,8 @@
  * concurrency pool behind the method surface `createClient()` returns — the
  * surface the top-level functions reach through the default client.
  * `render()` and `describe()` run every job inside the client's pool, from
- * staging its inputs until the job settles; `status()`, `cancel()`,
+ * staging its inputs until the job — its submit and any cancel request
+ * included — has settled; `status()`, `cancel()`,
  * `listPresets()` and `stage()` run outside it. Every public call emits
  * exactly one log record when it settles.
  */
@@ -11,6 +12,7 @@
 import type { Readable } from 'node:stream';
 import { resolveAsset, type Asset, type ResolveAs } from '../core/asset.js';
 import { resolveTokenProvider, type TokenProvider } from '../core/auth.js';
+import { brandClass } from '../core/brand.js';
 import { AudioVideoError } from '../core/errors.js';
 import { HttpClient, hostOrigin } from '../core/http.js';
 import { redactError } from '../core/redact.js';
@@ -30,6 +32,7 @@ import {
   type LoggingOption,
 } from '../core/logging.js';
 import { InMemoryPool, type PoolBackend } from '../core/pool.js';
+import { untilAborted } from '../core/signals.js';
 import {
   rejectedJob,
   runPooledJob,
@@ -160,9 +163,10 @@ export interface ClientConfig {
    * admitted, just before its submit, so a staged URL is fresh when DGR is
    * sent it however long the job queued. `AioFilesStorageProvider` and `S3StorageProvider` read a
    * `Readable` into memory before uploading it — the store needs its length —
-   * so pass a file path to stream a large input from disk. Only the calls
-   * holding a slot stage, so at most `concurrency` calls hold such bytes in
-   * memory at once.
+   * so pass a file path to stream a large input from disk. A render or a
+   * describe stages while it holds its slot, so at most `concurrency` of them
+   * hold such bytes in memory at once; `stage()` takes no slot, and each call
+   * holding a `Readable` adds its own.
    *
    * Omitted, a client in an App Builder environment — `__OW_NAMESPACE` or
    * `AIO_runtime_namespace` set — uses an `AioFilesStorageProvider`, and any
@@ -202,12 +206,17 @@ export interface RenderOptions {
   savePath?: string;
   /**
    * Cancels the render when it aborts, including the download `resolveAs`
-   * performs: before the job is submitted nothing is submitted; after, the
-   * service is asked to stop the job. The render rejects `cancelled` with the
-   * abort reason as `cause`.
+   * performs — for `'stream'`, until the stream closes: before the job is
+   * submitted nothing is submitted; after, the service is asked to stop the
+   * job. The render rejects `cancelled` with the abort reason as `cause`, and
+   * a stream it resolved with emits it as an `'error'`.
    */
   signal?: AbortSignal;
-  /** Called once per status poll with the raw status body, the terminal poll included. */
+  /**
+   * Called once per status poll with the raw status body, the terminal poll
+   * included. If it throws, the render rejects `callback_failed` with the
+   * thrown value as `cause`, and a job still running is asked to stop.
+   */
   onProgress?: (status: JobStatusLike) => void;
   /**
    * Milliseconds between status polls — a constant, or a function of the
@@ -223,7 +232,7 @@ export interface DescribeOptions {
   client?: Client;
   /** Cancels the describe job when it aborts; it rejects `cancelled` with the abort reason as `cause`. */
   signal?: AbortSignal;
-  /** Called once per status poll with the raw status body, the terminal poll included. */
+  /** Called once per status poll, as {@link RenderOptions.onProgress} is — a throw included. */
   onProgress?: (status: JobStatusLike) => void;
   /** Milliseconds between status polls; see {@link RenderOptions.pollIntervalMs}. */
   pollIntervalMs?: PollInterval;
@@ -247,6 +256,12 @@ export interface StageOptions {
   contentType?: string;
   /** How long the returned URL stays valid, in seconds. */
   expiresIn?: number;
+  /**
+   * Aborts the upload: the provider's `stageRead` is handed it, and the call
+   * rejects `cancelled` the moment it aborts, whether or not the provider
+   * stops. An already-aborted signal rejects without calling the provider.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -442,7 +457,8 @@ export interface Client {
    * a `file:` URL) uploaded through this client's storage, as the presigned
    * read URL it returns. Takes no pool slot. A string that is neither an
    * http(s) URL nor an existing file rejects `invalid_argument`, as does an
-   * upload with no `storage` configured.
+   * upload with no `storage` configured. `options.signal` aborts the upload,
+   * rejecting `cancelled` at once whether or not the provider stops.
    *
    * @example
    * ```ts
@@ -515,7 +531,8 @@ export function normalizeScope(raw: unknown, source: string): string | undefined
 }
 
 /**
- * @internal The client a `{ client }` option names.
+ * @internal The client a `{ client }` option names — one either of the
+ * package's builds created, since a process may load both.
  *
  * @throws {@link AudioVideoError} `invalid_argument` unless it came from {@link createClient}.
  */
@@ -625,7 +642,7 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
           const body = await materializeDescribe(prepared, this.#storage, signal);
           return () =>
             runJob(this.#http, {
-              submit: () => this.#submit(DESCRIBE_PATH, body),
+              submit: (stop) => this.#submit(DESCRIBE_PATH, body, stop),
               mapResult: (terminal) => describeResult(terminal),
               onProgress: progress.onProgress,
               ...jobTuning(options),
@@ -718,10 +735,12 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
   async stage(input: StageInput, options: StageOptions = {}): Promise<string> {
     const target = this.#targetOrLog(options, 'stage', STAGE_ENDPOINT, undefined);
     if (target !== this) return target.stage(input, options);
-    const { key, contentType, expiresIn } = options;
-    return this.#logged('stage', STAGE_ENDPOINT, undefined, undefined, () =>
-      normalizeAsset(input, this.#storage, { key, contentType, expiresIn }),
-    );
+    const { key, contentType, expiresIn, signal } = options;
+    return this.#logged('stage', STAGE_ENDPOINT, undefined, signal, () => {
+      signal?.throwIfAborted();
+      const staged = normalizeAsset(input, this.#storage, { key, contentType, expiresIn, signal });
+      return signal === undefined ? staged : untilAborted(staged, signal);
+    });
   }
 
   /** @internal Starts a fluent render; see {@link FluentRenderer}. */
@@ -787,7 +806,7 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
       const { body, outputs } = await materializeRender(prepared, this.#storage, signal);
       return () =>
         runJob(this.#http, {
-          submit: () => this.#submit(RENDER_PATH, body),
+          submit: (stop) => this.#submit(RENDER_PATH, body, stop),
           mapResult: (terminal, meta) => renderAssets(terminal, meta, outputs),
           onProgress: progress.onProgress,
           ...jobTuning(options),
@@ -798,10 +817,12 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
   /**
    * Submits a job and returns its ID and status URL. The service's `202` body
    * carries `jobId`, `statusUrl` and `cancelUrl`; the cancel request goes to
-   * `/v1/cancel/{jobId}`, which is what `cancelUrl` names.
+   * `/v1/cancel/{jobId}`, which is what `cancelUrl` names. `stop` ends the
+   * submit wherever no attempt is in flight — a `429` created no job — and
+   * never aborts one already sent.
    */
-  async #submit(path: string, body: unknown): Promise<JobSubmission> {
-    const res = await this.#http.request<unknown>('POST', path, body);
+  async #submit(path: string, body: unknown, stop: AbortSignal): Promise<JobSubmission> {
+    const res = await this.#http.request<unknown>('POST', path, body, { stopSignal: stop });
     const { jobId, statusUrl } = isRecord(res.body) ? res.body : {};
     if (typeof jobId !== 'string' || jobId === '' || typeof statusUrl !== 'string' || !statusUrl) {
       throw new AudioVideoError({
@@ -893,6 +914,10 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
   /** @internal Logs a fluent render as cancelled before it reached this client; see {@link FluentRenderer.logCancelled}. */
   logCancelled(error: AudioVideoError): void {
     this.#log({ ...settleFields('render', { ok: false, error }), endpoint: RENDER_ENDPOINT });
+  }
+
+  static {
+    brandClass(this, 'AudioVideoClient');
   }
 }
 

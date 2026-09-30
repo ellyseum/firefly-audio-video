@@ -5,7 +5,7 @@
  * tiered interval, retrying transient poll failures, deciding when the job is
  * terminal (including item-level errors reported while `status` still reads
  * `running`), deriving queue / render / total timing, and cancellation — and
- * hands the caller one {@link AsyncJob} that is both awaitable and a handle.
+ * hands the caller one job object that is both awaitable and a handle.
  * Nothing here knows what is being rendered, transcribed, or generated: `core/`
  * never imports from a capability module, and every status body is read
  * structurally through {@link JobStatusLike}.
@@ -101,14 +101,17 @@ export type PollInterval = number | ((elapsedMs: number) => number);
 export interface RunJobOptions<T> {
   /**
    * Issues the capability's request and returns the accepted job's ID and status
-   * URL. It is not handed the job's abort signal: a cancel during submission lets
-   * the request complete, so the job the service accepted is known by ID and is
-   * sent the cancel request — aborting the request would leave that job running
-   * unseen. Never retried: a failing submit rejects the job with the error it
-   * threw when that error is already an {@link AudioVideoError} (a caller matches
-   * on its code), or with one wrapping it (`code: 'submit_failed'`) otherwise.
+   * URL. `stop` aborts when the job is cancelled or times out: the request must
+   * then stop wherever nothing is in flight — before an attempt is sent, while it
+   * waits to retry after a `429`, which created no job — and reject, but never
+   * abort an attempt already sent. That attempt is seen through, so a job the
+   * service accepted is known by ID and is sent the cancel request; aborting it
+   * would leave that job running unseen. Never retried here: a failing submit
+   * rejects the job with the error it threw when that error is already an
+   * {@link AudioVideoError} (a caller matches on its code), or with one wrapping
+   * it (`code: 'submit_failed'`) otherwise.
    */
-  submit: () => Promise<JobSubmission>;
+  submit: (stop: AbortSignal) => Promise<JobSubmission>;
   /** Builds the job's result from a successful terminal status body and its derived timing. */
   mapResult: (terminal: JobStatusLike, meta: JobMeta) => T;
   /**
@@ -119,8 +122,10 @@ export interface RunJobOptions<T> {
   /**
    * Called once per poll with the raw status body, the terminal poll included. On
    * the terminal poll it runs after the outcome and `meta` have been derived, so
-   * nothing it does to the body changes them. An error it throws is the caller's
-   * own: it rejects the job exactly as thrown, never wrapped.
+   * nothing it does to the body changes them. If it throws, the job rejects
+   * `callback_failed` with the thrown value as `cause` — once the service has
+   * been sent the best-effort cancel request {@link AsyncJob.cancel} sends,
+   * when the poll was not the terminal one.
    */
   onProgress?: (status: JobStatusLike) => void;
   /**
@@ -228,39 +233,29 @@ const POLL_RETRY_BASE_MS = 1_000;
 const POLL_RETRY_MAX_MS = 30_000;
 
 /**
- * A running asynchronous job: awaitable like a promise (`await job`, `job.then()`,
- * `Promise.all([job])`) and holdable as a handle (`job.jobId`, `job.meta`,
- * `job.cancel()`). It settles exactly once — with the capability's mapped result
+ * @internal The job engine's handle on one running job: awaitable like a promise
+ * (`await job`, `job.then()`, `Promise.all([job])`) and holdable as a handle
+ * (`job.jobId`, `job.meta`, `job.cancel()`). It settles exactly once — with the capability's mapped result
  * when the job reaches a successful terminal state, or with an
  * {@link AudioVideoError} whose `code` is `job_failed`, `job_poll_failed`,
- * `submit_failed`, `cancelled` or `job_timeout` — or, when a submit or a final
- * poll failure was already one (a `404`, say — repeating the request cannot
- * change it), that same error unchanged.
+ * `submit_failed`, `callback_failed`, `cancelled` or `job_timeout` — or, when
+ * a submit or a final poll failure was already one (a `404`, say — repeating
+ * the request cannot change it), that same error unchanged.
  *
  * `util.inspect` / `console.log` print only `{ jobId, state }` — never a URL or a
  * status body — so a job can be logged freely.
  *
  * A job is a promise in this respect too: one that is never awaited (or given a
  * rejection handler) and ends in `job_failed`, `job_poll_failed`, `submit_failed`,
- * `job_timeout` or a service-side cancellation is an unhandled rejection. Only a
+ * `callback_failed`, `job_timeout` or a service-side cancellation is an
+ * unhandled rejection. Only a
  * job cancelled through {@link AsyncJob.cancel} or `signal` carries a handler of
  * its own.
  *
- * Instances are created by the SDK's job runner; application code receives them
- * from a capability method. The constructor is private — a job cannot be built
- * or subclassed outside the SDK — while `instanceof AsyncJob` still works.
- *
- * @example
- * ```ts
- * const job: AsyncJob<Result> = startSomething(); // any capability method returning an AsyncJob
- * const giveUp = setTimeout(() => void job.cancel(), 60_000);
- * try {
- *   const result = await job; // resolves once the job is terminal
- *   console.log(job.jobId, job.meta?.totalMs);
- * } finally {
- *   clearTimeout(giveUp);
- * }
- * ```
+ * Application code never holds one: a capability method runs its job inside a
+ * pooled call and returns that call's `JobHandle`, a type several classes
+ * satisfy. Instances come only from {@link runJob}; the constructor is private,
+ * so a job cannot be built or subclassed outside the SDK.
  */
 export class AsyncJob<T> implements PromiseLike<T> {
   readonly #controller = new AbortController();
@@ -344,6 +339,19 @@ export class AsyncJob<T> implements PromiseLike<T> {
     return this.#meta;
   }
 
+  /**
+   * @internal Resolves, never rejects, once the job has settled and so has
+   * everything it asked of the service: its submit request, and the cancel
+   * request a cancelled job sends once that submit shows a job to cancel. A
+   * job cancelled mid-submit settles at once but drains only then.
+   */
+  get drained(): Promise<void> {
+    return this.#promise.then(noop, noop).then(async () => {
+      await this.#jobIdKnown.promise;
+      await this.#remoteCancel;
+    });
+  }
+
   /** Attaches fulfillment/rejection handlers to the job's settlement; `await job` works through this. */
   then<TResult1 = T, TResult2 = never>(
     onfulfilled?: ((value: T) => TResult1 | PromiseLike<TResult1>) | null,
@@ -372,9 +380,10 @@ export class AsyncJob<T> implements PromiseLike<T> {
    *
    * A submit request still in flight is left to complete rather than aborted, so
    * the job the service accepted is known by ID and the cancel request reaches it;
-   * this promise resolves once that request has been attempted (or once a failed
-   * submit has shown there is nothing to cancel). Calling this on an
-   * already-settled job, or a second time, is a no-op.
+   * a submit waiting to retry after a `429`, which created no job, stops instead.
+   * This promise resolves once the cancel request has been attempted (or once a
+   * failed or stopped submit has shown there is nothing to cancel). Calling this
+   * on an already-settled job, or a second time, is a no-op.
    */
   cancel(): Promise<void> {
     return this.#cancelWith(ABORT_CANCELLED);
@@ -500,6 +509,10 @@ export class AsyncJob<T> implements PromiseLike<T> {
  *   on the client's own host, never to the refused URL; the job rejects once
  *   that request has been attempted, and a failed cancel request never replaces
  *   the `invalid_response`;
+ * - rejects `callback_failed`, with the thrown value as `cause`, when
+ *   `opts.onProgress` throws — on a poll that was not the terminal one, once
+ *   the service has been sent the best-effort cancel request, since nothing
+ *   polls the job after that;
  * - rejects `submit_failed`, with the rejection as `cause`, when the submit call
  *   rejects with anything other than an {@link AudioVideoError}; a submit
  *   rejecting with one (`http_429`, an auth failure, …) rejects the job with that
@@ -599,7 +612,7 @@ async function pollUntilTerminal<T>(
   const startedAt = Date.now();
 
   signal.throwIfAborted();
-  const submission = opts.submit().catch((err: unknown) => {
+  const submission = opts.submit(signal).catch((err: unknown) => {
     throw submitFailure(err);
   });
   const { jobId, statusUrl } = await ctx.trackSubmission(submission);
@@ -632,7 +645,13 @@ async function pollUntilTerminal<T>(
     const status = asStatusBody(response.body);
     const outcome = terminalOutcome(status, jobId);
     if (outcome !== undefined) ctx.setMeta(outcome.meta);
-    opts.onProgress?.(status);
+    try {
+      opts.onProgress?.(status);
+    } catch (error) {
+      // Nothing polls a job after this, so one still running is asked to stop.
+      if (outcome === undefined) await ctx.cancelRemote();
+      throw callbackFailure(jobId, outcome !== undefined, error);
+    }
 
     if (outcome !== undefined) {
       if (outcome.failure !== undefined) throw outcome.failure;
@@ -851,6 +870,24 @@ function submitFailure(cause: unknown): AudioVideoError {
   return new AudioVideoError({
     message: `${describeJob(undefined)} could not be submitted: ${describeFailure(cause)}.`,
     code: 'submit_failed',
+    cause,
+  });
+}
+
+/**
+ * The error a job rejects with when its `onProgress` callback throws, on the
+ * job's final status (`terminal`) or while it was still running. `cause` is
+ * the thrown value exactly as given, by design: it is the caller's own value,
+ * handed back to the caller, and `cause` never reaches a log record or a
+ * serialized form of the error.
+ */
+function callbackFailure(jobId: string, terminal: boolean, cause: unknown): AudioVideoError {
+  return new AudioVideoError({
+    message: terminal
+      ? `The onProgress callback threw on job ${jobId}'s final status.`
+      : `The onProgress callback threw while job ${jobId} was running; the service was asked to stop the job.`,
+    code: 'callback_failed',
+    jobId,
     cause,
   });
 }

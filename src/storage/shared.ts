@@ -18,10 +18,12 @@ export const DEFAULT_PREFIX = 'firefly-audio-video/';
 
 /**
  * @internal Seconds a staged input's URL lasts unless a caller says otherwise.
- * The URL is minted in the job's pool slot just before the submit, so it has
- * to last from the submit until the render has read the input.
+ * The URL is minted in the job's pool slot just before the submit, and the
+ * service may not read the input until rendering starts, after the job has
+ * waited in its queue (waits of 45 minutes have been seen), so it lasts as
+ * long as an output's URLs.
  */
-export const READ_EXPIRY_SECONDS = 3_600;
+export const READ_EXPIRY_SECONDS = 86_400;
 
 /** @internal Seconds an output's URLs last unless a caller says otherwise: they must outlive the render and the download after it. */
 export const OUTPUT_EXPIRY_SECONDS = 86_400;

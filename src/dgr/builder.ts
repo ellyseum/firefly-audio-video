@@ -10,7 +10,7 @@ import type { Asset, AssetReadOptions } from '../core/asset.js';
 import { AudioVideoError } from '../core/errors.js';
 import type { JobMeta, JobStatusLike, PollInterval } from '../core/job.js';
 import { rejectedJob, type JobHandle } from '../core/pooled-job.js';
-import { linkSignals } from '../core/signals.js';
+import { linkSignals, untilAborted } from '../core/signals.js';
 import { PRESET_NAMES } from '../presets/names.js';
 import type { Client, RenderJob } from './client.js';
 import { Preset, toPreset, type PresetInput, type ResizeTarget } from './preset.js';
@@ -40,7 +40,11 @@ export interface RenderBuilderOptions {
    * `cancelled` with the abort reason as `cause`.
    */
   signal?: AbortSignal;
-  /** Called once per status poll with the raw status body, the terminal poll included. */
+  /**
+   * Called once per status poll with the raw status body, the terminal poll
+   * included. If it throws, the render rejects `callback_failed` with the
+   * thrown value as `cause`, and a job still running is asked to stop.
+   */
   onProgress?: (status: JobStatusLike) => void;
   /**
    * Milliseconds between status polls — a constant, or a function of the
@@ -105,7 +109,10 @@ export interface RenderBuilder extends RenderJob<Asset>, NamedBuilderSteps {
   /**
    * A byte stream over the finished asset; see `Asset.stream`. Lazy: the
    * render starts on the stream's first read, and a render failure surfaces
-   * as an `'error'` event.
+   * as an `'error'` event. Destroying the stream — directly, or through
+   * `pipeline()` when the destination fails — cancels a render still running,
+   * as `cancel()` does, and ends a download in progress at once; a stream
+   * never read has started nothing to stop.
    */
   stream(options?: AssetReadOptions): Readable;
   /** Renders, then streams the finished asset to `path`; see `Asset.save`. */
@@ -207,7 +214,24 @@ class FluentRender implements Omit<RenderBuilder, PresetName> {
   }
 
   stream(options?: AssetReadOptions): Readable {
-    return Readable.from(this.#chunks(options), { objectMode: false });
+    const destroyed = new AbortController();
+    let phase: 'idle' | 'render' | 'download' = 'idle';
+    const bytes = Readable.from(
+      this.#chunks(options, destroyed.signal, (next) => {
+        phase = next;
+      }),
+      { objectMode: false },
+    );
+    // Readable.from's own destroy asks the generator to return, which takes effect only at its
+    // next yield: after the render, and after the download's next chunk. Stopping here ends
+    // either at once — a render still running is cancelled on the service.
+    const destroyChunks = bytes._destroy.bind(bytes);
+    bytes._destroy = (error, callback) => {
+      destroyed.abort(error ?? new Error('The stream was destroyed.'));
+      if (phase === 'render') void this.#job?.cancel();
+      destroyChunks(error, callback);
+    };
+    return bytes;
   }
 
   save(path: string, options?: AssetReadOptions): Promise<void> {
@@ -325,9 +349,20 @@ class FluentRender implements Omit<RenderBuilder, PresetName> {
     );
   }
 
-  async *#chunks(options: AssetReadOptions | undefined): AsyncGenerator<Buffer> {
-    const asset = await this.#started();
-    const link = this.#readLink(options);
+  /**
+   * The bytes a `.stream()` reads: the render, then its asset's download,
+   * reporting each phase as it begins. `destroyed` aborts both — the wait for
+   * the render at once, and the download through its read signal.
+   */
+  async *#chunks(
+    options: AssetReadOptions | undefined,
+    destroyed: AbortSignal,
+    onPhase: (phase: 'render' | 'download') => void,
+  ): AsyncGenerator<Buffer> {
+    onPhase('render');
+    const asset = await untilAborted(Promise.resolve(this.#started()), destroyed);
+    onPhase('download');
+    const link = this.#readLink(options, destroyed);
     try {
       yield* asset.stream(link.options);
     } finally {
@@ -351,16 +386,20 @@ class FluentRender implements Omit<RenderBuilder, PresetName> {
   /**
    * The options a terminal's underlying `Asset` read observes: a signal that
    * fires with whichever of the caller's own signal, this builder's `signal`
-   * option, and this builder's own `cancel()` fires first, and the caller's
-   * `retries`. The signal's listeners on those signals go once it aborts or
-   * `release` is called, which the terminal does when its read is over: the
-   * caller's signals can outlive the read by far.
+   * option, this builder's own `cancel()` and the terminal's own `stop` (a
+   * destroyed `.stream()`) fires first, and the caller's `retries`. The
+   * signal's listeners on those signals go once it aborts or `release` is
+   * called, which the terminal does when its read is over: the caller's
+   * signals can outlive the read by far.
    */
-  #readLink(options: AssetReadOptions | undefined): {
+  #readLink(
+    options: AssetReadOptions | undefined,
+    stop?: AbortSignal,
+  ): {
     options: AssetReadOptions;
     release: () => void;
   } {
-    const signals = [this.#reading.signal, this.#options.signal, options?.signal].filter(
+    const signals = [this.#reading.signal, this.#options.signal, options?.signal, stop].filter(
       (signal): signal is AbortSignal => signal !== undefined,
     );
     const { signal, release } = linkSignals(signals);

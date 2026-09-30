@@ -1,5 +1,6 @@
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
 import type { Readable } from 'node:stream';
+import { setTimeout as sleep } from 'node:timers/promises';
 import type { LogRecord, Logger } from '../../src/core/logging.js';
 import type { StorageProvider } from '../../src/core/storage.js';
 
@@ -304,4 +305,59 @@ export async function until(predicate: () => boolean, turns = 500): Promise<void
     await flush();
   }
   throw new Error('condition not reached');
+}
+
+/** Resolves once `predicate()` holds, checking every few milliseconds; rejects after `timeoutMs`. */
+export async function eventually(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error('condition not reached in time');
+    await sleep(5);
+  }
+}
+
+/**
+ * Answers every request whose URL starts with `prefix` through a stub over
+ * `globalThis.fetch`, with `chunks` 1 KiB chunks, one every `everyMs`, and
+ * counts the chunks served; every other request goes to the real fetch.
+ * `restore` puts the real fetch back.
+ */
+export function trickle(
+  prefix: string,
+  chunks: number,
+  everyMs: number,
+): { served: () => number; restore: () => void } {
+  let served = 0;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (input: string | URL | Request, init?: RequestInit) => {
+    const target =
+      typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (!target.startsWith(prefix)) return realFetch(input, init);
+    const signal = init?.signal;
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        await sleep(everyMs);
+        if (signal?.aborted) {
+          controller.error(signal.reason);
+          return;
+        }
+        if (served >= chunks) {
+          controller.close();
+          return;
+        }
+        served += 1;
+        controller.enqueue(new Uint8Array(1024));
+      },
+    });
+    return new Response(body, {
+      status: 200,
+      headers: { 'content-length': String(chunks * 1024) },
+    });
+  };
+  return {
+    served: () => served,
+    restore: () => {
+      globalThis.fetch = realFetch;
+    },
+  };
 }

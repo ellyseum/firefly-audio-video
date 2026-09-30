@@ -58,6 +58,15 @@ export interface HttpRequestInit {
    */
   signal?: AbortSignal;
   /**
+   * Stops the request at the next point where nothing is in flight: before
+   * an attempt is sent — the first, or a retry after a `429` or a `401` —
+   * and during a wait for a token or before a retry, which it cuts short. The
+   * request then rejects `cancelled`. Unlike {@link HttpRequestInit.signal} it
+   * never aborts an attempt already sent, so a request that may have taken
+   * effect on the server is always seen through to its response.
+   */
+  stopSignal?: AbortSignal;
+  /**
    * Merged over the computed `Authorization` / `x-api-key` / `Accept` /
    * `Content-Type` headers — a caller-supplied value with the same name
    * wins, for the rare case a call needs to override one.
@@ -160,7 +169,9 @@ export class HttpClient {
    *   response left after retries are exhausted, with `.items` holding the
    *   redacted response body.
    * @throws {@link AudioVideoError} — `code: 'cancelled'` — when `init.signal`
-   *   aborts before the request settles, including during a backoff wait.
+   *   aborts before the request settles, including during a backoff wait, or
+   *   `init.stopSignal` aborts before an attempt is sent or while the request
+   *   waits for a token or a retry.
    * @throws {@link AudioVideoError} — `code: 'request_timeout'` — when one
    *   attempt runs past this client's own 30-second budget.
    * @throws {@link AudioVideoError} — `code: 'request_failed'` — when the
@@ -177,53 +188,61 @@ export class HttpClient {
     init: HttpRequestInit = {},
   ): Promise<HttpResponse<T>> {
     const url = this.#resolve(path, init.fromResponse === true);
-    let token = await this.#token(false, init.signal, url);
-    let usedAuthRetry = false;
+    // The token requests and backoff delays stop for either signal; a fetch only for `signal`.
+    const waits = waitSignal(init);
+    try {
+      let token = await this.#token(false, waits.signal, url);
+      let usedAuthRetry = false;
 
-    for (let attempt = 0; ;) {
-      const timeoutSignal = AbortSignal.timeout(DEFAULT_ATTEMPT_TIMEOUT_MS);
-      const link =
-        init.signal === undefined ? undefined : linkSignals([timeoutSignal, init.signal]);
-      const signal = link?.signal ?? timeoutSignal;
+      for (let attempt = 0; ;) {
+        const stop = init.stopSignal;
+        if (stop?.aborted) throw cancelledRequest(url, stop.reason);
+        const timeoutSignal = AbortSignal.timeout(DEFAULT_ATTEMPT_TIMEOUT_MS);
+        const link =
+          init.signal === undefined ? undefined : linkSignals([timeoutSignal, init.signal]);
+        const signal = link?.signal ?? timeoutSignal;
 
-      try {
-        const res = await fetch(url, {
-          method,
-          headers: buildRequestHeaders(token, this.#apiKey, body !== undefined, init.headers),
-          body: body === undefined ? undefined : JSON.stringify(body),
-          redirect: 'manual',
-          signal,
-        });
+        try {
+          const res = await fetch(url, {
+            method,
+            headers: buildRequestHeaders(token, this.#apiKey, body !== undefined, init.headers),
+            body: body === undefined ? undefined : JSON.stringify(body),
+            redirect: 'manual',
+            signal,
+          });
 
-        if (res.status === 429 && attempt < this.#maxRetries) {
-          await drainBody(res);
-          await delay(computeDelayMs(res.headers.get('retry-after'), attempt), init.signal);
-          attempt += 1;
-          continue;
+          if (res.status === 429 && attempt < this.#maxRetries) {
+            await drainBody(res);
+            await delay(computeDelayMs(res.headers.get('retry-after'), attempt), waits.signal);
+            attempt += 1;
+            continue;
+          }
+
+          if (res.status === 401 && !usedAuthRetry) {
+            await drainBody(res);
+            usedAuthRetry = true;
+            token = await this.#token(true, waits.signal, url);
+            continue;
+          }
+
+          if (res.status >= 200 && res.status < 300) {
+            return {
+              status: res.status,
+              headers: headersToRecord(res.headers),
+              body: await parseBody<T>(res),
+            };
+          }
+
+          throw await toAudioVideoError(res, url);
+        } catch (error) {
+          if (error instanceof AudioVideoError) throw error;
+          throw requestFailure(error, url, init, timeoutSignal);
+        } finally {
+          link?.release();
         }
-
-        if (res.status === 401 && !usedAuthRetry) {
-          await drainBody(res);
-          usedAuthRetry = true;
-          token = await this.#token(true, init.signal, url);
-          continue;
-        }
-
-        if (res.status >= 200 && res.status < 300) {
-          return {
-            status: res.status,
-            headers: headersToRecord(res.headers),
-            body: await parseBody<T>(res),
-          };
-        }
-
-        throw await toAudioVideoError(res, url);
-      } catch (error) {
-        if (error instanceof AudioVideoError) throw error;
-        throw requestFailure(error, url, init.signal, timeoutSignal);
-      } finally {
-        link?.release();
       }
+    } finally {
+      waits.release();
     }
   }
 
@@ -350,19 +369,19 @@ function cancelledRequest(url: URL, reason: unknown): AudioVideoError {
 
 /**
  * The {@link AudioVideoError} for an attempt that failed before a response
- * settled it: `cancelled` when the caller's signal aborted, `request_timeout`
- * when this client's own per-attempt timeout did, and `request_failed` for
- * any other transport failure. The `cause` is a redacted copy of `error`, and
- * a `request_failed` message names the innermost system error code (such as
- * `ECONNRESET`) when the cause chain carries one.
+ * settled it: `cancelled` when the caller's signal or stop signal aborted,
+ * `request_timeout` when this client's own per-attempt timeout did, and
+ * `request_failed` for any other transport failure. The `cause` is a redacted
+ * copy of `error`, and a `request_failed` message names the innermost system
+ * error code (such as `ECONNRESET`) when the cause chain carries one.
  */
 function requestFailure(
   error: unknown,
   url: URL,
-  callerSignal: AbortSignal | undefined,
+  init: HttpRequestInit,
   timeoutSignal: AbortSignal,
 ): AudioVideoError {
-  if (callerSignal?.aborted) return cancelledRequest(url, error);
+  if (init.signal?.aborted || init.stopSignal?.aborted) return cancelledRequest(url, error);
   const target = redactUrl(url.toString());
   const cause = redactError(error);
   if (timeoutSignal.aborted) {
@@ -378,6 +397,22 @@ function requestFailure(
     code: 'request_failed',
     cause,
   });
+}
+
+/**
+ * The signal a request's waits observe — its token requests and the delays
+ * before its retries — aborting when `signal` or `stopSignal` does, and the
+ * function that unhooks it from both once the request is over.
+ */
+function waitSignal(init: HttpRequestInit): {
+  signal: AbortSignal | undefined;
+  release: () => void;
+} {
+  const { signal, stopSignal } = init;
+  if (signal === undefined || stopSignal === undefined) {
+    return { signal: signal ?? stopSignal, release: () => undefined };
+  }
+  return linkSignals([signal, stopSignal]);
 }
 
 /** The deepest string `code` along an error's `cause` chain, such as `ENOTFOUND`. */

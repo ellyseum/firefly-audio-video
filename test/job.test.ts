@@ -384,7 +384,7 @@ test('a null entry in outputs[] contributes no errors and no timing, and its nei
   expect(meta.renderMs).toBe(2_000);
 });
 
-test('an onProgress that throws on the terminal poll rejects the job with that error, meta already derived', async () => {
+test('an onProgress that throws on the terminal poll rejects callback_failed with that error as cause, meta already derived, and sends no cancel', async () => {
   statusReplies(
     { status: 'running' },
     {
@@ -394,6 +394,7 @@ test('an onProgress that throws on the terminal poll rejects the job with that e
       outputs: [{ startedDate: at(1), completedDate: at(3) }],
     },
   );
+  const cancels = cancelEndpoint();
   const bug = new RangeError('callback bug');
   const job = runJob(http(), {
     submit: submitJ1,
@@ -404,9 +405,47 @@ test('an onProgress that throws on the terminal poll rejects the job with that e
     },
   });
 
-  expect(await rejectionOf(job)).toBe(bug);
+  const err = await rejectionOf(job);
+  expect(err).toBeInstanceOf(AudioVideoError);
+  expect(err?.code).toBe('callback_failed');
+  expect(err?.cause).toBe(bug);
+  expect(err?.jobId).toBe('j1');
   expect(job.meta?.renderMs).toBe(2_000);
+  expect(cancels()).toBe(0);
   expect(inspect(job)).toBe("{ jobId: 'j1', state: 'rejected' }");
+});
+
+test('an onProgress that throws while the job runs asks the service to stop it, then rejects callback_failed with that error as cause', async () => {
+  const polls = runningForever();
+  const held = deferred();
+  let cancels = 0;
+  pool()
+    .intercept({ path: CANCEL_PATH, method: 'PUT' })
+    .reply(200, async () => {
+      cancels += 1;
+      await held.promise;
+      return '';
+    });
+  const bug = new Error('progress UI broke');
+  const job = runJob(http(), {
+    submit: submitJ1,
+    mapResult: () => 'unreached',
+    pollIntervalMs: 0,
+    onProgress: () => {
+      throw bug;
+    },
+  });
+
+  await until(() => cancels === 1);
+  expect(await isPending(job)).toBe(true);
+  held.resolve();
+
+  const err = await rejectionOf(job);
+  expect(err).toBeInstanceOf(AudioVideoError);
+  expect(err?.code).toBe('callback_failed');
+  expect(err?.cause).toBe(bug);
+  expect(err?.jobId).toBe('j1');
+  expect(polls()).toBe(1);
 });
 
 test('the outcome is derived before onProgress sees the body, so mutating it there changes nothing', async () => {

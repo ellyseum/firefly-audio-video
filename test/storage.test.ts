@@ -229,8 +229,10 @@ test('a signed-looking input that is not a URL keeps its signature out of every 
 
 // --- provider failures -----------------------------------------------------------------
 
-test('a provider that throws rejects storage_failed with its error as cause; its own AudioVideoError passes through', async () => {
-  const cause = new Error('bucket unreachable');
+test('a provider that throws rejects storage_failed with a redacted copy of its error as cause; its own AudioVideoError passes through', async () => {
+  const cause = new Error(
+    'bucket unreachable at https://acct.blob.core.windows.net/c/x?sv=2026&sig=PROVIDER_SIG',
+  );
   const failing = await rejection(
     normalizeAsset(Buffer.from('x'), {
       stageRead: () => Promise.reject(cause),
@@ -238,7 +240,11 @@ test('a provider that throws rejects storage_failed with its error as cause; its
     }),
   );
   expect(failing.code).toBe('storage_failed');
-  expect(failing.cause).toBe(cause);
+  expect(failing.cause).toBeInstanceOf(Error);
+  expect(failing.cause).not.toBe(cause);
+  const copied = (failing.cause as Error).message;
+  expect(copied).toContain('bucket unreachable at https://acct.blob.core.windows.net/c/x');
+  expect(copied).not.toContain('PROVIDER_SIG');
 
   const own = new AudioVideoError({ message: 'quota exceeded', code: 'quota' });
   const passed = await rejection(

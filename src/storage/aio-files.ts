@@ -5,6 +5,7 @@
 
 import * as fs from 'node:fs';
 import { readFile } from 'node:fs/promises';
+import { brandClass } from '../core/brand.js';
 import type { StageInput, StorageProvider } from '../core/storage.js';
 import { exportOf, loadPeer, type Peer } from './peer.js';
 import {
@@ -67,8 +68,9 @@ export interface AioFilesStorageProviderOptions {
   prefix?: string;
   /**
    * Seconds every URL this provider returns stays valid, from 2 to 86400 (24
-   * hours). Defaults to one hour for a staged input and 24 hours for an
-   * output, whose URLs must outlive the render and the download after it.
+   * hours). Defaults to 24 hours: a staged input's URL must last until the
+   * service reads it, which can follow a long wait in its queue, and an
+   * output's URLs must outlive the render and the download after it.
    */
   expiresIn?: number;
   /**
@@ -295,6 +297,10 @@ export class AioFilesStorageProvider implements StorageProvider {
 
   #checkExpiry(value: unknown): number {
     return checkExpiry(value, `${NAME}: expiresIn`, MAX_EXPIRY_SECONDS, MIN_EXPIRY_SECONDS);
+  }
+
+  static {
+    brandClass(this, 'AioFilesStorageProvider');
   }
 }
 

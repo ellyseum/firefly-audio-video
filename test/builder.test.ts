@@ -1,24 +1,29 @@
-import { getEventListeners } from 'node:events';
+import { getEventListeners, once } from 'node:events';
 import { existsSync, mkdtempSync, readFileSync, rmdirSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { Readable } from 'node:stream';
+import { PassThrough, type Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { inspect } from 'node:util';
 import { afterAll, afterEach, beforeAll, beforeEach, expect, expectTypeOf, test } from 'vitest';
 import { Asset } from '../src/core/asset.js';
 import { AudioVideoError } from '../src/core/errors.js';
 import { InMemoryPool } from '../src/core/pool.js';
-import type { RenderBuilder } from '../src/dgr/builder.js';
+import type { JobHandle } from '../src/core/pooled-job.js';
+import { createRenderBuilder, type RenderBuilder } from '../src/dgr/builder.js';
 import { createClient, type Client, type ClientConfig } from '../src/dgr/client.js';
 import { Preset } from '../src/dgr/preset.js';
 import {
   MockApi,
   STORAGE,
+  eventually,
   fakeStorage,
   flush,
   recordingLogger,
   running,
   succeeded,
+  trickle,
   until,
   wireOutput,
   type FakeStorage,
@@ -331,6 +336,85 @@ test('a render failure surfaces on .stream() as an error event', async () => {
     })(),
   );
   expect(error.code).toBe('invalid_argument');
+});
+
+test('a .stream() pipeline torn down while the render runs cancels the render on the service and downloads nothing', async () => {
+  api.submit(['job-d']);
+  let polls = 0;
+  api.status('job-d', () => {
+    polls += 1;
+    return polls < 4 ? running('job-d') : succeeded('job-d', [wireOutput(0, 0, 1, 2)]);
+  });
+  api.cancel('job-d');
+  api.download('/out/', BYTES);
+  const builder = client().render(CAPSULE, { pollIntervalMs: 10 }).prores;
+  const sink = new PassThrough();
+  const piping = pipeline(builder.stream(), sink);
+  await until(() => polls >= 1);
+
+  sink.destroy(new Error('the client went away'));
+  await expect(piping).rejects.toThrow('the client went away');
+  await until(() => api.count('PUT', '/v1/cancel/job-d') === 1);
+  expect((await rejection(builder)).code).toBe('cancelled');
+  await sleep(100);
+  expect(api.count('GET', '/out/', STORAGE)).toBe(0);
+});
+
+test('destroying a .stream() mid-download ends the download at once, before its next chunk', async () => {
+  jobsSucceed('job-1');
+  const download = trickle(`${STORAGE}/out/`, 10, 200);
+  try {
+    const stream = client().render(CAPSULE, { pollIntervalMs: 0 }).prores.stream();
+    const closed = once(stream, 'close');
+    stream.resume();
+    await eventually(() => download.served() >= 2, 5_000);
+
+    const servedAtStop = download.served();
+    stream.destroy();
+    await closed;
+    // Longer than one chunk's interval: a download still running would have served another.
+    await sleep(300);
+    expect(download.served()).toBe(servedAtStop);
+  } finally {
+    download.restore();
+  }
+});
+
+test('a destroyed .stream() closes at once even while the render it waits on has not settled', async () => {
+  const never = new Promise<Asset>(() => undefined);
+  const stuck: JobHandle<Asset> = {
+    jobId: 'job-stuck',
+    meta: undefined,
+    cancel: () => Promise.resolve(),
+    then: (onfulfilled, onrejected) => never.then(onfulfilled, onrejected),
+    catch: (onrejected) => never.catch(onrejected),
+    finally: (onfinally) => never.finally(onfinally),
+  };
+  const builder = createRenderBuilder(CAPSULE, {}, () => ({
+    startFluentRender: () => stuck,
+    logCancelled: () => undefined,
+  }));
+  const stream = builder.stream();
+  stream.resume();
+  await flush();
+
+  stream.destroy();
+  const outcome = await Promise.race([
+    once(stream, 'close').then(() => 'closed'),
+    sleep(1_000).then(() => 'still open'),
+  ]);
+  expect(outcome).toBe('closed');
+});
+
+test('destroying a .stream() before it is read cancels nothing: the builder still renders when awaited', async () => {
+  jobsSucceed('job-1');
+  const builder = client().render(CAPSULE, { pollIntervalMs: 0 }).prores;
+  const stream = builder.stream();
+  stream.destroy();
+  await once(stream, 'close');
+
+  expect(api.calls).toEqual([]);
+  await expect(builder).resolves.toBeInstanceOf(Asset);
 });
 
 test('cancel() before the render starts makes it reject cancelled once awaited, submitting nothing', async () => {

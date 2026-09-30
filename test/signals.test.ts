@@ -1,6 +1,6 @@
 import { getEventListeners } from 'node:events';
 import { expect, test, vi } from 'vitest';
-import { delay, linkSignals } from '../src/core/signals.js';
+import { delay, linkSignals, untilAborted } from '../src/core/signals.js';
 
 test('linkSignals: aborts with the reason of whichever input aborts first', () => {
   const a = new AbortController();
@@ -107,5 +107,53 @@ test('delay: without a signal it simply waits', async () => {
     expect(settled).toBe(true);
   } finally {
     vi.useRealTimers();
+  }
+});
+
+test('untilAborted: settles as the promise does, leaving no listener on the signal', async () => {
+  const controller = new AbortController();
+  await expect(untilAborted(Promise.resolve('value'), controller.signal)).resolves.toBe('value');
+  const failure = new Error('failed');
+  await expect(untilAborted(Promise.reject(failure), controller.signal)).rejects.toBe(failure);
+  expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+});
+
+test('untilAborted: an abort rejects with the reason at once, and the promise failing later is not unhandled', async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown): void => void unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const controller = new AbortController();
+    let fail!: (error: Error) => void;
+    const pending = new Promise<string>((_resolve, reject) => {
+      fail = reject;
+    });
+    const waiting = untilAborted(pending, controller.signal);
+
+    const reason = new Error('stopped');
+    controller.abort(reason);
+    await expect(waiting).rejects.toBe(reason);
+
+    fail(new Error('late'));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(unhandled).toEqual([]);
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+});
+
+test('untilAborted: a signal that has already aborted rejects at once, and the promise failing is not unhandled', async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown): void => void unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const reason = new Error('already');
+    const failing = Promise.reject(new Error('never observed'));
+    await expect(untilAborted(failing, AbortSignal.abort(reason))).rejects.toBe(reason);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(unhandled).toEqual([]);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
   }
 });

@@ -2,6 +2,7 @@ import { existsSync, mkdtempSync, rmdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Readable } from 'node:stream';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { inspect } from 'node:util';
 import { afterAll, afterEach, beforeAll, beforeEach, expect, expectTypeOf, test } from 'vitest';
 import { Asset } from '../src/core/asset.js';
@@ -18,6 +19,7 @@ import {
 } from '../src/dgr/client.js';
 import { encode, presets } from '../src/dgr/preset.js';
 import type { RenderRequest, RenderRequestOutput } from '../src/dgr/schemas.js';
+import { deferred } from './support/fake-ims.js';
 import {
   API,
   CREATED,
@@ -25,12 +27,14 @@ import {
   STORAGE,
   TOKEN,
   at,
+  eventually,
   fakeStorage,
   flush,
   recordingLogger,
   running,
   succeeded,
   succeededWithoutOutputs,
+  trickle,
   until,
   wireOutput,
 } from './support/mock-api.js';
@@ -151,6 +155,42 @@ test('render(spec): 202, then poll, then succeeded, resolves an Asset at the out
   expect(api.imsRequests()).toHaveLength(1);
 });
 
+test.each(['the caller signal', 'job.cancel()'] as const)(
+  "resolveAs: 'stream' stops its download within a chunk or two when %s cancels after the render resolved",
+  async (route) => {
+    api.submit(['job-s']);
+    succeedsAt('job-s');
+    const download = trickle(READ, 30, 20);
+    try {
+      const controller = new AbortController();
+      const job = client().render(singleSpec(), {
+        resolveAs: 'stream',
+        signal: controller.signal,
+        pollIntervalMs: 0,
+      });
+      const stream = await job;
+      const ended = new Promise<unknown>((resolve) => {
+        stream.once('error', resolve);
+        stream.once('end', () => resolve('end'));
+      });
+      stream.resume();
+      await eventually(() => download.served() >= 3);
+
+      const servedAtStop = download.served();
+      if (route === 'the caller signal') controller.abort(new Error('caller gave up'));
+      else await job.cancel();
+      const outcome = await ended;
+      await sleep(100);
+
+      expect(outcome).toBeInstanceOf(AudioVideoError);
+      expect((outcome as AudioVideoError).code).toBe('cancelled');
+      expect(download.served() - servedAtStop).toBeLessThanOrEqual(2);
+    } finally {
+      download.restore();
+    }
+  },
+);
+
 test('an output without a readUrl is read back from its destination', async () => {
   api.submit(['job-1']);
   succeedsAt('job-1');
@@ -187,6 +227,33 @@ test('onProgress is called with each status poll, terminal included', async () =
     onProgress: (status) => seen.push(status.status),
   });
   expect(seen).toEqual(['running', 'succeeded']);
+});
+
+test('an onProgress that throws stops the render on the service and rejects callback_failed with that error as cause', async () => {
+  api.submit(['job-cb']);
+  api.status('job-cb', () => running('job-cb'));
+  api.cancel('job-cb');
+  const logger = recordingLogger();
+  const bug = new Error('progress UI broke');
+  let polls = 0;
+
+  const error = await rejection(
+    client({ logging: logger }).render(singleSpec(), {
+      pollIntervalMs: 0,
+      onProgress: () => {
+        polls += 1;
+        if (polls === 2) throw bug;
+      },
+    }),
+  );
+
+  expect(error.code).toBe('callback_failed');
+  expect(error.cause).toBe(bug);
+  expect(error.jobId).toBe('job-cb');
+  expect(api.count('PUT', '/v1/cancel/job-cb')).toBe(1);
+  expect(logger.records.map((record) => [record.level, record.msg])).toEqual([
+    ['error', 'render failed'],
+  ]);
 });
 
 // --- render: several outputs ---------------------------------------------------------
@@ -729,6 +796,111 @@ test('with concurrency 2, five renders never have more than two submitted jobs u
   expect(timeline.filter((event) => event.startsWith('submit:'))).toHaveLength(5);
 });
 
+test('at concurrency 1, cancelling a render while its submit waits out a 429 stops the submit, which created no job', async () => {
+  const pool = new InMemoryPool({ concurrency: 1 });
+  const timeline: string[] = [];
+  api.agent
+    .get(API)
+    .intercept({
+      path: '/v1/templates/render',
+      method: 'POST',
+      headers: { 'x-api-key': 'client-a' },
+    })
+    .reply(
+      429,
+      () => {
+        timeline.push('submit A: 429');
+        return { error: 'rate_limit' };
+      },
+      { headers: { 'retry-after': '0.2' } },
+    )
+    .persist();
+  api.agent
+    .get(API)
+    .intercept({
+      path: '/v1/templates/render',
+      method: 'POST',
+      headers: { 'x-api-key': 'client-b' },
+    })
+    .reply(202, () => {
+      timeline.push('submit B');
+      return { jobId: 'job-b', statusUrl: `${API}/v1/status/job-b` };
+    });
+  api.status('job-b', () => running('job-b'));
+  api.cancel('job-b');
+
+  const a = client({ clientId: 'client-a', pool }).render(singleSpec(), { pollIntervalMs: 1_000 });
+  const b = client({ clientId: 'client-b', pool }).render(singleSpec(), { pollIntervalMs: 1_000 });
+  await until(() => timeline.length === 1);
+
+  await a.cancel();
+  expect((await rejection(a)).code).toBe('cancelled');
+  await until(() => timeline.includes('submit B'));
+  // Three times the wait A's retry was due after: a submit still retrying would have sent it.
+  await sleep(600);
+  expect(timeline).toEqual(['submit A: 429', 'submit B']);
+
+  await b.cancel();
+  await rejection(b);
+});
+
+test('at concurrency 1, cancelling a render whose submit is in flight cancels the job it creates before the next render submits', async () => {
+  const pool = new InMemoryPool({ concurrency: 1 });
+  const timeline: string[] = [];
+  const held = deferred();
+  api.agent
+    .get(API)
+    .intercept({
+      path: '/v1/templates/render',
+      method: 'POST',
+      headers: { 'x-api-key': 'client-a' },
+    })
+    .reply(202, async () => {
+      timeline.push('submit A sent');
+      await held.promise;
+      timeline.push('submit A answered');
+      return { jobId: 'job-a', statusUrl: `${API}/v1/status/job-a` };
+    });
+  api.agent
+    .get(API)
+    .intercept({ path: '/v1/cancel/job-a', method: 'PUT' })
+    .reply(202, () => {
+      timeline.push('cancel job-a');
+      return { jobId: 'job-a', status: 'canceling' };
+    });
+  api.agent
+    .get(API)
+    .intercept({
+      path: '/v1/templates/render',
+      method: 'POST',
+      headers: { 'x-api-key': 'client-b' },
+    })
+    .reply(202, () => {
+      timeline.push('submit B');
+      return { jobId: 'job-b', statusUrl: `${API}/v1/status/job-b` };
+    });
+  api.status('job-b', () => running('job-b'));
+  api.cancel('job-b');
+
+  const a = client({ clientId: 'client-a', pool }).render(singleSpec(), { pollIntervalMs: 1_000 });
+  const b = client({ clientId: 'client-b', pool }).render(singleSpec(), { pollIntervalMs: 1_000 });
+  await until(() => timeline.includes('submit A sent'));
+
+  const cancelling = a.cancel();
+  expect((await rejection(a)).code).toBe('cancelled');
+  for (let turn = 0; turn < 20; turn += 1) await flush();
+  // A still holds the slot: its submit has not answered, so B has not submitted.
+  expect(timeline).toEqual(['submit A sent']);
+
+  held.resolve();
+  await cancelling;
+  await until(() => timeline.includes('submit B'));
+  expect(timeline).toEqual(['submit A sent', 'submit A answered', 'cancel job-a', 'submit B']);
+
+  await b.cancel();
+  await rejection(b);
+});
+
 test('cancel() before pool admission submits nothing and rejects cancelled; the slot it never used stays free', async () => {
   const pool = new InMemoryPool({ concurrency: 1 });
   let open = false;
@@ -991,6 +1163,22 @@ test('listPresets unwraps the items list', async () => {
   await expect(client().listPresets()).resolves.toEqual(items);
 });
 
+test('credentials read with a trailing newline reach IMS and the x-api-key header trimmed alike', async () => {
+  api.reply('GET', '/v1/presets', 200, { items: [] });
+
+  await createClient({
+    clientId: 'cid-123\n',
+    clientSecret: 'sec-456\n',
+    logging: false,
+  }).listPresets();
+
+  const [mint] = api.imsRequests();
+  expect(mint?.get('client_id')).toBe('cid-123');
+  expect(mint?.get('client_secret') === 'sec-456', 'IMS receives the trimmed secret').toBe(true);
+  const [listing] = api.calls.filter((call) => call.origin === API && call.path === '/v1/presets');
+  expect(listing?.headers['x-api-key']).toBe('cid-123');
+});
+
 test('the single-request calls each emit one record', async () => {
   const logger = recordingLogger();
   api.status('job-15', () => ({ jobId: 'job-15', status: 'succeeded', totalJobItems: 2 }));
@@ -1083,6 +1271,46 @@ test('stage uploads through storage and resolves its read URL', async () => {
   expect(storage.staged).toEqual([{ input, opts: { key: 'logo.png', contentType: 'image/png' } }]);
 });
 
+test('stage hands its signal to the provider, and an abort mid-upload rejects cancelled at once, even from a provider that ignores it', async () => {
+  const logger = recordingLogger();
+  const handed: Array<AbortSignal | undefined> = [];
+  const storage = {
+    stageRead: (_input: unknown, opts?: { signal?: AbortSignal }): Promise<string> => {
+      handed.push(opts?.signal);
+      return new Promise<string>(() => undefined);
+    },
+    allocateOutput: async () => ({ writeUrl: `${STORAGE}/w`, readUrl: `${STORAGE}/r` }),
+  };
+  const controller = new AbortController();
+  const staging = client({ storage, logging: logger }).stage(Buffer.from('x'), {
+    signal: controller.signal,
+  });
+  await until(() => handed.length === 1);
+  expect(handed[0]).toBe(controller.signal);
+
+  controller.abort(new Error('caller gave up'));
+  const outcome = await Promise.race([
+    rejection(staging),
+    sleep(2_000).then(() => 'still pending' as const),
+  ]);
+
+  expect(outcome).toBeInstanceOf(AudioVideoError);
+  expect((outcome as AudioVideoError).code).toBe('cancelled');
+  expect(logger.records.map((record) => [record.level, record.msg])).toEqual([
+    ['warn', 'stage cancelled'],
+  ]);
+});
+
+test('an already-aborted signal rejects stage cancelled without calling the provider', async () => {
+  const storage = fakeStorage();
+  const error = await rejection(
+    client({ storage }).stage(Buffer.from('x'), { signal: AbortSignal.abort() }),
+  );
+  expect(error.code).toBe('cancelled');
+  await flush();
+  expect(storage.staged).toEqual([]);
+});
+
 test('stage passes an http(s) URL through with no storage, and refuses a string that is neither a URL nor a file before any storage call', async () => {
   await expect(client().stage(CAPSULE)).resolves.toBe(CAPSULE);
   const storage = fakeStorage();
@@ -1107,7 +1335,8 @@ test('stage without storage rejects invalid_argument naming the option; a failin
     }).stage(Buffer.from('x')),
   );
   expect(failing.code).toBe('storage_failed');
-  expect(failing.cause).toBe(cause);
+  expect(failing.cause).not.toBe(cause);
+  expect((failing.cause as Error).message).toBe('bucket unreachable');
 });
 
 // --- config -------------------------------------------------------------------------------------

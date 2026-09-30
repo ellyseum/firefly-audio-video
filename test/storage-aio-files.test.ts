@@ -179,11 +179,11 @@ test('stageRead presigns for read-write, PUTs a BlockBlob, then returns a read p
   expect(upload?.key).toMatch(STAGED_KEY);
   expect(read?.key).toBe(upload?.key);
   expect(upload?.options).toEqual({
-    expiryInSeconds: 3600,
+    expiryInSeconds: 86400,
     permissions: 'rw',
     urlType: 'external',
   });
-  expect(read?.options).toEqual({ expiryInSeconds: 3600, permissions: 'r', urlType: 'external' });
+  expect(read?.options).toEqual({ expiryInSeconds: 86400, permissions: 'r', urlType: 'external' });
   expect(url).toMatch(/sp=r&sig=SIG_r_2$/);
   expect(puts).toHaveLength(1);
   expect(puts[0]?.path).toMatch(/sp=rw&sig=SIG_rw_1$/);
@@ -253,7 +253,7 @@ test('key and expiresIn options name the object and its lifetime; prefix places 
     expect.stringMatching(OUTPUT_KEY),
   ]);
   expect(files.calls.map((call) => call.options.expiryInSeconds)).toEqual([
-    600, 600, 3600, 3600, 86400, 86400, 900, 900,
+    600, 600, 86400, 86400, 86400, 86400, 900, 900,
   ]);
 });
 

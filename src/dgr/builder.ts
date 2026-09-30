@@ -1,5 +1,5 @@
 /**
- * The fluent {@link RenderBuilder} `render(templateUrl)` returns: sugar for a
+ * The fluent {@link RenderBuilder} `render(source)` returns: sugar for a
  * render with one source, one preset and one output. It proxies the `Preset`
  * chain onto an internal preset, is itself the thenable job, and starts
  * nothing until it is awaited or one of its terminals is called.
@@ -14,10 +14,17 @@ import { anySignal } from '../core/signals.js';
 import { PRESET_NAMES } from '../presets/names.js';
 import type { Client, RenderJob } from './client.js';
 import { Preset, toPreset, type PresetInput, type ResizeTarget } from './preset.js';
-import type { FluentRenderInput, TemplateSource } from './render.js';
-import type { BitDepth, Bitrate, Chroma, EncodeConfig, PresetName } from './schemas.js';
+import type { FluentRenderInput } from './render.js';
+import type {
+  BitDepth,
+  Bitrate,
+  Chroma,
+  EncodeConfig,
+  PresetName,
+  TemplateSource,
+} from './schemas.js';
 
-/** Options for a fluent `render(templateUrl, options)`. */
+/** Options for a fluent `render(source, options)`. */
 export interface RenderBuilderOptions {
   /** Runs this render on `client` rather than the default client (or the client whose `render()` was called). */
   client?: Client;
@@ -59,8 +66,11 @@ type NamedBuilderSteps = { readonly [K in PresetName]: RenderBuilder };
  *
  * The output location comes from the client's storage
  * (`StorageProvider.allocateOutput()`): DGR writes to the allocated write URL
- * and the asset reads from its read URL. Without storage configured, or with
- * no preset chosen, the render rejects `invalid_argument`.
+ * and the asset reads from its read URL. A source given as a file path, a
+ * `file:` URL, a `Buffer` or a `Readable` is uploaded through the same
+ * storage once the render holds its pool slot, exactly as a spec's `source`
+ * is. Without storage configured, with no preset chosen, or with a source a
+ * spec would refuse, the render rejects `invalid_argument`.
  *
  * @example
  * ```ts

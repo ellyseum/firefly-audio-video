@@ -22,17 +22,18 @@ export type StageInput = Buffer | Readable | URL | string;
 /**
  * Stages inputs for DGR to read and allocates the locations DGR writes its
  * outputs to. The client calls {@link StorageProvider.stageRead} for every
- * render input given as bytes or a file — a template, an asset, an `.epr`,
- * a generated `.epr` — and for `stage()`, and
+ * render or describe input given as bytes or a file — a template, an asset,
+ * an `.epr`, a generated `.epr` — and for `stage()`, and
  * {@link StorageProvider.allocateOutput} for every output given no
  * `destination`. An http(s) URL never reaches a provider: it is already
  * something DGR can read.
  *
- * A render's storage calls run inside its pool slot, once the job is
- * admitted and just before it is submitted, so a staged URL is fresh when
- * DGR is sent it however long the job queued. Each call's options carry a
- * `signal` that aborts when the render is cancelled, or its caller's signal
- * aborts, before the submit; pass it to the transport so the upload stops.
+ * A render's or a describe's storage calls run inside its pool slot, once
+ * the job is admitted and just before it is submitted, so a staged URL is
+ * fresh when DGR is sent it however long the job queued. Each call's options
+ * carry a `signal` that aborts when the call is cancelled, or its caller's
+ * signal aborts, before the submit; pass it to the transport so the upload
+ * stops.
  * The built-in providers do: `AioFilesStorageProvider` to its upload's
  * `fetch`, `S3StorageProvider` and `AzureBlobStorageProvider` to their SDK's
  * `abortSignal` on the upload; presigning and signing take none. A provider

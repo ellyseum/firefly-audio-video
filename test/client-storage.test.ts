@@ -2,12 +2,14 @@ import { mkdtempSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
+import { pathToFileURL } from 'node:url';
 import { inspect } from 'node:util';
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from 'vitest';
 import { Asset } from '../src/core/asset.js';
 import { AudioVideoError } from '../src/core/errors.js';
+import { InMemoryPool, type PoolBackend } from '../src/core/pool.js';
 import { createClient, type Client, type ClientConfig } from '../src/dgr/client.js';
-import type { RenderRequest } from '../src/dgr/schemas.js';
+import type { RenderRequest, TemplateSource } from '../src/dgr/schemas.js';
 import {
   MockApi,
   STORAGE,
@@ -26,18 +28,22 @@ let api: MockApi;
 let dir: string;
 let logo: string;
 let epr: string;
+let capsule: string;
 
 beforeAll(() => {
   dir = mkdtempSync(join(tmpdir(), 'fav-client-storage-'));
   logo = join(dir, 'logo.png');
   epr = join(dir, 'My Preset.epr');
+  capsule = join(dir, 'capsule.mogrt');
   writeFileSync(logo, 'png bytes');
   writeFileSync(epr, '<PremiereData Version="3"/>');
+  writeFileSync(capsule, 'mogrt bytes on disk');
 });
 
 afterAll(() => {
   unlinkSync(logo);
   unlinkSync(epr);
+  unlinkSync(capsule);
   rmdirSync(dir);
 });
 
@@ -361,4 +367,186 @@ test('staged and allocated URLs never reach the render log record', async () => 
   const printed = JSON.stringify(logger.records);
   expect(logger.records).toHaveLength(1);
   expect(printed).not.toMatch(/STAGE_SIG|WRITE_SIG|READ_SIG/);
+});
+
+// --- render(source) and describe(source) read a template as render({ source }) does ----------
+
+/** A staged read URL `fakeStorage()` returns, whatever its call number. */
+const STAGED_URL = /^https:\/\/storage\.example\/staged\/\d+\.epr\?sv=2021&sp=r&sig=STAGE_SIG_\d+$/;
+
+interface TemplateForm {
+  readonly name: string;
+  /** A fresh template in this form. */
+  readonly make: () => TemplateSource;
+  /** What `stageRead` must be handed for `made`, or `undefined` for a URL sent as it is. */
+  readonly staged: (made: TemplateSource) => unknown;
+}
+
+/** Every form a spec's `source` takes, alone or as `{ url }`. */
+function templateForms(): TemplateForm[] {
+  return [
+    { name: 'an http(s) URL string', make: () => CAPSULE, staged: () => undefined },
+    { name: 'an http(s) URL object', make: () => new URL(CAPSULE), staged: () => undefined },
+    {
+      name: '{ url } holding a URL string',
+      make: () => ({ url: CAPSULE }),
+      staged: () => undefined,
+    },
+    { name: 'a file path', make: () => capsule, staged: () => capsule },
+    { name: 'a file: URL object', make: () => pathToFileURL(capsule), staged: () => capsule },
+    { name: 'a file: URL string', make: () => pathToFileURL(capsule).href, staged: () => capsule },
+    { name: 'a Buffer', make: () => Buffer.from('mogrt bytes'), staged: (made) => made },
+    {
+      name: 'a Readable',
+      make: () => Readable.from([Buffer.from('mogrt bytes')]),
+      staged: (made) => made,
+    },
+    {
+      name: '{ url } holding a Buffer',
+      make: () => ({ url: Buffer.from('mogrt bytes') }),
+      staged: (made) => (made as { url: Buffer }).url,
+    },
+  ];
+}
+
+/** Checks the source DGR was sent for `made`, and what storage was handed for it. */
+function expectSent(form: TemplateForm, made: TemplateSource, body: unknown, storage: FakeStorage) {
+  const source = (body as { source?: unknown } | undefined)?.source;
+  const input = form.staged(made);
+  if (input === undefined) {
+    expect(storage.staged).toEqual([]);
+    expect(source).toEqual({ url: CAPSULE });
+    return;
+  }
+  expect(storage.staged).toHaveLength(1);
+  expect(storage.staged[0]?.input).toBe(input);
+  expect(source).toEqual({ url: expect.stringMatching(STAGED_URL) });
+}
+
+test.each(templateForms())('render($name) sends DGR what a spec source would', async (form) => {
+  const storage = fakeStorage();
+  api.submit(['job-f']);
+  api.status('job-f', () =>
+    succeeded('job-f', [wireOutput(0, 0, 1, 2, storage.allocations[0]?.writeUrl)]),
+  );
+  const made = form.make();
+  await client({ storage }).render(made, { pollIntervalMs: 0 }).prores;
+  expectSent(form, made, api.submitted()[0], storage);
+});
+
+test.each(templateForms())('describe($name) sends DGR what a spec source would', async (form) => {
+  const storage = fakeStorage();
+  api.submit(['d-f'], { path: '/v1/templates/describe' });
+  api.status('d-f', () => ({ jobId: 'd-f', status: 'succeeded' }));
+  const made = form.make();
+  await client({ storage }).describe(made, { pollIntervalMs: 0 });
+  expectSent(form, made, api.submitted('/v1/templates/describe')[0], storage);
+});
+
+test('describe({ source, type, compName }) uploads a Buffer source and keeps type and compName', async () => {
+  const storage = fakeStorage();
+  api.submit(['d-aep'], { path: '/v1/templates/describe' });
+  api.status('d-aep', () => ({ jobId: 'd-aep', status: 'succeeded' }));
+  const zip = Buffer.from('zip bytes');
+  await client({ storage }).describe(
+    { source: zip, type: 'aep', compName: 'Main' },
+    { pollIntervalMs: 0 },
+  );
+  expect(storage.staged.map((entry) => entry.input)).toEqual([zip]);
+  expect(api.submitted('/v1/templates/describe')).toEqual([
+    { source: { url: expect.stringMatching(STAGED_URL) }, type: 'aep', compName: 'Main' },
+  ]);
+});
+
+/** An in-memory pool that counts every `run()` call. */
+function countingPool(): PoolBackend & { readonly runs: number } {
+  const inner = new InMemoryPool();
+  let runs = 0;
+  return {
+    run: (task) => {
+      runs += 1;
+      return inner.run(task);
+    },
+    drain: () => inner.drain(),
+    get active() {
+      return inner.active;
+    },
+    get queued() {
+      return inner.queued;
+    },
+    get runs() {
+      return runs;
+    },
+  };
+}
+
+test.each<[string, () => unknown]>([
+  ['a path that names no file', () => './no/such/capsule.mogrt'],
+  ['a string that is not a URL', () => 'not a url'],
+  ['a data: URL string', () => 'data:text/plain,mogrt'],
+  ['an ftp: URL string', () => 'ftp://example.com/capsule.mogrt'],
+  ['a data: URL object', () => new URL('data:text/plain,mogrt')],
+  ['an ftp: URL object', () => new URL('ftp://example.com/capsule.mogrt')],
+  ['an empty string', () => ''],
+  ['{ url } holding a path that names no file', () => ({ url: './no/such/capsule.mogrt' })],
+])(
+  '%s is refused invalid_argument by render(source), describe(source) and a spec alike, before any pool slot or request',
+  async (_name, make) => {
+    const storage = fakeStorage();
+    const pool = countingPool();
+    const c = client({ storage, pool });
+    const fluent = await rejection(c.render(make() as TemplateSource).prores);
+    const described = await rejection(c.describe(make() as TemplateSource));
+    const spec = await rejection(
+      c.render({
+        source: ((made) =>
+          typeof made === 'object' && made !== null && 'url' in made ? made.url : made)(
+          make(),
+        ) as RenderRequest['source'],
+        presets: ['h264Land1080pHq'],
+        outputs: [{ presetIndex: 0, destination: WRITE }],
+      }),
+    );
+    for (const error of [fluent, described, spec]) expect(error.code).toBe('invalid_argument');
+    expect(described.message).toBe(fluent.message);
+    expect(fluent.message.startsWith('source')).toBe(true);
+    expect(pool.runs).toBe(0);
+    expect(storage.staged).toEqual([]);
+    expect(api.calls).toEqual([]);
+  },
+);
+
+test('describe() of a value that is no template at all is refused invalid_argument, naming the forms it takes', async () => {
+  const error = await rejection(
+    client({ storage: fakeStorage() }).describe(42 as unknown as TemplateSource),
+  );
+  expect(error.code).toBe('invalid_argument');
+  expect(error.message).toBe(
+    'source must be an http(s) URL, a file path, a URL, a Buffer or a Readable, or { url } holding one',
+  );
+  expect(api.calls).toEqual([]);
+});
+
+test('a mistyped path is refused with the same message by render(source), describe(source) and a spec', async () => {
+  const c = client({ storage: fakeStorage() });
+  const typo = './no/such/capsule.mogrt';
+  const expected = `source: The input "${typo}" is neither an http(s) URL nor an existing file.`;
+  expect((await rejection(c.render(typo).prores)).message).toBe(expected);
+  expect((await rejection(c.describe(typo))).message).toBe(expected);
+  const spec = await rejection(
+    c.render({ source: typo, presets: ['prores'], outputs: [{ presetIndex: 0 }] }),
+  );
+  expect(spec.message).toBe(expected);
+});
+
+test('a template to upload with no storage configured is refused invalid_argument naming the storage option, before any request', async () => {
+  const c = client();
+  const fluent = await rejection(c.render(Buffer.from('mogrt')).prores);
+  const described = await rejection(c.describe(Buffer.from('mogrt')));
+  expect(fluent.code).toBe('invalid_argument');
+  expect(fluent.message).toContain('storage option');
+  expect(described.code).toBe('invalid_argument');
+  expect(described.message.startsWith('source must be uploaded for DGR to read it')).toBe(true);
+  expect(described.message).toContain('storage option');
+  expect(api.calls).toEqual([]);
 });

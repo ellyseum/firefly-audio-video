@@ -5,16 +5,27 @@
  */
 
 import type { JobStatusLike } from '../core/job.js';
-import { invalidArgument, templateUrl, type TemplateSource } from './render.js';
+import { isReadable, noStorage, type StorageProvider } from '../core/storage.js';
+import {
+  invalidArgument,
+  materializeTemplateSource,
+  prepareTemplateSource,
+  type PreparedAsset,
+} from './render.js';
+import type { TemplateSource } from './schemas.js';
 
 /**
  * What `describe()` takes: a template source on its own, or an object naming
  * it with the template's `type` — `'mogrt'` (the default) or `'aep'` — and,
- * for an After Effects project, the composition to describe.
+ * for an After Effects project, the composition to describe. The source
+ * takes every form a render spec's `source` does: an http(s) URL is used as
+ * it is, and a file path, a `file:` URL, a `Buffer` or a `Readable` is
+ * uploaded through the client's storage once the job holds its pool slot.
  *
  * @example
  * ```ts
  * await describe('https://example.com/capsule.mogrt?sig=…');
+ * await describe('./capsule.mogrt'); // uploaded through storage
  * await describe({ source: { url: capsuleUrl } });
  * await describe({ source: zipUrl, type: 'aep', compName: 'Main' });
  * ```
@@ -71,32 +82,67 @@ export interface DescribeBody {
   compName?: string;
 }
 
+/** @internal A describe request validated and its source read, before any storage call. */
+export interface PreparedDescribe {
+  readonly source: PreparedAsset;
+  readonly type?: 'mogrt' | 'aep';
+  readonly compName?: string;
+}
+
 /**
- * @internal Normalizes a {@link DescribeInput} to its wire body.
+ * @internal Validates a {@link DescribeInput} and reads whether its source
+ * needs uploading, by the rule a render spec's `source` follows — checking
+ * that storage is there when it does. Consults only the local filesystem;
+ * performs no remote call.
  *
- * @throws {@link AudioVideoError} `invalid_argument` for a missing template
- *   URL, an unknown `type`, or `type: 'aep'` without a `compName`.
+ * @throws {@link AudioVideoError} `invalid_argument` for a source a render
+ *   spec would refuse, an unknown `type`, `type: 'aep'` without a
+ *   `compName`, or a source to upload when no storage is configured.
  */
-export function describeBody(input: DescribeInput): DescribeBody {
-  if (!isRecord(input) || !('source' in input)) {
-    return { source: { url: templateUrl(input, 'The describe source') } };
-  }
-  const url = templateUrl(input.source, 'The describe source');
-  const type = input.type === 'mogrt' || input.type === 'aep' ? input.type : undefined;
-  if (input.type !== undefined && type === undefined) {
+export async function prepareDescribe(
+  input: DescribeInput,
+  storage: StorageProvider | undefined,
+): Promise<PreparedDescribe> {
+  const named =
+    isRecord(input) && 'source' in input && !Buffer.isBuffer(input) && !isReadable(input);
+  const request = named ? input : { source: input };
+  const type = request.type === 'mogrt' || request.type === 'aep' ? request.type : undefined;
+  if (request.type !== undefined && type === undefined) {
     throw invalidArgument("describe: type must be 'mogrt' or 'aep'.");
   }
-  const compName = typeof input.compName === 'string' ? input.compName : undefined;
-  if (input.compName !== undefined && !compName) {
+  const compName = typeof request.compName === 'string' ? request.compName : undefined;
+  if (request.compName !== undefined && !compName) {
     throw invalidArgument('describe: compName must be a non-empty string when provided.');
   }
   if (type === 'aep' && compName === undefined) {
     throw invalidArgument("describe: type 'aep' requires a compName naming the composition.");
   }
+  const source = await prepareTemplateSource(request.source);
+  if ('stage' in source && storage === undefined) throw noStorage('source');
   return {
-    source: { url },
+    source,
     ...(type !== undefined ? { type } : {}),
     ...(compName !== undefined ? { compName } : {}),
+  };
+}
+
+/**
+ * @internal The wire body of a prepared describe, uploading its source first
+ * when it needs that. Runs once the job holds its pool slot, just before the
+ * submit; `signal` aborts the upload.
+ *
+ * @throws {@link AudioVideoError} `storage_failed` when the upload fails.
+ */
+export async function materializeDescribe(
+  prepared: PreparedDescribe,
+  storage: StorageProvider | undefined,
+  signal: AbortSignal,
+): Promise<DescribeBody> {
+  const url = await materializeTemplateSource(prepared.source, storage, signal);
+  return {
+    source: { url },
+    ...(prepared.type !== undefined ? { type: prepared.type } : {}),
+    ...(prepared.compName !== undefined ? { compName: prepared.compName } : {}),
   };
 }
 

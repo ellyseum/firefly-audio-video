@@ -14,6 +14,7 @@ import { AudioVideoError } from '../core/errors.js';
 import type { JobItemLike, JobMeta, JobStatusLike } from '../core/job.js';
 import {
   classifyAsset,
+  isReadable,
   noStorage,
   normalizeAsset,
   storageFailure,
@@ -27,16 +28,15 @@ import { resolvePreset, toPreset, type Preset, type PresetInput } from './preset
 import {
   PresetRefSchema,
   RenderRequestSchema,
+  TemplateSourceSchema,
   type EncodeConfig,
   type PresetRef,
   type PresetRefInput,
   type RenderRequestOutput,
   type RenderSpec,
+  type TemplateSource,
 } from './schemas.js';
 import type { RenderBodyWire } from './types.js';
-
-/** A template to render or describe: an http(s) URL as a string, a `URL`, or `{ url }`. */
-export type TemplateSource = string | URL | { url: string };
 
 /**
  * @internal A render input as validation leaves it: a URL DGR reads as it is,
@@ -145,19 +145,20 @@ export async function prepareRequest(
 }
 
 /**
- * @internal Validates a fluent render: one source, one preset, one output
- * whose location storage allocates in {@link materializeRender}. Performs no
- * remote call.
+ * @internal Validates a fluent render: one source, read by
+ * {@link prepareTemplateSource} exactly as a spec's `source` is; one preset;
+ * one output whose location storage allocates in {@link materializeRender}.
+ * Consults only the local filesystem; performs no remote call.
  *
- * @throws {@link AudioVideoError} `invalid_argument` when no preset is chosen,
- *   no storage is configured, or the source is not a template URL;
- *   `invalid_preset` for a preset that cannot resolve.
+ * @throws {@link AudioVideoError} `invalid_argument` when the source is one
+ *   a spec's `source` would refuse, no preset is chosen, or no storage is
+ *   configured; `invalid_preset` for a preset that cannot resolve.
  */
 export async function prepareFluent(
   input: FluentRenderInput,
   storage: StorageProvider | undefined,
 ): Promise<PreparedRender> {
-  const source = templateUrl(input.source, 'The render source');
+  const source = await prepareTemplateSource(input.source);
   if (input.preset === undefined) {
     throw invalidArgument(
       'No preset is chosen: pick one on the builder — render(url).prores, ' +
@@ -175,7 +176,7 @@ export async function prepareFluent(
     throw invalidArgument('fileName must be a non-empty string when provided.');
   }
   return {
-    source: { url: source },
+    source,
     presets: [await preparePreset(input.preset, 'The preset')],
     outputs: [
       {
@@ -297,31 +298,43 @@ export function presetLogFields(presets: readonly PreparedPreset[]): {
 
 /** @internal True for a value `render()` reads as a template source rather than a spec object. */
 export function isTemplateSource(value: unknown): value is TemplateSource {
-  if (typeof value === 'string' || value instanceof URL) return true;
+  if (isStageInputForm(value)) return true;
   return isRecord(value) && 'url' in value && !('source' in value);
 }
 
 /**
- * @internal The URL a {@link TemplateSource} names.
+ * @internal Validates a template source — what `render(source)` and
+ * `describe()` take — and reads whether it needs uploading, by the rule
+ * {@link prepareRequest} applies to a spec's `source`: an http(s) URL is used
+ * as it is; a file path, a `file:` URL, a `Buffer` or a `Readable` is kept for
+ * staging. Consults only the local filesystem, to tell a file path from a
+ * mistyped one; performs no remote call. Errors name `source`.
  *
- * @param what - Names the value in the error message, e.g. `'The render source'`.
- * @throws {@link AudioVideoError} `invalid_argument` for anything else, or an empty URL.
+ * @throws {@link AudioVideoError} `invalid_argument` for anything a spec's
+ *   `source` would refuse: a path that names no file, a string that is not
+ *   an http(s) URL, a URL of another scheme, or any other kind of value.
  */
-export function templateUrl(source: unknown, what: string): string {
-  const url =
-    source instanceof URL
-      ? source.href
-      : typeof source === 'string'
-        ? source
-        : isRecord(source) && typeof source.url === 'string'
-          ? source.url
-          : undefined;
-  if (url === undefined || url.trim() === '') {
-    throw invalidArgument(
-      `${what} must be a template URL — a non-empty string, a URL, or { url } — got ${typeName(source)}.`,
-    );
-  }
-  return url;
+export async function prepareTemplateSource(source: unknown): Promise<PreparedAsset> {
+  const parsed = TemplateSourceSchema.safeParse(source);
+  if (!parsed.success) throw invalidArgument(describeIssues(parsed.error), parsed.error);
+  const input = isStageInputForm(parsed.data) ? parsed.data : parsed.data.url;
+  return prepareAsset(input, 'source');
+}
+
+/**
+ * @internal The URL DGR reads a template source from once the job holds its
+ * pool slot: as it is, or uploaded through `storage` first when
+ * {@link prepareTemplateSource} kept it for staging. `signal` aborts the
+ * upload.
+ *
+ * @throws {@link AudioVideoError} `storage_failed` when the upload fails.
+ */
+export function materializeTemplateSource(
+  source: PreparedAsset,
+  storage: StorageProvider | undefined,
+  signal: AbortSignal,
+): Promise<string> {
+  return materializeAsset(source, storage, 'source', { signal });
 }
 
 /** @internal An {@link AudioVideoError} with `code: 'invalid_argument'`. */
@@ -714,6 +727,13 @@ function typeName(value: unknown): string {
   if (Array.isArray(value)) return 'an array';
   if (typeof value === 'string') return value === '' ? 'an empty string' : 'a string';
   return typeof value === 'object' ? 'an object' : `a ${typeof value}`;
+}
+
+/** True for a value in a form a render input takes on its own: a string, a `URL`, a `Buffer` or a `Readable`. */
+function isStageInputForm(value: unknown): value is StageInput {
+  return (
+    typeof value === 'string' || value instanceof URL || Buffer.isBuffer(value) || isReadable(value)
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

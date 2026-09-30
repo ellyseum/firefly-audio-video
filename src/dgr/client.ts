@@ -46,8 +46,9 @@ import {
   type RenderBuilderOptions,
 } from './builder.js';
 import {
-  describeBody,
   describeResult,
+  materializeDescribe,
+  prepareDescribe,
   type DescribeInput,
   type TemplateDescription,
 } from './describe.js';
@@ -62,9 +63,13 @@ import {
   renderAssets,
   type FluentRenderInput,
   type PreparedRender,
-  type TemplateSource,
 } from './render.js';
-import type { PresetRefInput, RenderRequest, RenderRequestOutput } from './schemas.js';
+import type {
+  PresetRefInput,
+  RenderRequest,
+  RenderRequestOutput,
+  TemplateSource,
+} from './schemas.js';
 
 /**
  * The handle `render()` and `describe()` return: awaitable like a promise,
@@ -144,16 +149,16 @@ export interface ClientConfig {
   logging?: LoggingOption;
   /**
    * Uploads what DGR must read from a URL, and allocates the locations it
-   * writes to: a spec's `source`, `assets` and `{ url }` presets given as a
-   * file, a `Buffer` or a `Readable`; generated `.epr` presets; `stage()`
-   * inputs; and every output with no `destination`, fluent renders included.
-   * Without it, any of those rejects `invalid_argument`; http(s) URLs never
-   * need it.
+   * writes to: a spec's `source`, `assets` and `{ url }` presets, and the
+   * template of a fluent `render(source)` or a `describe()`, given as a file,
+   * a `Buffer` or a `Readable`; generated `.epr` presets; `stage()` inputs;
+   * and every output with no `destination`, fluent renders included. Without
+   * it, any of those rejects `invalid_argument`; http(s) URLs never need it.
    *
-   * Staging holds the job's pool slot: a render's uploads, generated `.epr`
-   * files and output allocations run once the job is admitted, just before
-   * its submit, so a staged URL is fresh when DGR is sent it however long the
-   * job queued. `AioFilesStorageProvider` and `S3StorageProvider` read a
+   * Staging holds the job's pool slot: a render's or describe's uploads,
+   * generated `.epr` files and output allocations run once the job is
+   * admitted, just before its submit, so a staged URL is fresh when DGR is
+   * sent it however long the job queued. `AioFilesStorageProvider` and `S3StorageProvider` read a
    * `Readable` into memory before uploading it — the store needs its length —
    * so pass a file path to stream a large input from disk. Only the calls
    * holding a slot stage, so at most `concurrency` calls hold such bytes in
@@ -285,12 +290,17 @@ export interface PresetSummary {
 export interface Client {
   /**
    * Starts a fluent render of the template at `source` — see
-   * {@link RenderBuilder}. Nothing is submitted until the builder is awaited
-   * or one of its terminals (`buffer()`, `stream()`, `save()`) is called.
+   * {@link RenderBuilder}. `source` takes every form a spec's `source` does,
+   * read the same way: an http(s) URL is used as it is; a file path, a
+   * `file:` URL, a `Buffer` or a `Readable` is uploaded through `storage`
+   * once the render holds its pool slot; anything else rejects
+   * `invalid_argument`. Nothing is submitted until the builder is awaited or
+   * one of its terminals (`buffer()`, `stream()`, `save()`) is called.
    *
    * @example
    * ```ts
    * await client.render(templateUrl).prores4444xq.alpha().save('./out.mov');
+   * await client.render('./capsule.mogrt').prores.save('./out.mov');
    * ```
    */
   render(source: TemplateSource, options?: RenderBuilderOptions): RenderBuilder;
@@ -375,7 +385,11 @@ export interface Client {
   ): RenderJob<Asset | Asset[] | string | Buffer | Readable>;
   /**
    * Describes a template: submits a describe job, runs it inside this client's
-   * pool, and resolves with the template's editable controls and fonts.
+   * pool, and resolves with the template's editable controls and fonts. The
+   * template takes every form a render spec's `source` does, read the same
+   * way: an http(s) URL is used as it is; a file path, a `file:` URL, a
+   * `Buffer` or a `Readable` is uploaded through `storage` once the job holds
+   * its pool slot; anything else rejects `invalid_argument`.
    *
    * @example
    * ```ts
@@ -600,15 +614,18 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
     return runPooledJob<TemplateDescription, TemplateDescription>({
       pool: this.#pool,
       ...(options.signal !== undefined ? { signal: options.signal } : {}),
-      prepare: () => {
-        const body = describeBody(input);
-        return () => () =>
-          runJob(this.#http, {
-            submit: () => this.#submit(DESCRIBE_PATH, body),
-            mapResult: (terminal) => describeResult(terminal),
-            onProgress: progress.onProgress,
-            ...jobTuning(options),
-          });
+      prepare: async () => {
+        const prepared = await prepareDescribe(input, this.#storage);
+        return async (signal) => {
+          const body = await materializeDescribe(prepared, this.#storage, signal);
+          return () =>
+            runJob(this.#http, {
+              submit: () => this.#submit(DESCRIBE_PATH, body),
+              mapResult: (terminal) => describeResult(terminal),
+              onProgress: progress.onProgress,
+              ...jobTuning(options),
+            });
+        };
       },
       finish: (description) => description,
       onSettle: (outcome, job) => {

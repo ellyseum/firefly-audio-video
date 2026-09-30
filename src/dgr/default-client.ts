@@ -66,7 +66,7 @@ export function resetDefaultClient(): void {
 /**
  * Renders on the default client — or on `options.client` — with every form
  * {@link Client.render} takes: a spec resolves with its finished `Asset`
- * (`Asset[]` for several outputs, or the `resolveAs` form); a template URL
+ * (`Asset[]` for several outputs, or the `resolveAs` form); a template source
  * starts a fluent {@link RenderBuilder}.
  *
  * Without `configure()`, the first call creates the default client from

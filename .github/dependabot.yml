@@ -10,6 +10,15 @@ updates:
       # dgr bin as CommonJS, so neither major can be taken as an update.
       - dependency-name: 'commander'
         versions: ['>=14.0.0']
+      # TypeScript 7 is a compiler change taken deliberately, not a routine
+      # dependency bump — see issue #9.
+      - dependency-name: 'typescript'
+        versions: ['>=7.0.0']
+      # @types/node tracks the development Node major pinned in .nvmrc (24); the
+      # runtime smoke test on Node 18-24 is what guards this package's actual
+      # runtime API use on the older majors it still supports.
+      - dependency-name: '@types/node'
+        versions: ['>=25.0.0']
   - package-ecosystem: 'github-actions'
     directory: '/'
     schedule:

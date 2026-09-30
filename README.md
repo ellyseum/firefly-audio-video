@@ -358,8 +358,10 @@ record to stdout when it settles; importing the package writes nothing. A record
 
 `time` (ISO-8601), `level` (`info`, `warn` for a cancelled call, `error`) and `msg` lead, then flat
 fields: `endpoint`, `jobId`, `queueMs`, `renderMs`, `totalMs`, `preset`, `codec`, `resolution`,
-`totalJobItems`, `status`, and `error` as one `code: message` string. Every value is a string or a
-number, so a column-based ingester maps each field to a column; a field with no value is left out.
+`totalJobItems`, `status`, and `error` as one `code: message` string, followed by `Reason: <reason>`
+when the service gave one (`First reason:` when it gave several), the reason itself cut to 200
+characters. Every value is a string or a number, so a column-based ingester maps each field to a
+column; a field with no value is left out.
 
 | `logging`             | Effect                                              |
 | --------------------- | --------------------------------------------------- |
@@ -464,24 +466,28 @@ dgr encode '{"codec":"hevc","bitDepth":10,"resolution":"3840x2160"}' --out ./hev
 ```
 
 `render` takes `--spec <file>`, or `--template` with one of `--preset` (a catalog name, a native
-preset ID or an `.epr` path) or `--encode <json>`. It prints the output's URL, or saves the file
-with `--out`. The first Ctrl+C cancels the job; a second exits at once.
+preset ID or an `.epr` path) or `--encode <json>`. Without `--out` it prints each output's read URL,
+one per line; `--out` saves the render's one output, and is refused up front for a spec with several.
+The first Ctrl+C cancels the job; a second exits at once.
 
 `--json` prints exactly one JSON document on stdout, success or failure, usage errors included:
 `{ "ok": true, ... }` with the command's fields, or
 `{ "ok": false, "error": { "code", "message", "jobId"?, "requestId"? } }`.
 
-| Command            | `--json` fields                                     |
-| ------------------ | --------------------------------------------------- |
-| `render`           | `jobId`, `output`, `queueMs`, `renderMs`, `totalMs` |
-| `describe`         | `controls`, `fonts`                                 |
-| `presets`          | `presets`                                           |
-| `status`, `cancel` | `job`                                               |
-| `stage`            | `url`                                               |
-| `encode`           | `xml`, or `path` with `--out`                       |
+| Command            | `--json` fields                                                                                 |
+| ------------------ | ----------------------------------------------------------------------------------------------- |
+| `render`           | `jobId`, `output` (a string, or an array for several outputs), `queueMs`, `renderMs`, `totalMs` |
+| `describe`         | `controls`, `fonts`                                                                             |
+| `presets`          | `presets`                                                                                       |
+| `status`, `cancel` | `job`, redacted — it echoes each output's presigned write URL otherwise                         |
+| `stage`            | `url`                                                                                           |
+| `encode`           | `native` for a config that renders natively, `xml`, or `path` with `--out`                      |
 
 `--log` writes the SDK's NDJSON records to stderr; without it the CLI writes none, so stdout carries
 only the result.
+
+A config that matches one of DGR's native presets prints `renders natively as <presetId>` instead of
+XML, and `--out` writes nothing for it — there is no `.epr` to save.
 
 Credentials come from `IMS_OAUTH_S2S_CLIENT_ID`, `IMS_OAUTH_S2S_CLIENT_SECRET` and
 `IMS_OAUTH_S2S_SCOPES`, in the environment or a `.env` in the working directory, or from

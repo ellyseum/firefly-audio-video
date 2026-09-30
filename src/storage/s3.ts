@@ -5,6 +5,7 @@
 
 import { createReadStream } from 'node:fs';
 import type { Readable } from 'node:stream';
+import { brandClass } from '../core/brand.js';
 import { httpUrlOf, type StageInput, type StorageProvider } from '../core/storage.js';
 import { exportOf, loadPeer, type Peer } from './peer.js';
 import {
@@ -366,6 +367,10 @@ export class S3StorageProvider implements StorageProvider {
 
   #checkExpiry(value: unknown): number {
     return checkExpiry(value, `${NAME}: expiresIn`, MAX_EXPIRY_SECONDS);
+  }
+
+  static {
+    brandClass(this, 'S3StorageProvider');
   }
 }
 

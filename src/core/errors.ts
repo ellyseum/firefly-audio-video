@@ -6,6 +6,7 @@
  * display.
  */
 
+import { brandClass } from './brand.js';
 import { redactValue } from './redact.js';
 
 /**
@@ -53,7 +54,9 @@ export interface AudioVideoErrorJSON {
  * The single error type this SDK throws or rejects with. Extends the native
  * `Error` — so `instanceof Error` and every existing error-handling idiom still
  * work — and adds a stable `.code`, DGR-specific context (`.status`/`.jobId`/
- * `.requestId`/`.items`), and a native `.cause` chain.
+ * `.requestId`/`.items`), and a native `.cause` chain. `instanceof
+ * AudioVideoError` holds for an error either of the package's builds made,
+ * when a process loads both its ESM and its CommonJS build.
  *
  * Every surface a caller might use to observe this error is pre-redacted:
  * `.message`, `toJSON()` (used by `JSON.stringify`), `toString()`, and the
@@ -151,6 +154,10 @@ export class AudioVideoError extends Error {
    */
   [Symbol.for('nodejs.util.inspect.custom')](): AudioVideoErrorJSON {
     return this.toJSON();
+  }
+
+  static {
+    brandClass(this, 'AudioVideoError');
   }
 }
 

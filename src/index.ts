@@ -1,3 +1,6 @@
+import { Asset } from './core/asset.js';
+import { brandClass } from './core/brand.js';
+
 export const VERSION = '0.1.0'; // x-release-please-version
 
 export {
@@ -55,7 +58,10 @@ export type { AudioVideoErrorOptions, AudioVideoErrorJSON } from './core/errors.
 export type { JobItemLike, JobMeta, JobStatusLike, PollInterval } from './core/job.js';
 export type { JobHandle } from './core/pooled-job.js';
 
-export { Asset } from './core/asset.js';
+// Every exported class answers `instanceof` for an instance either of the package's builds made;
+// see core/brand.ts. Asset is branded where the package exports it.
+brandClass(Asset, 'Asset');
+export { Asset };
 export type { AssetJSON, AssetOptions, AssetReadOptions, ResolveAs } from './core/asset.js';
 
 export { ClientCredentialsProvider } from './core/auth.js';

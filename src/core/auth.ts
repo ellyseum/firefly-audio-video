@@ -10,6 +10,7 @@ import {
   ServerToServerTokenProvider,
   type ServerToServerAuthDetails,
 } from '@adobe/firefly-services-common-apis';
+import { brandClass } from './brand.js';
 import { AudioVideoError } from './errors.js';
 import { redactError } from './redact.js';
 
@@ -379,6 +380,10 @@ export class ClientCredentialsProvider implements TokenProvider {
         cause: redactError(cause),
       });
     }
+  }
+
+  static {
+    brandClass(this, 'ClientCredentialsProvider');
   }
 }
 

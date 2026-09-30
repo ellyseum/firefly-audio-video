@@ -11,6 +11,7 @@
 import { stat } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
+import { brandClass } from './brand.js';
 import { AudioVideoError } from './errors.js';
 import { redactError } from './redact.js';
 
@@ -178,6 +179,10 @@ export class PassthroughStorageProvider implements StorageProvider {
       'PassthroughStorageProvider cannot allocate an output location: give each output a ' +
         'destination and a readUrl, or configure a storage provider that allocates them.',
     );
+  }
+
+  static {
+    brandClass(this, 'PassthroughStorageProvider');
   }
 }
 

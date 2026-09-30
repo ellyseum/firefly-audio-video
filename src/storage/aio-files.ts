@@ -5,6 +5,7 @@
 
 import * as fs from 'node:fs';
 import { readFile } from 'node:fs/promises';
+import { brandClass } from '../core/brand.js';
 import type { StageInput, StorageProvider } from '../core/storage.js';
 import { exportOf, loadPeer, type Peer } from './peer.js';
 import {
@@ -296,6 +297,10 @@ export class AioFilesStorageProvider implements StorageProvider {
 
   #checkExpiry(value: unknown): number {
     return checkExpiry(value, `${NAME}: expiresIn`, MAX_EXPIRY_SECONDS, MIN_EXPIRY_SECONDS);
+  }
+
+  static {
+    brandClass(this, 'AioFilesStorageProvider');
   }
 }
 

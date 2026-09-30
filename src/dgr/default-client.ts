@@ -6,6 +6,7 @@
  * default.
  */
 
+import { sharedKey } from '../core/brand.js';
 import { rejectedJob } from '../core/pooled-job.js';
 import type { StageInput } from '../core/storage.js';
 import type { JobStatusLike } from '../core/job.js';
@@ -27,13 +28,24 @@ import type { DescribeInput, TemplateDescription } from './describe.js';
 import { invalidArgument, isTemplateSource } from './render.js';
 import type { RenderRequest } from './schemas.js';
 
-let defaultClient: AudioVideoClient | undefined;
+/**
+ * The slot on `globalThis` that holds the default client. A process that loads
+ * both the package's ESM and CommonJS builds holds two copies of this module,
+ * and the key, registered with `Symbol.for`, is the same in both: a client
+ * `configure()` installs through either build is the one top-level calls
+ * through the other use, rather than one the other build creates from the
+ * environment.
+ */
+const DEFAULT_CLIENT = sharedKey('defaultClient');
+
+type DefaultClientSlot = { [key: symbol]: unknown };
 
 /**
  * Installs the default client every top-level function uses. The config is
  * checked at once; the last call wins, and a job already running keeps the
  * client it started on. Use {@link createClient} instead for several
- * credentials, or inside a library.
+ * credentials, or inside a library. Both of the package's builds share it:
+ * installed through one, it serves top-level calls through the other.
  *
  * @param config - See {@link ClientConfig}.
  * @throws {@link AudioVideoError} `invalid_argument` for an invalid config;
@@ -46,7 +58,7 @@ let defaultClient: AudioVideoClient | undefined;
  * ```
  */
 export function configure(config: ClientConfig): void {
-  defaultClient = new AudioVideoClient(config);
+  slot()[DEFAULT_CLIENT] = new AudioVideoClient(config);
 }
 
 /**
@@ -60,7 +72,7 @@ export function configure(config: ClientConfig): void {
  * ```
  */
 export function resetDefaultClient(): void {
-  defaultClient = undefined;
+  delete slot()[DEFAULT_CLIENT];
 }
 
 /**
@@ -174,8 +186,16 @@ export async function stage(input: StageInput, options?: StageOptions): Promise<
 /** The client a top-level call runs on: `options.client`, else the default, created on first use. */
 function clientFor(options: { client?: Client } | undefined): AudioVideoClient {
   if (options?.client !== undefined) return asClient(options.client);
-  defaultClient ??= new AudioVideoClient(configFromEnvironment());
-  return defaultClient;
+  const current = slot()[DEFAULT_CLIENT];
+  if (current instanceof AudioVideoClient) return current;
+  const created = new AudioVideoClient(configFromEnvironment());
+  slot()[DEFAULT_CLIENT] = created;
+  return created;
+}
+
+/** `globalThis`, as the holder of the default client's slot. */
+function slot(): DefaultClientSlot {
+  return globalThis as unknown as DefaultClientSlot;
 }
 
 /**

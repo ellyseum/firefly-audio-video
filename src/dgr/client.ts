@@ -12,6 +12,7 @@
 import type { Readable } from 'node:stream';
 import { resolveAsset, type Asset, type ResolveAs } from '../core/asset.js';
 import { resolveTokenProvider, type TokenProvider } from '../core/auth.js';
+import { brandClass } from '../core/brand.js';
 import { AudioVideoError } from '../core/errors.js';
 import { HttpClient, hostOrigin } from '../core/http.js';
 import { redactError } from '../core/redact.js';
@@ -530,7 +531,8 @@ export function normalizeScope(raw: unknown, source: string): string | undefined
 }
 
 /**
- * @internal The client a `{ client }` option names.
+ * @internal The client a `{ client }` option names — one either of the
+ * package's builds created, since a process may load both.
  *
  * @throws {@link AudioVideoError} `invalid_argument` unless it came from {@link createClient}.
  */
@@ -912,6 +914,10 @@ export class AudioVideoClient implements Omit<Client, 'render'>, FluentRenderer 
   /** @internal Logs a fluent render as cancelled before it reached this client; see {@link FluentRenderer.logCancelled}. */
   logCancelled(error: AudioVideoError): void {
     this.#log({ ...settleFields('render', { ok: false, error }), endpoint: RENDER_ENDPOINT });
+  }
+
+  static {
+    brandClass(this, 'AudioVideoClient');
   }
 }
 

@@ -5,7 +5,7 @@
  * tiered interval, retrying transient poll failures, deciding when the job is
  * terminal (including item-level errors reported while `status` still reads
  * `running`), deriving queue / render / total timing, and cancellation — and
- * hands the caller one {@link AsyncJob} that is both awaitable and a handle.
+ * hands the caller one job object that is both awaitable and a handle.
  * Nothing here knows what is being rendered, transcribed, or generated: `core/`
  * never imports from a capability module, and every status body is read
  * structurally through {@link JobStatusLike}.
@@ -230,9 +230,9 @@ const POLL_RETRY_BASE_MS = 1_000;
 const POLL_RETRY_MAX_MS = 30_000;
 
 /**
- * A running asynchronous job: awaitable like a promise (`await job`, `job.then()`,
- * `Promise.all([job])`) and holdable as a handle (`job.jobId`, `job.meta`,
- * `job.cancel()`). It settles exactly once — with the capability's mapped result
+ * @internal The job engine's handle on one running job: awaitable like a promise
+ * (`await job`, `job.then()`, `Promise.all([job])`) and holdable as a handle
+ * (`job.jobId`, `job.meta`, `job.cancel()`). It settles exactly once — with the capability's mapped result
  * when the job reaches a successful terminal state, or with an
  * {@link AudioVideoError} whose `code` is `job_failed`, `job_poll_failed`,
  * `submit_failed`, `callback_failed`, `cancelled` or `job_timeout` — or, when
@@ -249,21 +249,10 @@ const POLL_RETRY_MAX_MS = 30_000;
  * job cancelled through {@link AsyncJob.cancel} or `signal` carries a handler of
  * its own.
  *
- * Instances are created by the SDK's job runner; application code receives them
- * from a capability method. The constructor is private — a job cannot be built
- * or subclassed outside the SDK — while `instanceof AsyncJob` still works.
- *
- * @example
- * ```ts
- * const job: AsyncJob<Result> = startSomething(); // any capability method returning an AsyncJob
- * const giveUp = setTimeout(() => void job.cancel(), 60_000);
- * try {
- *   const result = await job; // resolves once the job is terminal
- *   console.log(job.jobId, job.meta?.totalMs);
- * } finally {
- *   clearTimeout(giveUp);
- * }
- * ```
+ * Application code never holds one: a capability method runs its job inside a
+ * pooled call and returns that call's `JobHandle`, a type several classes
+ * satisfy. Instances come only from {@link runJob}; the constructor is private,
+ * so a job cannot be built or subclassed outside the SDK.
  */
 export class AsyncJob<T> implements PromiseLike<T> {
   readonly #controller = new AbortController();

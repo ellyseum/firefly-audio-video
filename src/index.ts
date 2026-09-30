@@ -52,8 +52,8 @@ export type { PresetInput, PresetJSON, PresetKind, ResizeTarget } from './dgr/pr
 export { AudioVideoError } from './core/errors.js';
 export type { AudioVideoErrorOptions, AudioVideoErrorJSON } from './core/errors.js';
 
-export { AsyncJob } from './core/job.js';
 export type { JobItemLike, JobMeta, JobStatusLike, PollInterval } from './core/job.js';
+export type { JobHandle } from './core/pooled-job.js';
 
 export { Asset } from './core/asset.js';
 export type { AssetJSON, AssetOptions, AssetReadOptions, ResolveAs } from './core/asset.js';

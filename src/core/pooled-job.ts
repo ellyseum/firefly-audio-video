@@ -24,6 +24,11 @@ import { linkSignals } from './signals.js';
  * `Promise.all([job])`) and holdable as a handle (`job.jobId`, `job.meta`,
  * `job.cancel()`). It settles exactly once — with the call's value, or with an
  * {@link AudioVideoError}.
+ *
+ * The type of every handle a job-running call returns — a spec's render, a
+ * describe, the fluent builder, a call refused before it started — which are
+ * different objects, so type a handle with this interface: no class covers
+ * them for `instanceof`.
  */
 export interface JobHandle<T> extends PromiseLike<T> {
   /** The service's job ID — `undefined` until the submit response has arrived. */

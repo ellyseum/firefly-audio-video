@@ -1,13 +1,12 @@
 #!/usr/bin/env node
-import { VERSION } from './index.js';
+import 'dotenv/config';
+import { createProgram } from './cli/program.js';
 
-const args = process.argv.slice(2);
-
-if (args.includes('--version') || args.includes('-V')) {
-  console.log(VERSION);
-  process.exit(0);
-}
-
-console.log(`dgr ${VERSION}`);
-console.log('Adobe Firefly Services audio/video (DGR) CLI.');
-console.log('Commands are not implemented yet — this is a scaffold stub.');
+// createProgram()'s parseAsync() never rejects — every exit path, including
+// commander's own, calls process.exit() itself — so nothing here awaits it.
+void createProgram({
+  env: process.env,
+  stdout: process.stdout,
+  stderr: process.stderr,
+  exit: (code) => process.exit(code),
+}).parseAsync(process.argv);

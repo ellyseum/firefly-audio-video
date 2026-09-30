@@ -1,10 +1,11 @@
 /**
  * The render pipeline behind `render()`, in the three steps a pooled call
  * runs it: validate the spec, resolve its presets and read which inputs need
- * uploading — checking that storage is there for every one of them; upload
- * those inputs, stage generated `.epr` files, allocate output locations and
- * build the wire body — all before the job takes a pool slot; and map the
- * terminal status back onto the spec's outputs as {@link Asset}s.
+ * uploading — checking that storage is there for every one of them — before
+ * the job asks for a pool slot; upload those inputs, stage generated `.epr`
+ * files, allocate output locations and build the wire body once the job holds
+ * its slot, just before the submit; and map the terminal status back onto the
+ * spec's outputs as {@link Asset}s.
  */
 
 import * as z from 'zod';
@@ -189,8 +190,9 @@ export async function prepareFluent(
 /**
  * @internal Uploads every input that needs it, stages every deferred `.epr`,
  * and allocates every output that has no destination — concurrently — then
- * builds the wire body. Runs before the job takes a pool slot, so no storage
- * call ever waits on the pool.
+ * builds the wire body. Runs once the job holds its pool slot, just before
+ * the submit, so every staged URL is fresh when DGR is sent it; it never asks
+ * the pool for another slot. `signal` goes to every storage call.
  *
  * @throws {@link AudioVideoError} `storage_failed` when the storage provider
  *   throws or resolves with something other than the URLs it owes (an
@@ -200,18 +202,21 @@ export async function prepareFluent(
 export async function materializeRender(
   prepared: PreparedRender,
   storage: StorageProvider | undefined,
+  signal: AbortSignal,
 ): Promise<{ body: RenderBodyWire; outputs: MaterializedOutput[] }> {
   const [source, assets, presets, outputs] = await Promise.all([
-    materializeAsset(prepared.source, storage, 'source'),
+    materializeAsset(prepared.source, storage, 'source', { signal }),
     prepared.assets === undefined
       ? undefined
       : Promise.all(
           prepared.assets.map((asset, index) =>
-            materializeAsset(asset, storage, `assets[${index}]`),
+            materializeAsset(asset, storage, `assets[${index}]`, { signal }),
           ),
         ),
-    Promise.all(prepared.presets.map((preset, index) => materializePreset(preset, storage, index))),
-    Promise.all(prepared.outputs.map((output) => materializeOutput(output, storage))),
+    Promise.all(
+      prepared.presets.map((preset, index) => materializePreset(preset, storage, index, signal)),
+    ),
+    Promise.all(prepared.outputs.map((output) => materializeOutput(output, storage, signal))),
   ]);
   const spec: RenderSpec = {
     source,
@@ -476,7 +481,7 @@ async function materializeAsset(
   asset: PreparedAsset,
   storage: StorageProvider | undefined,
   where: string,
-  opts?: { contentType?: string },
+  opts: { contentType?: string; signal: AbortSignal },
 ): Promise<string> {
   if ('url' in asset) return asset.url;
   try {
@@ -491,15 +496,17 @@ async function materializePreset(
   preset: PreparedPreset,
   storage: StorageProvider | undefined,
   index: number,
+  signal: AbortSignal,
 ): Promise<PresetRef> {
   if (preset.ref !== undefined) return preset.ref;
   if (preset.stage !== undefined) {
     const url = await materializeAsset({ stage: preset.stage }, storage, `presets[${index}].url`, {
       contentType: EPR_CONTENT_TYPE,
+      signal,
     });
     return { url };
   }
-  return stageEpr(storage, preset.xml ?? '', index);
+  return stageEpr(storage, preset.xml ?? '', index, signal);
 }
 
 /**
@@ -528,13 +535,14 @@ async function stageEpr(
   storage: StorageProvider | undefined,
   xml: string,
   index: number,
+  signal: AbortSignal,
 ): Promise<PresetRef> {
   if (storage === undefined) {
     throw storageFailure(`presets[${index}] needs staging, and no storage is configured.`);
   }
   let url: unknown;
   try {
-    url = await storage.stageRead(Buffer.from(xml), { contentType: EPR_CONTENT_TYPE });
+    url = await storage.stageRead(Buffer.from(xml), { contentType: EPR_CONTENT_TYPE, signal });
   } catch (cause) {
     throw storageFailure(`Staging the .epr for presets[${index}] failed.`, cause);
   }
@@ -549,6 +557,7 @@ async function stageEpr(
 async function materializeOutput(
   output: PreparedOutput,
   storage: StorageProvider | undefined,
+  signal: AbortSignal,
 ): Promise<MaterializedOutput> {
   const { variationIndex, presetIndex, fileName } = output;
   const named = fileName !== undefined ? { fileName } : {};
@@ -566,7 +575,7 @@ async function materializeOutput(
   }
   let slot: unknown;
   try {
-    slot = await storage.allocateOutput();
+    slot = await storage.allocateOutput({ signal });
   } catch (cause) {
     throw storageFailure('Allocating the output location failed.', cause);
   }

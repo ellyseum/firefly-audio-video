@@ -336,7 +336,7 @@ test('a config preset stages its generated .epr once through storage and submits
   const [staged] = storage.staged;
   expect(Buffer.isBuffer(staged?.input)).toBe(true);
   expect((staged?.input as Buffer).toString('utf8')).toContain('<PremiereData');
-  expect(staged?.opts).toEqual({ contentType: 'application/xml' });
+  expect(staged?.opts).toEqual({ contentType: 'application/xml', signal: expect.any(AbortSignal) });
   expect(api.submitted()[0]?.presets).toEqual([
     { source: { url: `${STORAGE}/staged/1.epr?sv=2021&sp=r&sig=STAGE_SIG_1` } },
   ]);
@@ -734,7 +734,7 @@ test('cancel() before pool admission submits nothing and rejects cancelled; the 
   ).toBe(true);
 });
 
-test('at concurrency 1, renders whose presets need staging complete: staging never waits on the pool', async () => {
+test('at concurrency 1, renders whose presets need staging complete: staging inside the slot never asks the pool for another', async () => {
   const storage = fakeStorage();
   api.submit(['j0', 'j1']);
   succeedsAt('j0');

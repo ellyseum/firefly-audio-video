@@ -145,8 +145,8 @@ test('a { url } preset given as a Buffer or a file path is staged as XML and sub
   );
 
   expect(storage.staged.map((entry) => entry.opts)).toEqual([
-    { contentType: 'application/xml' },
-    { contentType: 'application/xml' },
+    { contentType: 'application/xml', signal: expect.any(AbortSignal) },
+    { contentType: 'application/xml', signal: expect.any(AbortSignal) },
   ]);
   const inputs = storage.staged.map((entry) => entry.input);
   expect(inputs).toContain(xml);

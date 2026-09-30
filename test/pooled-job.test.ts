@@ -3,7 +3,14 @@ import { afterAll, afterEach, beforeAll, expect, test } from 'vitest';
 import { AudioVideoError } from '../src/core/errors.js';
 import { AsyncJob } from '../src/core/job.js';
 import { InMemoryPool } from '../src/core/pool.js';
-import { rejectedJob, runPooledJob, type PooledJobOutcome } from '../src/core/pooled-job.js';
+import {
+  rejectedJob,
+  runPooledJob,
+  type JobHandle,
+  type PooledJobOutcome,
+  type StageJob,
+  type StartJob,
+} from '../src/core/pooled-job.js';
 
 const unhandledRejections: unknown[] = [];
 const onUnhandledRejection = (reason: unknown): void => void unhandledRejections.push(reason);
@@ -39,6 +46,15 @@ function flush(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
+/** Resolves once `predicate()` holds, checking after each macrotask turn. */
+async function until(predicate: () => boolean): Promise<void> {
+  for (let turn = 0; turn < 200; turn += 1) {
+    if (predicate()) return;
+    await flush();
+  }
+  throw new Error('condition not reached');
+}
+
 /** A job that reports `jobId` at once and settles when `result` does, or when it is aborted. */
 function controlledJob<T>(jobId: string, result: Promise<T>, cancels: string[] = []): AsyncJob<T> {
   return AsyncJob.start<T>({
@@ -53,6 +69,11 @@ function controlledJob<T>(jobId: string, result: Promise<T>, cancels: string[] =
       cancels.push(id);
     },
   });
+}
+
+/** A stage with nothing to upload: it resolves with `start` at once. */
+function nothingToStage<J>(start: StartJob<J>): StageJob<J> {
+  return () => start;
 }
 
 async function rejection(promise: PromiseLike<unknown>): Promise<AudioVideoError> {
@@ -70,16 +91,17 @@ test('a call holds its slot from admission until its job settles, and a rejectin
   const first = deferred<string>();
   const a = runPooledJob({
     pool,
-    prepare: () => () => controlledJob('job-a', first.promise),
+    prepare: () => nothingToStage(() => controlledJob('job-a', first.promise)),
     finish: (value) => value,
   });
   const started: string[] = [];
   const b = runPooledJob({
     pool,
-    prepare: () => () => {
-      started.push('b');
-      return controlledJob('job-b', Promise.resolve('b-result'));
-    },
+    prepare: () =>
+      nothingToStage(() => {
+        started.push('b');
+        return controlledJob('job-b', Promise.resolve('b-result'));
+      }),
     finish: (value) => value,
   });
   await flush();
@@ -96,22 +118,26 @@ test('a call holds its slot from admission until its job settles, and a rejectin
   expect(pool.active).toBe(0);
 });
 
-test('a signal aborting while the call is queued rejects cancelled with the reason as cause, and the job never starts', async () => {
+test('a signal aborting while the call is queued rejects cancelled with the reason as cause, and the call never stages or starts', async () => {
   const pool = new InMemoryPool({ concurrency: 1 });
   const hold = deferred<string>();
   const holder = runPooledJob({
     pool,
-    prepare: () => () => controlledJob('job-a', hold.promise),
+    prepare: () => nothingToStage(() => controlledJob('job-a', hold.promise)),
     finish: (value) => value,
   });
   const controller = new AbortController();
+  let stages = 0;
   let starts = 0;
   const queued = runPooledJob({
     pool,
     signal: controller.signal,
     prepare: () => () => {
-      starts += 1;
-      return controlledJob('job-b', Promise.resolve('never'));
+      stages += 1;
+      return () => {
+        starts += 1;
+        return controlledJob('job-b', Promise.resolve('never'));
+      };
     },
     finish: (value) => value,
   });
@@ -127,17 +153,18 @@ test('a signal aborting while the call is queued rejects cancelled with the reas
   hold.resolve('done');
   await holder;
   await pool.drain();
+  expect(stages).toBe(0);
   expect(starts).toBe(0);
   expect(queued.jobId).toBeUndefined();
 });
 
 test('cancel() while the call is still preparing rejects at once; the pool is never asked for a slot', async () => {
   const pool = new InMemoryPool({ concurrency: 1 });
-  const staging = deferred<() => AsyncJob<string>>();
+  const preparing = deferred<StageJob<string>>();
   let starts = 0;
   const job = runPooledJob({
     pool,
-    prepare: () => staging.promise,
+    prepare: () => preparing.promise,
     finish: (value) => value,
   });
   await flush();
@@ -145,14 +172,180 @@ test('cancel() while the call is still preparing rejects at once; the pool is ne
   await job.cancel();
   expect((await rejection(job)).code).toBe('cancelled');
 
-  staging.resolve(() => {
-    starts += 1;
-    return controlledJob('job-a', Promise.resolve('never'));
-  });
+  preparing.resolve(
+    nothingToStage(() => {
+      starts += 1;
+      return controlledJob('job-a', Promise.resolve('never'));
+    }),
+  );
   await flush();
   expect(starts).toBe(0);
   expect(pool.active).toBe(0);
   expect(pool.queued).toBe(0);
+});
+
+test('a call stages only once it holds its slot, keeps the slot while staging, and starts its job once the stage resolves', async () => {
+  const pool = new InMemoryPool({ concurrency: 1 });
+  const hold = deferred<string>();
+  const holder = runPooledJob({
+    pool,
+    prepare: () => nothingToStage(() => controlledJob('job-a', hold.promise)),
+    finish: (value) => value,
+  });
+  const staged = deferred();
+  const events: string[] = [];
+  const queued = runPooledJob({
+    pool,
+    prepare: () => async () => {
+      events.push('stage');
+      await staged.promise;
+      return () => {
+        events.push('start');
+        return controlledJob('job-b', Promise.resolve('b-result'));
+      };
+    },
+    finish: (value) => value,
+  });
+  await flush();
+  expect(pool.queued).toBe(1);
+  expect(events).toEqual([]);
+
+  hold.resolve('a-result');
+  await holder;
+  await until(() => events.length > 0);
+  expect(events).toEqual(['stage']);
+  expect(pool.active).toBe(1);
+  expect(queued.jobId).toBeUndefined();
+
+  staged.resolve();
+  await expect(queued).resolves.toBe('b-result');
+  expect(events).toEqual(['stage', 'start']);
+  await pool.drain();
+  expect(pool.active).toBe(0);
+});
+
+test('cancel() during the stage rejects cancelled at once, aborts the signal the stage got, and frees the slot for the next queued call — even when the stage ignores its signal', async () => {
+  const pool = new InMemoryPool({ concurrency: 1 });
+  let seen: AbortSignal | undefined;
+  let starts = 0;
+  const staging = runPooledJob<string, string>({
+    pool,
+    prepare: () => (signal) => {
+      seen = signal;
+      return new Promise<StartJob<string>>(() => undefined);
+    },
+    finish: (value) => value,
+  });
+  const next = runPooledJob({
+    pool,
+    prepare: () =>
+      nothingToStage(() => {
+        starts += 1;
+        return controlledJob('job-b', Promise.resolve('b-result'));
+      }),
+    finish: (value) => value,
+  });
+  await until(() => seen !== undefined);
+  expect(seen?.aborted).toBe(false);
+  expect(pool.active).toBe(1);
+  expect(pool.queued).toBe(1);
+
+  await staging.cancel();
+  const error = await rejection(staging);
+  expect(error.code).toBe('cancelled');
+  expect(error.message).toBe('The job was cancelled before it was submitted.');
+  expect(seen?.aborted).toBe(true);
+  expect(staging.jobId).toBeUndefined();
+
+  await expect(next).resolves.toBe('b-result');
+  expect(starts).toBe(1);
+  await pool.drain();
+  expect(pool.active).toBe(0);
+});
+
+test("the caller's signal aborting during the stage rejects cancelled with the reason as cause, and the stage sees the abort", async () => {
+  const pool = new InMemoryPool({ concurrency: 1 });
+  const controller = new AbortController();
+  let seen: AbortSignal | undefined;
+  const job = runPooledJob<string, string>({
+    pool,
+    signal: controller.signal,
+    prepare: () => (signal) =>
+      new Promise<StartJob<string>>((_resolve, reject) => {
+        seen = signal;
+        signal.addEventListener('abort', () => reject(new Error('upload aborted')), {
+          once: true,
+        });
+      }),
+    finish: (value) => value,
+  });
+  await until(() => seen !== undefined);
+
+  const reason = new Error('caller gave up');
+  controller.abort(reason);
+  const error = await rejection(job);
+  expect(error.code).toBe('cancelled');
+  expect(error.cause).toBe(reason);
+  expect(seen?.aborted).toBe(true);
+  await pool.drain();
+  expect(pool.active).toBe(0);
+});
+
+test('a stage that rejects settles the call with its error, starts nothing, and frees the slot', async () => {
+  const pool = new InMemoryPool({ concurrency: 1 });
+  const failure = new AudioVideoError({ message: 'upload refused', code: 'storage_failed' });
+  const outcomes: unknown[] = [];
+  let starts = 0;
+  const job = runPooledJob<string, string>({
+    pool,
+    prepare: () => async () => {
+      throw failure;
+    },
+    finish: (value) => value,
+    onSettle: (outcome, started) => outcomes.push({ outcome, started }),
+  });
+  const next = runPooledJob({
+    pool,
+    prepare: () =>
+      nothingToStage(() => {
+        starts += 1;
+        return controlledJob('job-b', Promise.resolve('b-result'));
+      }),
+    finish: (value) => value,
+  });
+
+  await expect(job).rejects.toBe(failure);
+  expect(outcomes).toEqual([{ outcome: { ok: false, error: failure }, started: undefined }]);
+  await expect(next).resolves.toBe('b-result');
+  expect(starts).toBe(1);
+  await pool.drain();
+  expect(pool.active).toBe(0);
+});
+
+test('a cancel that lands after the stage resolved, before its start runs, starts nothing', async () => {
+  const pool = new InMemoryPool({ concurrency: 1 });
+  let starts = 0;
+  const holder: { job?: JobHandle<string> } = {};
+  const job = runPooledJob<string, string>({
+    pool,
+    // The stage resolves at once; two microtask hops later — after the stage's
+    // result has reached the call, before the call starts the job — cancel() runs.
+    prepare: () => () => {
+      queueMicrotask(() => queueMicrotask(() => void holder.job?.cancel()));
+      return () => {
+        starts += 1;
+        return controlledJob('job-a', Promise.resolve('never'));
+      };
+    },
+    finish: (value) => value,
+  });
+  holder.job = job;
+
+  expect((await rejection(job)).code).toBe('cancelled');
+  await pool.drain();
+  expect(starts).toBe(0);
+  expect(job.jobId).toBeUndefined();
+  expect(pool.active).toBe(0);
 });
 
 test('cancel() after the job starts delegates to the job, which asks the service to stop it', async () => {
@@ -161,7 +354,7 @@ test('cancel() after the job starts delegates to the job, which asks the service
   const never = new Promise<string>(() => undefined);
   const job = runPooledJob({
     pool,
-    prepare: () => () => controlledJob('job-a', never, cancels),
+    prepare: () => nothingToStage(() => controlledJob('job-a', never, cancels)),
     finish: (value) => value,
   });
   await flush();
@@ -179,7 +372,7 @@ test('cancel() while finishing aborts the signal finish received', async () => {
   const reachedFinish = deferred();
   const job = runPooledJob({
     pool,
-    prepare: () => () => controlledJob('job-a', Promise.resolve('result')),
+    prepare: () => nothingToStage(() => controlledJob('job-a', Promise.resolve('result'))),
     finish: (_value, signal) =>
       new Promise<string>((_resolve, reject) => {
         signal.addEventListener('abort', () => reject(signal.reason), { once: true });
@@ -195,9 +388,9 @@ test('cancel() while finishing aborts the signal finish received', async () => {
 
 test('onSettle runs exactly once, after finish, and a throwing onSettle changes nothing', async () => {
   const outcomes: Array<PooledJobOutcome<string>> = [];
-  const job = runPooledJob({
+  const job = runPooledJob<string, string>({
     pool: new InMemoryPool(),
-    prepare: () => () => controlledJob('job-a', Promise.resolve('raw')),
+    prepare: () => nothingToStage(() => controlledJob('job-a', Promise.resolve('raw'))),
     finish: (value) => `${value}-finished`,
     onSettle: (outcome, started) => {
       outcomes.push(outcome);

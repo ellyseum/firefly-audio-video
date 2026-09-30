@@ -28,6 +28,15 @@ export type StageInput = Buffer | Readable | URL | string;
  * `destination`. An http(s) URL never reaches a provider: it is already
  * something DGR can read.
  *
+ * A render's storage calls run inside its pool slot, once the job is
+ * admitted and just before it is submitted, so a staged URL is fresh when
+ * DGR is sent it however long the job queued. Each call's options carry a
+ * `signal` that aborts when the render is cancelled, or its caller's signal
+ * aborts, before the submit; pass it to the transport so the upload stops. A
+ * provider that ignores it cannot hold the call hostage: the call stops
+ * waiting the moment the signal aborts, releases its slot to the next queued
+ * job and rejects `cancelled`, while the ignored upload runs on unseen.
+ *
  * @example
  * ```ts
  * const storage: StorageProvider = {
@@ -49,26 +58,29 @@ export interface StorageProvider {
    * Uploads `input` and resolves with a presigned URL DGR can read it from.
    *
    * @param input - The bytes to stage; see {@link StageInput}.
-   * @param opts - `key` names the stored object, `contentType` labels it, and
-   *   `expiresIn` (seconds) bounds how long the returned URL stays valid.
+   * @param opts - `key` names the stored object, `contentType` labels it,
+   *   `expiresIn` (seconds) bounds how long the returned URL stays valid, and
+   *   `signal` aborts the upload.
    * @returns A presigned read URL for the staged object.
    */
   stageRead(
     input: StageInput,
-    opts?: { key?: string; contentType?: string; expiresIn?: number },
+    opts?: { key?: string; contentType?: string; expiresIn?: number; signal?: AbortSignal },
   ): Promise<string>;
   /**
    * Allocates one output location: DGR `PUT`s the rendered file to `writeUrl`,
    * and the finished asset is read back from `readUrl` — two URLs for the same
    * stored object.
    *
-   * @param opts - `key` names the stored object and `expiresIn` (seconds)
-   *   bounds how long both URLs stay valid.
+   * @param opts - `key` names the stored object, `expiresIn` (seconds) bounds
+   *   how long both URLs stay valid, and `signal` aborts any request the
+   *   allocation makes.
    * @returns The write URL DGR renders into and the read URL the asset is read from.
    */
   allocateOutput(opts?: {
     key?: string;
     expiresIn?: number;
+    signal?: AbortSignal;
   }): Promise<{ writeUrl: string; readUrl: string }>;
 }
 
@@ -86,7 +98,8 @@ export interface StorageProvider {
  * @param input - The asset: see {@link StageInput}.
  * @param provider - Stages the inputs that need it; unused for a URL.
  * @param opts - Passed to `provider.stageRead`: the stored object's `key`, its
- *   `contentType`, and how many seconds (`expiresIn`) the URL stays valid.
+ *   `contentType`, how many seconds (`expiresIn`) the URL stays valid, and a
+ *   `signal` that aborts the upload.
  * @returns A URL DGR can read the asset from.
  * @throws {@link AudioVideoError} `invalid_argument` for a string that is
  *   neither an http(s) URL nor an existing file, a URL of another scheme, any
@@ -104,7 +117,7 @@ export interface StorageProvider {
 export async function normalizeAsset(
   input: StageInput,
   provider?: StorageProvider,
-  opts?: { key?: string; contentType?: string; expiresIn?: number },
+  opts?: { key?: string; contentType?: string; expiresIn?: number; signal?: AbortSignal },
 ): Promise<string> {
   const asset = await classifyAsset(input);
   if (asset.kind === 'url') return asset.url;
@@ -261,17 +274,17 @@ const EXPECTED_INPUT =
 /** How much of an input string an error message quotes. */
 const QUOTE_LIMIT = 120;
 
+/** The options `stageRead` takes. */
+type StageReadOptions = NonNullable<Parameters<StorageProvider['stageRead']>[1]>;
+
 /** `stageRead` options with their `undefined` entries left out. */
-function stageOptions(opts: { key?: string; contentType?: string; expiresIn?: number } = {}): {
-  key?: string;
-  contentType?: string;
-  expiresIn?: number;
-} {
-  const { key, contentType, expiresIn } = opts;
+function stageOptions(opts: StageReadOptions = {}): StageReadOptions {
+  const { key, contentType, expiresIn, signal } = opts;
   return {
     ...(key !== undefined ? { key } : {}),
     ...(contentType !== undefined ? { contentType } : {}),
     ...(expiresIn !== undefined ? { expiresIn } : {}),
+    ...(signal !== undefined ? { signal } : {}),
   };
 }
 

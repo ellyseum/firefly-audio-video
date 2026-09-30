@@ -320,6 +320,21 @@ test('a refused PUT rejects storage_failed with its status and error code, never
   expect(everythingPrinted(error)).not.toMatch(/SIG_/);
 });
 
+test.each([200, 204, 307])(
+  'a PUT answered %i is refused storage_failed naming the status: only 201 means the blob was created',
+  async (status) => {
+    blobStore(status, status === 307 ? { location: `${BLOB}/fav/elsewhere` } : {});
+    const files = fakeFiles();
+    const error = await rejection(
+      new AioFilesStorageProvider({ files }).stageRead(Buffer.from('x')),
+    );
+    expect(error.code).toBe('storage_failed');
+    expect(error.message).toBe(`Uploading the object failed with status ${status}.`);
+    expect(puts).toHaveLength(1);
+    expect(files.calls.map((call) => call.options.permissions)).toEqual(['rw']);
+  },
+);
+
 test('a PUT that fails in transit rejects storage_failed, and no SAS survives anywhere in the error or its causes', async () => {
   agent
     .get(BLOB)
